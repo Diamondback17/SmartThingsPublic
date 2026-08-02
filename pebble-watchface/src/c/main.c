@@ -7,12 +7,15 @@
 // ring, a bluetooth status blip and a shake-to-glitch easter egg.
 // ---------------------------------------------------------------------------
 
-#define CELL_W 12
-#define CELL_H 14
-#define MAX_COLS 20
-#define MAX_ROWS 20
+#define MAX_COLS 24
+#define MAX_ROWS 24
 #define GLITCH_FRAME_MS 70
 #define GLITCH_FRAME_COUNT 5
+// Reference width the base layout (Aplite/Basalt/Diorite) was designed
+// against; every other platform's layout is derived from bounds relative
+// to this, so the same code scales up cleanly on the big 260x260 Gabbro
+// (Pebble Round 2) display without needing a per-platform layout table.
+#define BASE_WIDTH 144.0
 
 static Window *s_window;
 static Layer *s_canvas_layer;
@@ -23,6 +26,7 @@ static char s_date_buffer[24];
 static char s_steps_buffer[24];
 
 static int s_cols, s_rows;
+static int s_cell_w, s_cell_h;
 static char s_grid[MAX_ROWS][MAX_COLS];
 static int8_t s_drop_head[MAX_COLS];
 static int8_t s_drop_len[MAX_COLS];
@@ -33,6 +37,13 @@ static int s_battery_percent = 100;
 static bool s_battery_charging = false;
 static bool s_bt_connected = true;
 static bool s_health_available = false;
+
+static GRect s_box;
+static GFont s_time_font;
+static GFont s_detail_font;
+static GFont s_rain_font;
+static int s_time_row_h;
+static int s_line_h;
 
 static AppTimer *s_glitch_timer;
 static int s_glitch_frames_left = 0;
@@ -57,10 +68,28 @@ static void seed_column(int col) {
 }
 
 static void matrix_init(GRect bounds) {
-  s_cols = bounds.size.w / CELL_W;
-  s_rows = bounds.size.h / CELL_H;
+  // Scale the rain grid's cell size with the display so every platform
+  // (144px-wide Aplite up to the 260px Gabbro) shows roughly the same
+  // number of columns/rows instead of Gabbro getting either a sparse
+  // few columns or capping out at MAX_COLS.
+  double scale = bounds.size.w / BASE_WIDTH;
+  s_cell_w = (int)(12 * scale + 0.5);
+  s_cell_h = (int)(14 * scale + 0.5);
+  if (s_cell_w < 10) s_cell_w = 10;
+  if (s_cell_h < 12) s_cell_h = 12;
+
+  s_cols = bounds.size.w / s_cell_w;
+  s_rows = bounds.size.h / s_cell_h;
   if (s_cols > MAX_COLS) s_cols = MAX_COLS;
   if (s_rows > MAX_ROWS) s_rows = MAX_ROWS;
+
+  if (s_cell_w >= 20) {
+    s_rain_font = fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
+  } else if (s_cell_w >= 15) {
+    s_rain_font = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
+  } else {
+    s_rain_font = fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+  }
 
   memset(s_grid, ' ', sizeof(s_grid));
   for (int c = 0; c < s_cols; c++) {
@@ -96,7 +125,6 @@ static void matrix_tick(void) {
 static void matrix_draw(GContext *ctx, GRect bounds) {
   graphics_context_set_text_color(
       ctx, PBL_IF_COLOR_ELSE(GColorDarkGreen, GColorWhite));
-  GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
 
   for (int c = 0; c < s_cols; c++) {
     for (int dr = 0; dr <= s_drop_len[c]; dr++) {
@@ -116,8 +144,8 @@ static void matrix_draw(GContext *ctx, GRect bounds) {
       graphics_context_set_text_color(ctx, color);
 
       char buf[2] = {s_grid[r][c], '\0'};
-      GRect cell = GRect(c * CELL_W, r * CELL_H, CELL_W + 4, CELL_H + 2);
-      graphics_draw_text(ctx, buf, font, cell, GTextOverflowModeFill,
+      GRect cell = GRect(c * s_cell_w, r * s_cell_h, s_cell_w + 4, s_cell_h + 2);
+      graphics_draw_text(ctx, buf, s_rain_font, cell, GTextOverflowModeFill,
                           GTextAlignmentLeft, NULL);
     }
   }
@@ -146,7 +174,8 @@ static void draw_battery_ring(GContext *ctx, GRect bounds) {
 }
 
 static void draw_bluetooth_status(GContext *ctx, GRect bounds) {
-  GPoint center = GPoint(bounds.size.w / 2, PBL_IF_ROUND_ELSE(34, 20));
+  int top_offset = PBL_IF_ROUND_ELSE((int)(bounds.size.h * 0.19), 20);
+  GPoint center = GPoint(bounds.size.w / 2, top_offset);
   GColor color = s_bt_connected ? PBL_IF_COLOR_ELSE(GColorBlueMoon, GColorWhite)
                                  : PBL_IF_COLOR_ELSE(GColorRed, GColorWhite);
   graphics_context_set_fill_color(ctx, color);
@@ -161,64 +190,86 @@ static void draw_bluetooth_status(GContext *ctx, GRect bounds) {
   }
 }
 
-static void draw_hud_box(GContext *ctx, GRect bounds, GRect *out_box) {
-  int box_h = s_health_available ? 92 : 76;
-  GRect box = GRect(bounds.size.w / 2 - 62, bounds.size.h / 2 - box_h / 2, 124,
-                     box_h);
-  *out_box = box;
+// Lays out the terminal HUD box once (on window load / size change) rather
+// than every redraw. Box width is derived from the display width so it
+// fills a sensible fraction of the big square Gabbro screen instead of
+// staying pinned at the pixel size that fit 144px-wide Aplite; round
+// platforms get a narrower fraction so the corners don't get clipped by
+// the circular display mask.
+static void compute_layout(GRect bounds) {
+  int box_w = PBL_IF_ROUND_ELSE((int)(bounds.size.w * 0.70),
+                                 bounds.size.w - 20);
+  bool big = box_w >= 170;
 
+  s_time_font = fonts_get_system_font(
+      big ? FONT_KEY_LECO_42_NUMBERS : FONT_KEY_LECO_38_BOLD_NUMBERS);
+  s_detail_font = fonts_get_system_font(
+      big ? FONT_KEY_GOTHIC_18_BOLD : FONT_KEY_GOTHIC_14_BOLD);
+  s_time_row_h = big ? 54 : 44;
+  s_line_h = big ? 20 : 16;
+
+  int lines = s_health_available ? 3 : 2;  // seconds, date, (steps)
+  int box_h = 2 + s_time_row_h + lines * s_line_h;
+
+  s_box = GRect(bounds.size.w / 2 - box_w / 2,
+                bounds.size.h / 2 - box_h / 2, box_w, box_h);
+}
+
+static void draw_hud_box(GContext *ctx) {
   graphics_context_set_fill_color(ctx, GColorBlack);
-  graphics_fill_rect(ctx, box, 4, GCornersAll);
+  graphics_fill_rect(ctx, s_box, 4, GCornersAll);
 
   GColor accent = PBL_IF_COLOR_ELSE(GColorBrightGreen, GColorWhite);
   graphics_context_set_stroke_color(ctx, accent);
-  graphics_draw_round_rect(ctx, box, 4);
+  graphics_draw_round_rect(ctx, s_box, 4);
 }
 
-static void draw_time(GContext *ctx, GRect box) {
-  GFont font = fonts_get_system_font(FONT_KEY_LECO_38_BOLD_NUMBERS);
+static void draw_time(GContext *ctx) {
   GColor color = PBL_IF_COLOR_ELSE(GColorBrightGreen, GColorWhite);
-
-  GRect time_rect = GRect(box.origin.x, box.origin.y + 2, box.size.w, 44);
+  GRect time_rect =
+      GRect(s_box.origin.x, s_box.origin.y + 2, s_box.size.w, s_time_row_h);
 
   if (s_glitch_frames_left > 0) {
     // chromatic-aberration style glitch: two mis-registered copies
     graphics_context_set_text_color(ctx, PBL_IF_COLOR_ELSE(GColorRed, GColorWhite));
     GRect off1 = time_rect;
     off1.origin.x -= 2;
-    graphics_draw_text(ctx, s_time_buffer, font, off1, GTextOverflowModeFill,
-                        GTextAlignmentCenter, NULL);
+    graphics_draw_text(ctx, s_time_buffer, s_time_font, off1,
+                        GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 
     graphics_context_set_text_color(ctx, PBL_IF_COLOR_ELSE(GColorCyan, GColorWhite));
     GRect off2 = time_rect;
     off2.origin.x += 2;
-    graphics_draw_text(ctx, s_time_buffer, font, off2, GTextOverflowModeFill,
-                        GTextAlignmentCenter, NULL);
+    graphics_draw_text(ctx, s_time_buffer, s_time_font, off2,
+                        GTextOverflowModeFill, GTextAlignmentCenter, NULL);
   }
 
   graphics_context_set_text_color(ctx, color);
-  graphics_draw_text(ctx, s_time_buffer, font, time_rect, GTextOverflowModeFill,
-                      GTextAlignmentCenter, NULL);
+  graphics_draw_text(ctx, s_time_buffer, s_time_font, time_rect,
+                      GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 }
 
-static void draw_details(GContext *ctx, GRect box) {
+static void draw_details(GContext *ctx) {
   GColor dim = PBL_IF_COLOR_ELSE(GColorIslamicGreen, GColorLightGray);
-  GFont small_font = fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
-
   graphics_context_set_text_color(ctx, dim);
-  GRect sec_rect = GRect(box.origin.x, box.origin.y + 44, box.size.w, 16);
+
+  int y = s_box.origin.y + 2 + s_time_row_h;
+
   char line[28];
   snprintf(line, sizeof(line), ":%s SEC", s_seconds_buffer);
-  graphics_draw_text(ctx, line, small_font, sec_rect, GTextOverflowModeFill,
+  GRect sec_rect = GRect(s_box.origin.x, y, s_box.size.w, s_line_h);
+  graphics_draw_text(ctx, line, s_detail_font, sec_rect, GTextOverflowModeFill,
                       GTextAlignmentCenter, NULL);
+  y += s_line_h;
 
-  GRect date_rect = GRect(box.origin.x, box.origin.y + 60, box.size.w, 16);
-  graphics_draw_text(ctx, s_date_buffer, small_font, date_rect,
+  GRect date_rect = GRect(s_box.origin.x, y, s_box.size.w, s_line_h);
+  graphics_draw_text(ctx, s_date_buffer, s_detail_font, date_rect,
                       GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+  y += s_line_h;
 
   if (s_health_available) {
-    GRect steps_rect = GRect(box.origin.x, box.origin.y + 76, box.size.w, 16);
-    graphics_draw_text(ctx, s_steps_buffer, small_font, steps_rect,
+    GRect steps_rect = GRect(s_box.origin.x, y, s_box.size.w, s_line_h);
+    graphics_draw_text(ctx, s_steps_buffer, s_detail_font, steps_rect,
                         GTextOverflowModeFill, GTextAlignmentCenter, NULL);
   }
 }
@@ -235,10 +286,9 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
 
   matrix_draw(ctx, bounds);
 
-  GRect box;
-  draw_hud_box(ctx, bounds, &box);
-  draw_time(ctx, box);
-  draw_details(ctx, box);
+  draw_hud_box(ctx);
+  draw_time(ctx);
+  draw_details(ctx);
 
   draw_bluetooth_status(ctx, bounds);
   draw_battery_ring(ctx, bounds);
@@ -335,6 +385,7 @@ static void window_load(Window *window) {
   GRect bounds = layer_get_bounds(root);
 
   matrix_init(bounds);
+  compute_layout(bounds);
 
   s_canvas_layer = layer_create(bounds);
   layer_set_update_proc(s_canvas_layer, canvas_update_proc);

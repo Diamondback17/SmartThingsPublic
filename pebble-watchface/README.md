@@ -1,7 +1,8 @@
 # Cyber Matrix — a Pebble watchface
 
-A "go crazy" digital watchface for Pebble (Aplite, Basalt, Chalk, Diorite,
-Emery):
+A "go crazy" digital watchface for Pebble, built primarily for **Gabbro**
+(Pebble Round 2, the 260x260 round display) with the layout scaling down
+cleanly to Emery, Chalk, Basalt, Diorite, and Aplite too:
 
 - **Live digital-rain background** — falling character columns, à la The
   Matrix, running behind everything and continuously animating every second.
@@ -17,9 +18,11 @@ Emery):
   the screen showing charge level (green/yellow/red, cyan while charging).
 - **Bluetooth status dot** — solid dot when connected, an "X" plus a
   double vibration pulse when the phone disconnects.
-- Full color on Basalt/Chalk/Emery, sensible white-on-black fallback on
-  the 1-bit Aplite/Diorite displays. Layout adapts for the round Chalk
-  display.
+- Full color on Gabbro/Basalt/Chalk/Emery, sensible white-on-black
+  fallback on the 1-bit Aplite/Diorite displays. The HUD box, fonts, and
+  matrix-rain grid density all scale with screen size, and round platforms
+  (Gabbro, Chalk) get a narrower box so corners aren't clipped by the
+  circular display mask.
 
 ## Project layout
 
@@ -39,7 +42,7 @@ retired) installed:
 ```sh
 cd pebble-watchface
 pebble build
-pebble install --phone <phone-ip>      # or --emulator basalt
+pebble install --phone <phone-ip>      # or --emulator gabbro
 ```
 
 You can also just drag `src/c/main.c` and `package.json` into a new
@@ -50,7 +53,9 @@ in the browser.
 
 - `s_charset` in `main.c` controls which characters fall in the rain —
   swap in different symbols for a different vibe.
-- `CELL_W`/`CELL_H` control the rain grid density.
+- The rain grid's cell size and the HUD box/font sizing scale off screen
+  width (see `BASE_WIDTH`, `matrix_init`, and `compute_layout` in
+  `main.c`) rather than being hardcoded per platform.
 - `GLITCH_FRAME_COUNT` / `GLITCH_FRAME_MS` control how long/fast glitch
   bursts play.
 - The `rand() % 45` check in `tick_handler` controls how often random
