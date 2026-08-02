@@ -26,15 +26,21 @@ layout into a circle. No clock hands, nothing on screen moves on its own.
 - **Moon phase** — a small phase-accurate moon icon, computed locally
   from the date (no network needed), appears near the bottom — only at
   night, since that's the only time it'd matter.
-- **Cohesive mood theming** — a single accent color runs through the
-  weather icon, the moon, the day-side bezel ticks, the chapter ring, the
-  battery ring's track, and the grain speckle, so the whole face reads as
-  one themed unit rather than separately-colored parts. It shifts through
-  dawn (orange) → day (blue) → dusk (violet) → night (indigo) based on
-  real sunrise/sunset, and dramatic weather (storm, snow, fog, rain)
-  overrides it with its own mood color regardless of time of day. Status
+- **Cohesive, weather-led theming** — weather is the primary driver of the
+  single accent color that runs through the weather icon, the moon, the
+  day-side bezel ticks, the chapter ring, and the battery ring's track:
+  storm/snow/fog/rain each get their own fixed mood color outright, clear
+  skies get the full-bright time-of-day color (dawn orange → day blue →
+  dusk violet → night indigo, from real sunrise/sunset), and cloudy skies
+  dim that same color rather than looking identical to clear. Status
   colors (battery charge level, the bluetooth alert) stay fixed and
   outside the theme, since they need to stay recognizable.
+- **Weather-shaped background texture** — the grain speckle isn't just
+  dots: it renders as short streaks for rain/storm, small round flakes
+  for snow, sparser haze for fog, and a plain fine grain for clear/cloudy
+  — so the whole face's texture reflects the current sky, not just its
+  color. Still fully static (positions are fixed, only the style per dot
+  changes with the category), so nothing here animates either.
 - **Settings page** — accessible from the watch app's entry in the phone's
   Pebble app ("Settings"). Lets you override the accent to a fixed color
   (or leave it on Auto) and pick Fahrenheit or Celsius. Persists on the
@@ -108,9 +114,12 @@ separate "PebbleKit JS" tab for the JS file.
   countdown format.
 - `WIND_REVEAL_MS` controls how long the tap-triggered wind readout stays
   up before reverting.
-- `GRAIN_COUNT` controls how much speckle texture is drawn.
-- `draw_battery_ring`'s `inset`/`thickness` locals control how thick the
-  ring is and how far it sits from the chapter ring.
+- `GRAIN_COUNT` controls how much speckle texture is drawn; `draw_grain`'s
+  switch on `s_weather_category` controls what shape each dot renders as
+  per condition (streaks, flakes, haze, plain grain).
+- `draw_battery_ring`'s `thickness` local controls how thick the ring is;
+  its position now derives from `s_battery_inset` (see `compute_layout`)
+  rather than a fixed value.
 - `weatherCodeInfo` in `pebble-js-app.js` controls the condition labels
   and categories; `tick_handler`'s `tm_min % 30` in `main.c` controls the
   refresh interval; `buildConfigHtml` is the settings page markup.

@@ -116,9 +116,26 @@ static ThemePeriod current_period(void) {
   return PERIOD_NIGHT;
 }
 
-// A manual accent override wins outright; otherwise dramatic weather
-// overrides the time-of-day mood, which otherwise follows dawn/day/dusk/
-// night. Monochrome platforms always just get white.
+// A darker shade of the same hue, for background/track elements that
+// should carry the theme without competing with the bright accent uses.
+static GColor dim_color(GColor c) {
+#if !defined(PBL_COLOR)
+  return GColorDarkGray;
+#else
+  GColor out = c;
+  out.r = c.r / 2;
+  out.g = c.g / 2;
+  out.b = c.b / 2;
+  return out;
+#endif
+}
+
+// A manual accent override wins outright. Otherwise weather is the
+// primary driver: dramatic conditions (storm/snow/fog/rain) get their
+// own fixed mood color outright, clear skies get the full-bright
+// time-of-day color, and cloudy cover dims that same color - so cloudy
+// days visibly read as duller than clear ones instead of looking
+// identical. Monochrome platforms always just get white.
 static GColor theme_accent(void) {
 #if !defined(PBL_COLOR)
   return GColorWhite;
@@ -142,26 +159,15 @@ static GColor theme_accent(void) {
     case WX_RAIN: return GColorTiffanyBlue;
     default: break;
   }
-  switch (current_period()) {
-    case PERIOD_DAWN: return GColorSunsetOrange;
-    case PERIOD_DAY: return GColorVividCerulean;
-    case PERIOD_DUSK: return GColorVividViolet;
-    default: return GColorDukeBlue;
-  }
-#endif
-}
 
-// A darker shade of the same hue, for background/track elements that
-// should carry the theme without competing with the bright accent uses.
-static GColor dim_color(GColor c) {
-#if !defined(PBL_COLOR)
-  return GColorDarkGray;
-#else
-  GColor out = c;
-  out.r = c.r / 2;
-  out.g = c.g / 2;
-  out.b = c.b / 2;
-  return out;
+  GColor time_color;
+  switch (current_period()) {
+    case PERIOD_DAWN: time_color = GColorSunsetOrange; break;
+    case PERIOD_DAY: time_color = GColorVividCerulean; break;
+    case PERIOD_DUSK: time_color = GColorVividViolet; break;
+    default: time_color = GColorDukeBlue; break;
+  }
+  return s_weather_category == WX_CLOUDY ? dim_color(time_color) : time_color;
 #endif
 }
 
@@ -216,13 +222,50 @@ static void draw_chapter_ring(GContext *ctx, GRect bounds) {
                         DEG_TO_TRIGANGLE(0), DEG_TO_TRIGANGLE(360));
 }
 
-// Sparse static speckle inside the chapter ring for a bit of grain/texture
-// on the otherwise flat black face. Positions are fixed per screen size
-// (computed once in compute_layout), so this never animates.
+// Sparse static speckle inside the chapter ring, styled per current
+// weather category so the background itself reads as the condition
+// rather than just a color: rain/storm get short streaks, snow gets
+// small round flakes, fog gets sparser haze, clear/cloudy get a plain
+// fine grain. Positions are fixed per screen size (computed once in
+// compute_layout) and the style is picked fresh each redraw from the
+// live category, but nothing here animates - it's still a static texture,
+// just one that matches whatever the sky is doing right now.
 static void draw_grain(GContext *ctx) {
-  graphics_context_set_stroke_color(ctx, dim_color(theme_accent()));
-  for (int i = 0; i < GRAIN_COUNT; i++) {
-    graphics_draw_pixel(ctx, s_grain[i]);
+  GColor color = dim_color(theme_accent());
+
+  switch (s_weather_category) {
+    case WX_RAIN:
+    case WX_STORM:
+      graphics_context_set_stroke_color(ctx, color);
+      graphics_context_set_stroke_width(ctx, 1);
+      for (int i = 0; i < GRAIN_COUNT; i++) {
+        GPoint p = s_grain[i];
+        graphics_draw_line(ctx, p, GPoint(p.x - 2, p.y + 5));
+      }
+      break;
+
+    case WX_SNOW:
+      graphics_context_set_fill_color(ctx, color);
+      for (int i = 0; i < GRAIN_COUNT; i++) {
+        graphics_fill_circle(ctx, s_grain[i], 1);
+      }
+      break;
+
+    case WX_FOG:
+      graphics_context_set_stroke_color(ctx, color);
+      for (int i = 0; i < GRAIN_COUNT; i += 2) {  // sparser - hazy rather than grainy
+        graphics_draw_pixel(ctx, s_grain[i]);
+      }
+      break;
+
+    case WX_CLEAR:
+    case WX_CLOUDY:
+    default:
+      graphics_context_set_stroke_color(ctx, color);
+      for (int i = 0; i < GRAIN_COUNT; i++) {
+        graphics_draw_pixel(ctx, s_grain[i]);
+      }
+      break;
   }
 }
 
