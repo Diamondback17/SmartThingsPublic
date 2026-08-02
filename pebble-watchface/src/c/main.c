@@ -1,23 +1,45 @@
 #include <pebble.h>
+#include <math.h>
 
 // ---------------------------------------------------------------------------
 // "Halo" watchface
 //
 // A sleek, fully-digital face built for round displays (primarily Gabbro's
-// 260x260 Pebble Round 2 screen): a static tick-mark bezel and a thin
-// chapter ring give it dial-like texture, a battery ring sits just inside
-// them, and numeric time/date/weather sit centered. Nothing on screen
-// moves on its own — no seconds hand, no sweeping indicator. Weather comes
-// from the phone's companion JS (src/js/pebble-js-app.js) over AppMessage,
+// 260x260 Pebble Round 2 screen). The bezel doubles as a 24-hour day/night
+// gauge lit from real sunrise/sunset times, a drawn weather icon and a
+// computed moon phase (visible at night) add character, and the accent
+// color shifts with time of day and weather mood. Nothing on screen moves
+// on its own - no seconds hand, no sweeping indicator. Weather comes from
+// the phone's companion JS (src/js/pebble-js-app.js) over AppMessage,
 // since the watch has no network access of its own.
 // ---------------------------------------------------------------------------
 
 #define GRAIN_COUNT 46
+#define DAY_TICKS 96  // 15-minute resolution across 24 hours
 
 // Must match the "appKeys" order in package.json/appinfo.json.
 #define KEY_TEMPERATURE 0
 #define KEY_CONDITION 1
 #define KEY_REQUEST 2
+#define KEY_CATEGORY 3
+#define KEY_SUNRISE 4
+#define KEY_SUNSET 5
+
+typedef enum {
+  WX_CLEAR = 0,
+  WX_CLOUDY = 1,
+  WX_FOG = 2,
+  WX_RAIN = 3,
+  WX_SNOW = 4,
+  WX_STORM = 5,
+} WeatherCategory;
+
+typedef enum {
+  PERIOD_NIGHT,
+  PERIOD_DAWN,
+  PERIOD_DAY,
+  PERIOD_DUSK,
+} ThemePeriod;
 
 static Window *s_window;
 static Layer *s_canvas_layer;
@@ -25,20 +47,65 @@ static Layer *s_canvas_layer;
 static char s_time_buffer[8];
 static char s_date_buffer[24];
 static char s_weather_buffer[32];
+static WeatherCategory s_weather_category = WX_CLOUDY;
 
 static int s_battery_percent = 100;
 static bool s_battery_charging = false;
 static bool s_bt_connected = true;
 
+static int s_now_min = 8 * 60;       // minutes since local midnight
+static int s_sunrise_min = 6 * 60;   // placeholders until first weather push
+static int s_sunset_min = 20 * 60;
+
 static GFont s_time_font;
 static GFont s_detail_font;
 static int s_time_h;
 static int s_line_h;
+static int s_icon_row_h;
 
 static GPoint s_grain[GRAIN_COUNT];
 
 // ---------------------------------------------------------------------------
-// Static dial texture: tick bezel, chapter ring, grain
+// Theming: time-of-day period + weather mood -> accent color
+// ---------------------------------------------------------------------------
+
+static ThemePeriod current_period(void) {
+  if (s_now_min >= s_sunrise_min - 30 && s_now_min <= s_sunrise_min + 30) {
+    return PERIOD_DAWN;
+  }
+  if (s_now_min >= s_sunset_min - 30 && s_now_min <= s_sunset_min + 30) {
+    return PERIOD_DUSK;
+  }
+  if (s_now_min > s_sunrise_min + 30 && s_now_min < s_sunset_min - 30) {
+    return PERIOD_DAY;
+  }
+  return PERIOD_NIGHT;
+}
+
+// Dramatic weather overrides the time-of-day mood; otherwise the accent
+// follows dawn/day/dusk/night. Monochrome platforms just get white.
+static GColor theme_accent(void) {
+#if !defined(PBL_COLOR)
+  return GColorWhite;
+#else
+  switch (s_weather_category) {
+    case WX_STORM: return GColorJazzberryJam;
+    case WX_SNOW: return GColorPictonBlue;
+    case WX_FOG: return GColorLightGray;
+    case WX_RAIN: return GColorTiffanyBlue;
+    default: break;
+  }
+  switch (current_period()) {
+    case PERIOD_DAWN: return GColorSunsetOrange;
+    case PERIOD_DAY: return GColorVividCerulean;
+    case PERIOD_DUSK: return GColorVividViolet;
+    default: return GColorDukeBlue;
+  }
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Static dial texture: day/night bezel, chapter ring, grain
 // ---------------------------------------------------------------------------
 
 static GPoint point_on_circle(GPoint center, int32_t angle, int radius) {
@@ -46,10 +113,13 @@ static GPoint point_on_circle(GPoint center, int32_t angle, int radius) {
                 center.y - (int16_t)(cos_lookup(angle) * radius / TRIG_MAX_RATIO));
 }
 
-// A fixed 60-tick bezel (5 major ticks per hour mark) around the very edge.
-// Purely decorative and static - it doesn't move, so it reads as dial
-// texture rather than a hand.
-static void draw_tick_bezel(GContext *ctx, GRect bounds) {
+// A 96-tick bezel around the very edge, one revolution per 24 hours
+// (12 o'clock = midnight, 6 o'clock = noon). Ticks falling within today's
+// daylight window are lit brighter than the night ticks, turning the
+// static bezel into a daylight gauge rather than a plain decorative
+// scale. It's still fixed once drawn for the current minute - it doesn't
+// sweep like a hand.
+static void draw_day_night_bezel(GContext *ctx, GRect bounds) {
   GPoint center = GPoint(bounds.size.w / 2, bounds.size.h / 2);
   int radius = (bounds.size.w < bounds.size.h ? bounds.size.w : bounds.size.h) / 2 - 3;
   int minor_len = bounds.size.w / 40;
@@ -57,14 +127,17 @@ static void draw_tick_bezel(GContext *ctx, GRect bounds) {
   if (minor_len < 3) minor_len = 3;
   if (major_len < 7) major_len = 7;
 
-  for (int i = 0; i < 60; i++) {
-    bool major = (i % 5 == 0);
-    int32_t angle = TRIG_MAX_ANGLE * i / 60;
-    int len = major ? major_len : minor_len;
+  GColor day_color = PBL_IF_COLOR_ELSE(GColorIcterine, GColorWhite);
+  GColor night_color = PBL_IF_COLOR_ELSE(GColorIndigo, GColorDarkGray);
 
-    GColor color = major ? PBL_IF_COLOR_ELSE(GColorLightGray, GColorWhite)
-                          : PBL_IF_COLOR_ELSE(GColorDarkGray, GColorLightGray);
-    graphics_context_set_stroke_color(ctx, color);
+  for (int i = 0; i < DAY_TICKS; i++) {
+    bool major = (i % 4 == 0);  // on the hour
+    int32_t angle = TRIG_MAX_ANGLE * i / DAY_TICKS;
+    int len = major ? major_len : minor_len;
+    int tick_minutes = i * (24 * 60 / DAY_TICKS);
+    bool daylight = tick_minutes >= s_sunrise_min && tick_minutes <= s_sunset_min;
+
+    graphics_context_set_stroke_color(ctx, daylight ? day_color : night_color);
     graphics_context_set_stroke_width(ctx, major ? 3 : 1);
     graphics_draw_line(ctx, point_on_circle(center, angle, radius),
                         point_on_circle(center, angle, radius - len));
@@ -132,6 +205,116 @@ static void draw_bluetooth_alert(GContext *ctx, GRect bounds) {
 }
 
 // ---------------------------------------------------------------------------
+// Moon phase (computed locally, no network needed)
+// ---------------------------------------------------------------------------
+
+// Synodic month reckoned from a known new moon (2000-01-06 18:14 UTC).
+// Returns phase in [0, 1): 0/1 = new moon, 0.5 = full moon.
+static double compute_moon_phase(void) {
+  const double reference_new_moon = 947182440.0;  // unix time
+  const double synodic_days = 29.530588853;
+  double days_since_new = ((double)time(NULL) - reference_new_moon) / 86400.0;
+  double cycles = days_since_new / synodic_days;
+  double phase = cycles - floor(cycles);
+  return phase;
+}
+
+// Renders the moon as a lit disc with a second, offset disc painted in the
+// background color to carve out the shadow - a standard small-icon trick
+// that cycles correctly through new/crescent/quarter/gibbous/full/back to
+// new as phase goes 0 -> 1.
+static void draw_moon_phase(GContext *ctx, GPoint center, int r) {
+  double phase = compute_moon_phase();
+  int32_t angle = (int32_t)(phase * TRIG_MAX_ANGLE);
+  int32_t cos_val = cos_lookup(angle);
+  int offset = (int)(((int32_t)(TRIG_MAX_RATIO - cos_val)) * r / TRIG_MAX_RATIO);
+
+  graphics_context_set_fill_color(ctx, theme_accent());
+  graphics_fill_circle(ctx, center, r);
+
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_fill_circle(ctx, GPoint(center.x - offset, center.y), r);
+
+  GColor outline = PBL_IF_COLOR_ELSE(GColorDarkGray, GColorLightGray);
+  graphics_context_set_stroke_color(ctx, outline);
+  graphics_draw_circle(ctx, center, r);
+}
+
+// ---------------------------------------------------------------------------
+// Weather icon
+// ---------------------------------------------------------------------------
+
+static void draw_cloud(GContext *ctx, GPoint center, int r, GColor color) {
+  graphics_context_set_fill_color(ctx, color);
+  graphics_fill_circle(ctx, GPoint(center.x - r / 2, center.y + r / 4), r * 6 / 10);
+  graphics_fill_circle(ctx, GPoint(center.x + r / 2, center.y + r / 4), r * 6 / 10);
+  graphics_fill_circle(ctx, GPoint(center.x, center.y - r / 5), r * 7 / 10);
+  graphics_fill_rect(ctx, GRect(center.x - r, center.y, 2 * r, r / 2), 0, GCornerNone);
+}
+
+static void draw_weather_icon(GContext *ctx, GPoint center, int r) {
+  GColor accent = theme_accent();
+
+  switch (s_weather_category) {
+    case WX_CLEAR:
+      graphics_context_set_fill_color(ctx, accent);
+      graphics_fill_circle(ctx, center, r * 6 / 10);
+      graphics_context_set_stroke_color(ctx, accent);
+      graphics_context_set_stroke_width(ctx, 1);
+      for (int i = 0; i < 8; i++) {
+        int32_t angle = TRIG_MAX_ANGLE * i / 8;
+        graphics_draw_line(ctx, point_on_circle(center, angle, r * 8 / 10),
+                            point_on_circle(center, angle, r + 2));
+      }
+      break;
+
+    case WX_FOG:
+      graphics_context_set_stroke_color(ctx, accent);
+      graphics_context_set_stroke_width(ctx, 2);
+      for (int i = -1; i <= 1; i++) {
+        graphics_draw_line(ctx, GPoint(center.x - r, center.y + i * r / 2),
+                            GPoint(center.x + r, center.y + i * r / 2));
+      }
+      break;
+
+    case WX_RAIN:
+      draw_cloud(ctx, center, r * 7 / 10, accent);
+      graphics_context_set_stroke_color(ctx, accent);
+      graphics_context_set_stroke_width(ctx, 2);
+      for (int i = -1; i <= 1; i++) {
+        GPoint top = GPoint(center.x + i * r / 2, center.y + r / 2);
+        graphics_draw_line(ctx, top, GPoint(top.x - 2, top.y + r / 2));
+      }
+      break;
+
+    case WX_SNOW:
+      draw_cloud(ctx, center, r * 7 / 10, accent);
+      graphics_context_set_fill_color(ctx, accent);
+      for (int i = -1; i <= 1; i++) {
+        graphics_fill_circle(ctx, GPoint(center.x + i * r / 2, center.y + r / 2), 1);
+      }
+      break;
+
+    case WX_STORM:
+      draw_cloud(ctx, center, r * 7 / 10, accent);
+      graphics_context_set_stroke_color(ctx, accent);
+      graphics_context_set_stroke_width(ctx, 2);
+      graphics_draw_line(ctx, GPoint(center.x, center.y + r / 3),
+                          GPoint(center.x - r / 4, center.y + r * 7 / 10));
+      graphics_draw_line(ctx, GPoint(center.x - r / 4, center.y + r * 7 / 10),
+                          GPoint(center.x + r / 6, center.y + r * 7 / 10));
+      graphics_draw_line(ctx, GPoint(center.x + r / 6, center.y + r * 7 / 10),
+                          GPoint(center.x - r / 8, center.y + r * 11 / 10));
+      break;
+
+    case WX_CLOUDY:
+    default:
+      draw_cloud(ctx, center, r, accent);
+      break;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Center readout
 // ---------------------------------------------------------------------------
 
@@ -142,13 +325,14 @@ static void compute_layout(GRect bounds) {
       fonts_get_system_font(big ? FONT_KEY_GOTHIC_18 : FONT_KEY_GOTHIC_14);
   s_time_h = big ? 54 : 46;
   s_line_h = big ? 22 : 16;
+  s_icon_row_h = big ? 30 : 22;
 
   // Scatter the grain speckle once per screen size, in the annulus between
   // the center text block and the chapter ring, so it never overlaps
   // either and never needs recomputing on every redraw.
   GPoint center = GPoint(bounds.size.w / 2, bounds.size.h / 2);
   int r_max = bounds.size.w / 2 - bounds.size.w / 6 - 6;
-  int r_min = s_time_h;
+  int r_min = (s_time_h + s_line_h + s_icon_row_h + s_line_h) / 2;
   if (r_min > r_max - 10) r_min = r_max / 3;
   int span = r_max - r_min;
   if (span < 1) span = 1;
@@ -161,7 +345,7 @@ static void compute_layout(GRect bounds) {
 }
 
 static void draw_center(GContext *ctx, GRect bounds) {
-  int total_h = s_time_h + 2 * s_line_h;  // time, date, weather
+  int total_h = s_time_h + s_line_h + s_icon_row_h + s_line_h;  // time, date, icon, weather
   int top = bounds.size.h / 2 - total_h / 2;
 
   graphics_context_set_text_color(ctx, GColorWhite);
@@ -178,6 +362,11 @@ static void draw_center(GContext *ctx, GRect bounds) {
                       GTextOverflowModeFill, GTextAlignmentCenter, NULL);
   y += s_line_h;
 
+  GPoint icon_center = GPoint(bounds.size.w / 2, y + s_icon_row_h / 2);
+  draw_weather_icon(ctx, icon_center, s_icon_row_h / 2 - 2);
+  y += s_icon_row_h;
+
+  graphics_context_set_text_color(ctx, dim);
   GRect weather_rect = GRect(0, y, bounds.size.w, s_line_h);
   graphics_draw_text(ctx, s_weather_buffer, s_detail_font, weather_rect,
                       GTextOverflowModeFill, GTextAlignmentCenter, NULL);
@@ -193,12 +382,19 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
   graphics_context_set_fill_color(ctx, GColorBlack);
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
 
-  draw_tick_bezel(ctx, bounds);
+  draw_day_night_bezel(ctx, bounds);
   draw_chapter_ring(ctx, bounds);
   draw_grain(ctx);
   draw_battery_ring(ctx, bounds);
   draw_center(ctx, bounds);
   draw_bluetooth_alert(ctx, bounds);
+
+  // Only worth showing when it'd actually be visible in the sky.
+  if (current_period() == PERIOD_NIGHT) {
+    int bottom_offset = PBL_IF_ROUND_ELSE((int)(bounds.size.h * 0.19), 20);
+    GPoint moon_center = GPoint(bounds.size.w / 2, bounds.size.h - bottom_offset);
+    draw_moon_phase(ctx, moon_center, bounds.size.w / 22 < 6 ? 6 : bounds.size.w / 22);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +405,7 @@ static void update_time_buffers(struct tm *tick_time) {
   strftime(s_time_buffer, sizeof(s_time_buffer),
            clock_is_24h_style() ? "%H:%M" : "%I:%M", tick_time);
   strftime(s_date_buffer, sizeof(s_date_buffer), "%a %d %b", tick_time);
+  s_now_min = tick_time->tm_hour * 60 + tick_time->tm_min;
 }
 
 // Nudges the phone's companion JS to refetch and push a fresh weather
@@ -232,10 +429,24 @@ static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
 static void inbox_received_handler(DictionaryIterator *iterator, void *context) {
   Tuple *temp_tuple = dict_find(iterator, KEY_TEMPERATURE);
   Tuple *cond_tuple = dict_find(iterator, KEY_CONDITION);
-  if (!temp_tuple || !cond_tuple) return;
+  Tuple *category_tuple = dict_find(iterator, KEY_CATEGORY);
+  Tuple *sunrise_tuple = dict_find(iterator, KEY_SUNRISE);
+  Tuple *sunset_tuple = dict_find(iterator, KEY_SUNSET);
 
-  snprintf(s_weather_buffer, sizeof(s_weather_buffer), "%d° %s",
-           (int)temp_tuple->value->int32, cond_tuple->value->cstring);
+  if (temp_tuple && cond_tuple) {
+    snprintf(s_weather_buffer, sizeof(s_weather_buffer), "%d° %s",
+             (int)temp_tuple->value->int32, cond_tuple->value->cstring);
+  }
+  if (category_tuple) {
+    s_weather_category = (WeatherCategory)category_tuple->value->int32;
+  }
+  if (sunrise_tuple) {
+    s_sunrise_min = (int)sunrise_tuple->value->int32;
+  }
+  if (sunset_tuple) {
+    s_sunset_min = (int)sunset_tuple->value->int32;
+  }
+
   layer_mark_dirty(s_canvas_layer);
 }
 
