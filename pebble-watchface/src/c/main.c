@@ -172,7 +172,7 @@ static void draw_hud_box(GContext *ctx, GRect bounds, GRect *out_box) {
 
   GColor accent = PBL_IF_COLOR_ELSE(GColorBrightGreen, GColorWhite);
   graphics_context_set_stroke_color(ctx, accent);
-  graphics_draw_round_rect_by_value(ctx, box, 4, GCornersAll);
+  graphics_draw_round_rect(ctx, box, 4);
 }
 
 static void draw_time(GContext *ctx, GRect box) {
