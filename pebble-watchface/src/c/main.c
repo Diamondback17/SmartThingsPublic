@@ -6,23 +6,29 @@
 // A sleek, fully-digital face built for round displays (primarily Gabbro's
 // 260x260 Pebble Round 2 screen): a static tick-mark bezel and a thin
 // chapter ring give it dial-like texture, a battery ring sits just inside
-// them, and numeric time/date/steps sit centered. Nothing on screen moves
-// on its own — no seconds hand, no sweeping indicator.
+// them, and numeric time/date/weather sit centered. Nothing on screen
+// moves on its own — no seconds hand, no sweeping indicator. Weather comes
+// from the phone's companion JS (src/js/pebble-js-app.js) over AppMessage,
+// since the watch has no network access of its own.
 // ---------------------------------------------------------------------------
 
 #define GRAIN_COUNT 46
+
+// Must match the "appKeys" order in package.json/appinfo.json.
+#define KEY_TEMPERATURE 0
+#define KEY_CONDITION 1
+#define KEY_REQUEST 2
 
 static Window *s_window;
 static Layer *s_canvas_layer;
 
 static char s_time_buffer[8];
 static char s_date_buffer[24];
-static char s_steps_buffer[24];
+static char s_weather_buffer[32];
 
 static int s_battery_percent = 100;
 static bool s_battery_charging = false;
 static bool s_bt_connected = true;
-static bool s_health_available = false;
 
 static GFont s_time_font;
 static GFont s_detail_font;
@@ -155,8 +161,7 @@ static void compute_layout(GRect bounds) {
 }
 
 static void draw_center(GContext *ctx, GRect bounds) {
-  int lines_below = s_health_available ? 2 : 1;  // date, (steps)
-  int total_h = s_time_h + lines_below * s_line_h;
+  int total_h = s_time_h + 2 * s_line_h;  // time, date, weather
   int top = bounds.size.h / 2 - total_h / 2;
 
   graphics_context_set_text_color(ctx, GColorWhite);
@@ -173,11 +178,9 @@ static void draw_center(GContext *ctx, GRect bounds) {
                       GTextOverflowModeFill, GTextAlignmentCenter, NULL);
   y += s_line_h;
 
-  if (s_health_available) {
-    GRect steps_rect = GRect(0, y, bounds.size.w, s_line_h);
-    graphics_draw_text(ctx, s_steps_buffer, s_detail_font, steps_rect,
-                        GTextOverflowModeFill, GTextAlignmentCenter, NULL);
-  }
+  GRect weather_rect = GRect(0, y, bounds.size.w, s_line_h);
+  graphics_draw_text(ctx, s_weather_buffer, s_detail_font, weather_rect,
+                      GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -208,15 +211,31 @@ static void update_time_buffers(struct tm *tick_time) {
   strftime(s_date_buffer, sizeof(s_date_buffer), "%a %d %b", tick_time);
 }
 
-static void update_steps(void) {
-  if (!s_health_available) return;
-  HealthValue steps = health_service_sum_today(HealthMetricStepCount);
-  snprintf(s_steps_buffer, sizeof(s_steps_buffer), "%d STEPS", (int)steps);
+// Nudges the phone's companion JS to refetch and push a fresh weather
+// reading. The message content doesn't matter - the JS side just listens
+// for any inbound AppMessage as its cue to refetch.
+static void request_weather_update(void) {
+  DictionaryIterator *iter;
+  if (app_message_outbox_begin(&iter) != APP_MSG_OK) return;
+  dict_write_uint8(iter, KEY_REQUEST, 1);
+  app_message_outbox_send();
 }
 
 static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
   update_time_buffers(tick_time);
-  update_steps();
+  if (tick_time->tm_min % 30 == 0) {
+    request_weather_update();
+  }
+  layer_mark_dirty(s_canvas_layer);
+}
+
+static void inbox_received_handler(DictionaryIterator *iterator, void *context) {
+  Tuple *temp_tuple = dict_find(iterator, KEY_TEMPERATURE);
+  Tuple *cond_tuple = dict_find(iterator, KEY_CONDITION);
+  if (!temp_tuple || !cond_tuple) return;
+
+  snprintf(s_weather_buffer, sizeof(s_weather_buffer), "%d° %s",
+           (int)temp_tuple->value->int32, cond_tuple->value->cstring);
   layer_mark_dirty(s_canvas_layer);
 }
 
@@ -232,13 +251,6 @@ static void bt_handler(bool connected) {
   }
   s_bt_connected = connected;
   layer_mark_dirty(s_canvas_layer);
-}
-
-static void health_event_handler(HealthEventType event, void *context) {
-  if (event == HealthEventMovementUpdate || event == HealthEventSignificantUpdate) {
-    update_steps();
-    layer_mark_dirty(s_canvas_layer);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -258,7 +270,6 @@ static void window_load(Window *window) {
   time_t now = time(NULL);
   struct tm *tick_time = localtime(&now);
   update_time_buffers(tick_time);
-  update_steps();
 
   BatteryChargeState state = battery_state_service_peek();
   battery_handler(state);
@@ -276,14 +287,7 @@ static void window_unload(Window *window) {
 
 static void init(void) {
   srand((unsigned int)time(NULL));
-  strcpy(s_steps_buffer, "-- STEPS");
-
-#if defined(PBL_HEALTH)
-  s_health_available = true;
-  health_service_events_subscribe(health_event_handler, NULL);
-#else
-  s_health_available = false;
-#endif
+  strcpy(s_weather_buffer, "-- WEATHER");
 
   s_window = window_create();
   window_set_window_handlers(s_window, (WindowHandlers){
@@ -298,15 +302,17 @@ static void init(void) {
   connection_service_subscribe((ConnectionHandlers){
       .pebble_app_connection_handler = bt_handler,
   });
+
+  app_message_register_inbox_received(inbox_received_handler);
+  app_message_open(app_message_inbox_size_maximum(),
+                    app_message_outbox_size_maximum());
+  request_weather_update();
 }
 
 static void deinit(void) {
   tick_timer_service_unsubscribe();
   battery_state_service_unsubscribe();
   connection_service_unsubscribe();
-#if defined(PBL_HEALTH)
-  health_service_events_unsubscribe();
-#endif
   window_destroy(s_window);
 }
 
