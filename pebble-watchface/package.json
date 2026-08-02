@@ -1,7 +1,7 @@
 {
   "name": "halo",
   "author": "ttrjet",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "keywords": [
     "pebble-app"
   ],
@@ -29,7 +29,12 @@
       "REQUEST": 2,
       "CATEGORY": 3,
       "SUNRISE": 4,
-      "SUNSET": 5
+      "SUNSET": 5,
+      "SUNRISE_TOMORROW": 6,
+      "WIND_SPEED": 7,
+      "WIND_DIR": 8,
+      "UNIT": 9,
+      "ACCENT_MODE": 10
     },
     "resources": {
       "media": []

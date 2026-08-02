@@ -7,15 +7,20 @@
 // A sleek, fully-digital face built for round displays (primarily Gabbro's
 // 260x260 Pebble Round 2 screen). The bezel doubles as a 24-hour day/night
 // gauge lit from real sunrise/sunset times, a drawn weather icon and a
-// computed moon phase (visible at night) add character, and the accent
-// color shifts with time of day and weather mood. Nothing on screen moves
-// on its own - no seconds hand, no sweeping indicator. Weather comes from
-// the phone's companion JS (src/js/pebble-js-app.js) over AppMessage,
-// since the watch has no network access of its own.
+// computed moon phase (visible at night) add character, and one accent
+// color threads through the icon, moon, bezel, chapter ring, battery
+// track, and grain for a cohesive weather/time-driven mood - overridable
+// from the watch's Settings page. A countdown to the next sunrise/sunset
+// sits below the weather line, and tapping the watch briefly swaps that
+// line for wind speed/direction. Nothing on screen moves on its own - no
+// seconds hand, no sweeping indicator. Weather comes from the phone's
+// companion JS (src/js/pebble-js-app.js) over AppMessage, since the watch
+// has no network access of its own.
 // ---------------------------------------------------------------------------
 
 #define GRAIN_COUNT 46
 #define DAY_TICKS 96  // 15-minute resolution across 24 hours
+#define WIND_REVEAL_MS 4000
 
 // Must match the "appKeys" order in package.json/appinfo.json.
 #define KEY_TEMPERATURE 0
@@ -24,6 +29,14 @@
 #define KEY_CATEGORY 3
 #define KEY_SUNRISE 4
 #define KEY_SUNSET 5
+#define KEY_SUNRISE_TOMORROW 6
+#define KEY_WIND_SPEED 7
+#define KEY_WIND_DIR 8
+#define KEY_UNIT 9
+#define KEY_ACCENT_MODE 10
+
+#define PERSIST_KEY_UNIT 100
+#define PERSIST_KEY_ACCENT 101
 
 typedef enum {
   WX_CLEAR = 0,
@@ -41,21 +54,40 @@ typedef enum {
   PERIOD_DUSK,
 } ThemePeriod;
 
+typedef enum {
+  ACCENT_AUTO = 0,
+  ACCENT_BLUE = 1,
+  ACCENT_ORANGE = 2,
+  ACCENT_VIOLET = 3,
+  ACCENT_GREEN = 4,
+  ACCENT_RED = 5,
+  ACCENT_GOLD = 6,
+  ACCENT_MONO = 7,
+} AccentMode;
+
 static Window *s_window;
 static Layer *s_canvas_layer;
 
 static char s_time_buffer[8];
 static char s_date_buffer[24];
 static char s_weather_buffer[32];
+static char s_wind_buffer[32];
+static char s_countdown_buffer[24];
 static WeatherCategory s_weather_category = WX_CLOUDY;
+static bool s_unit_celsius = false;
+static AccentMode s_accent_mode = ACCENT_AUTO;
 
 static int s_battery_percent = 100;
 static bool s_battery_charging = false;
 static bool s_bt_connected = true;
 
-static int s_now_min = 8 * 60;       // minutes since local midnight
-static int s_sunrise_min = 6 * 60;   // placeholders until first weather push
+static int s_now_min = 8 * 60;               // minutes since local midnight
+static int s_sunrise_min = 6 * 60;           // placeholders until first weather push
 static int s_sunset_min = 20 * 60;
+static int s_sunrise_tomorrow_min = 6 * 60;
+
+static bool s_show_wind = false;
+static AppTimer *s_wind_timer;
 
 static GFont s_time_font;
 static GFont s_detail_font;
@@ -82,12 +114,25 @@ static ThemePeriod current_period(void) {
   return PERIOD_NIGHT;
 }
 
-// Dramatic weather overrides the time-of-day mood; otherwise the accent
-// follows dawn/day/dusk/night. Monochrome platforms just get white.
+// A manual accent override wins outright; otherwise dramatic weather
+// overrides the time-of-day mood, which otherwise follows dawn/day/dusk/
+// night. Monochrome platforms always just get white.
 static GColor theme_accent(void) {
 #if !defined(PBL_COLOR)
   return GColorWhite;
 #else
+  switch (s_accent_mode) {
+    case ACCENT_BLUE: return GColorVividCerulean;
+    case ACCENT_ORANGE: return GColorSunsetOrange;
+    case ACCENT_VIOLET: return GColorVividViolet;
+    case ACCENT_GREEN: return GColorGreen;
+    case ACCENT_RED: return GColorRed;
+    case ACCENT_GOLD: return GColorIcterine;
+    case ACCENT_MONO: return GColorWhite;
+    case ACCENT_AUTO:
+    default: break;
+  }
+
   switch (s_weather_category) {
     case WX_STORM: return GColorJazzberryJam;
     case WX_SNOW: return GColorPictonBlue;
@@ -104,6 +149,20 @@ static GColor theme_accent(void) {
 #endif
 }
 
+// A darker shade of the same hue, for background/track elements that
+// should carry the theme without competing with the bright accent uses.
+static GColor dim_color(GColor c) {
+#if !defined(PBL_COLOR)
+  return GColorDarkGray;
+#else
+  GColor out = c;
+  out.r = c.r / 2;
+  out.g = c.g / 2;
+  out.b = c.b / 2;
+  return out;
+#endif
+}
+
 // ---------------------------------------------------------------------------
 // Static dial texture: day/night bezel, chapter ring, grain
 // ---------------------------------------------------------------------------
@@ -115,10 +174,10 @@ static GPoint point_on_circle(GPoint center, int32_t angle, int radius) {
 
 // A 96-tick bezel around the very edge, one revolution per 24 hours
 // (12 o'clock = midnight, 6 o'clock = noon). Ticks falling within today's
-// daylight window are lit brighter than the night ticks, turning the
-// static bezel into a daylight gauge rather than a plain decorative
-// scale. It's still fixed once drawn for the current minute - it doesn't
-// sweep like a hand.
+// daylight window use the bright theme accent; night ticks use a dimmed
+// version of the same color, tying the day/night gauge into the overall
+// mood theme. It's still fixed once drawn for the current minute - it
+// doesn't sweep like a hand.
 static void draw_day_night_bezel(GContext *ctx, GRect bounds) {
   GPoint center = GPoint(bounds.size.w / 2, bounds.size.h / 2);
   int radius = (bounds.size.w < bounds.size.h ? bounds.size.w : bounds.size.h) / 2 - 3;
@@ -127,8 +186,8 @@ static void draw_day_night_bezel(GContext *ctx, GRect bounds) {
   if (minor_len < 3) minor_len = 3;
   if (major_len < 7) major_len = 7;
 
-  GColor day_color = PBL_IF_COLOR_ELSE(GColorIcterine, GColorWhite);
-  GColor night_color = PBL_IF_COLOR_ELSE(GColorIndigo, GColorDarkGray);
+  GColor day_color = theme_accent();
+  GColor night_color = dim_color(day_color);
 
   for (int i = 0; i < DAY_TICKS; i++) {
     bool major = (i % 4 == 0);  // on the hour
@@ -151,7 +210,7 @@ static void draw_chapter_ring(GContext *ctx, GRect bounds) {
   int inset = bounds.size.w / 6;
   GRect ring_rect = GRect(bounds.origin.x + inset, bounds.origin.y + inset,
                            bounds.size.w - 2 * inset, bounds.size.h - 2 * inset);
-  graphics_context_set_fill_color(ctx, PBL_IF_COLOR_ELSE(GColorDarkGray, GColorLightGray));
+  graphics_context_set_fill_color(ctx, dim_color(theme_accent()));
   graphics_fill_radial(ctx, ring_rect, GOvalScaleModeFillCircle, 1,
                         DEG_TO_TRIGANGLE(0), DEG_TO_TRIGANGLE(360));
 }
@@ -160,14 +219,14 @@ static void draw_chapter_ring(GContext *ctx, GRect bounds) {
 // on the otherwise flat black face. Positions are fixed per screen size
 // (computed once in compute_layout), so this never animates.
 static void draw_grain(GContext *ctx) {
-  graphics_context_set_stroke_color(ctx, PBL_IF_COLOR_ELSE(GColorDarkGray, GColorLightGray));
+  graphics_context_set_stroke_color(ctx, dim_color(theme_accent()));
   for (int i = 0; i < GRAIN_COUNT; i++) {
     graphics_draw_pixel(ctx, s_grain[i]);
   }
 }
 
 static void draw_battery_ring(GContext *ctx, GRect bounds) {
-  GColor track = PBL_IF_COLOR_ELSE(GColorDarkGray, GColorLightGray);
+  GColor track = dim_color(theme_accent());
   GColor color;
   if (s_battery_charging) {
     color = PBL_IF_COLOR_ELSE(GColorCyan, GColorWhite);
@@ -195,7 +254,8 @@ static void draw_battery_ring(GContext *ctx, GRect bounds) {
 }
 
 // A small dot at 12 o'clock, visible only when the phone is disconnected -
-// present only when it's actionable, invisible otherwise.
+// present only when it's actionable, invisible otherwise. Always red:
+// alerts stay a fixed, recognizable color regardless of theme.
 static void draw_bluetooth_alert(GContext *ctx, GRect bounds) {
   if (s_bt_connected) return;
   GPoint center = GPoint(bounds.size.w / 2, bounds.origin.y + 22);
@@ -324,15 +384,15 @@ static void compute_layout(GRect bounds) {
   s_detail_font =
       fonts_get_system_font(big ? FONT_KEY_GOTHIC_18 : FONT_KEY_GOTHIC_14);
   s_time_h = big ? 54 : 46;
-  s_line_h = big ? 22 : 16;
-  s_icon_row_h = big ? 30 : 22;
+  s_line_h = big ? 22 : 14;
+  s_icon_row_h = big ? 30 : 20;
 
   // Scatter the grain speckle once per screen size, in the annulus between
   // the center text block and the chapter ring, so it never overlaps
   // either and never needs recomputing on every redraw.
   GPoint center = GPoint(bounds.size.w / 2, bounds.size.h / 2);
   int r_max = bounds.size.w / 2 - bounds.size.w / 6 - 6;
-  int r_min = (s_time_h + s_line_h + s_icon_row_h + s_line_h) / 2;
+  int r_min = (s_time_h + 2 * s_line_h + s_icon_row_h + s_line_h) / 2;
   if (r_min > r_max - 10) r_min = r_max / 3;
   int span = r_max - r_min;
   if (span < 1) span = 1;
@@ -345,7 +405,8 @@ static void compute_layout(GRect bounds) {
 }
 
 static void draw_center(GContext *ctx, GRect bounds) {
-  int total_h = s_time_h + s_line_h + s_icon_row_h + s_line_h;  // time, date, icon, weather
+  // time, date, icon, weather/wind, countdown
+  int total_h = s_time_h + s_line_h + s_icon_row_h + s_line_h + s_line_h;
   int top = bounds.size.h / 2 - total_h / 2;
 
   graphics_context_set_text_color(ctx, GColorWhite);
@@ -368,7 +429,13 @@ static void draw_center(GContext *ctx, GRect bounds) {
 
   graphics_context_set_text_color(ctx, dim);
   GRect weather_rect = GRect(0, y, bounds.size.w, s_line_h);
-  graphics_draw_text(ctx, s_weather_buffer, s_detail_font, weather_rect,
+  graphics_draw_text(ctx, s_show_wind ? s_wind_buffer : s_weather_buffer, s_detail_font,
+                      weather_rect, GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+  y += s_line_h;
+
+  graphics_context_set_text_color(ctx, theme_accent());
+  GRect countdown_rect = GRect(0, y, bounds.size.w, s_line_h);
+  graphics_draw_text(ctx, s_countdown_buffer, s_detail_font, countdown_rect,
                       GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 }
 
@@ -401,11 +468,30 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
 // Services
 // ---------------------------------------------------------------------------
 
+static void update_countdown_text(void) {
+  int diff;
+  const char *label;
+  if (s_now_min < s_sunrise_min) {
+    diff = s_sunrise_min - s_now_min;
+    label = "SUNRISE";
+  } else if (s_now_min < s_sunset_min) {
+    diff = s_sunset_min - s_now_min;
+    label = "SUNSET";
+  } else {
+    diff = (s_sunrise_tomorrow_min + 24 * 60) - s_now_min;
+    label = "SUNRISE";
+  }
+  if (diff < 0) diff = 0;
+  snprintf(s_countdown_buffer, sizeof(s_countdown_buffer), "%s %dH%02dM", label,
+           diff / 60, diff % 60);
+}
+
 static void update_time_buffers(struct tm *tick_time) {
   strftime(s_time_buffer, sizeof(s_time_buffer),
            clock_is_24h_style() ? "%H:%M" : "%I:%M", tick_time);
   strftime(s_date_buffer, sizeof(s_date_buffer), "%a %d %b", tick_time);
   s_now_min = tick_time->tm_hour * 60 + tick_time->tm_min;
+  update_countdown_text();
 }
 
 // Nudges the phone's companion JS to refetch and push a fresh weather
@@ -426,25 +512,65 @@ static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
   layer_mark_dirty(s_canvas_layer);
 }
 
+static void wind_timer_callback(void *data) {
+  s_show_wind = false;
+  layer_mark_dirty(s_canvas_layer);
+}
+
+// Briefly swaps the weather line for wind speed/direction - an
+// interactive detail rather than a continuously-updating hand, so it's a
+// one-shot reveal that reverts itself.
+static void accel_tap_handler(AccelAxisType axis, int32_t direction) {
+  s_show_wind = true;
+  layer_mark_dirty(s_canvas_layer);
+  if (s_wind_timer) app_timer_cancel(s_wind_timer);
+  s_wind_timer = app_timer_register(WIND_REVEAL_MS, wind_timer_callback, NULL);
+}
+
 static void inbox_received_handler(DictionaryIterator *iterator, void *context) {
   Tuple *temp_tuple = dict_find(iterator, KEY_TEMPERATURE);
   Tuple *cond_tuple = dict_find(iterator, KEY_CONDITION);
   Tuple *category_tuple = dict_find(iterator, KEY_CATEGORY);
   Tuple *sunrise_tuple = dict_find(iterator, KEY_SUNRISE);
   Tuple *sunset_tuple = dict_find(iterator, KEY_SUNSET);
+  Tuple *sunrise_tomorrow_tuple = dict_find(iterator, KEY_SUNRISE_TOMORROW);
+  Tuple *wind_speed_tuple = dict_find(iterator, KEY_WIND_SPEED);
+  Tuple *wind_dir_tuple = dict_find(iterator, KEY_WIND_DIR);
+  Tuple *unit_tuple = dict_find(iterator, KEY_UNIT);
+  Tuple *accent_tuple = dict_find(iterator, KEY_ACCENT_MODE);
 
+  if (unit_tuple) {
+    s_unit_celsius = unit_tuple->value->int32 != 0;
+    persist_write_bool(PERSIST_KEY_UNIT, s_unit_celsius);
+  }
+  if (accent_tuple) {
+    s_accent_mode = (AccentMode)accent_tuple->value->int32;
+    persist_write_int(PERSIST_KEY_ACCENT, s_accent_mode);
+  }
   if (temp_tuple && cond_tuple) {
-    snprintf(s_weather_buffer, sizeof(s_weather_buffer), "%d° %s",
-             (int)temp_tuple->value->int32, cond_tuple->value->cstring);
+    snprintf(s_weather_buffer, sizeof(s_weather_buffer), "%d°%s %s",
+             (int)temp_tuple->value->int32, s_unit_celsius ? "C" : "F",
+             cond_tuple->value->cstring);
   }
   if (category_tuple) {
     s_weather_category = (WeatherCategory)category_tuple->value->int32;
+  }
+  if (wind_speed_tuple && wind_dir_tuple) {
+    snprintf(s_wind_buffer, sizeof(s_wind_buffer), "%d %s %s",
+             (int)wind_speed_tuple->value->int32, s_unit_celsius ? "KMH" : "MPH",
+             wind_dir_tuple->value->cstring);
   }
   if (sunrise_tuple) {
     s_sunrise_min = (int)sunrise_tuple->value->int32;
   }
   if (sunset_tuple) {
     s_sunset_min = (int)sunset_tuple->value->int32;
+  }
+  if (sunrise_tomorrow_tuple) {
+    s_sunrise_tomorrow_min = (int)sunrise_tomorrow_tuple->value->int32;
+  }
+  if (sunrise_tuple || sunset_tuple || sunrise_tomorrow_tuple) {
+    update_countdown_text();
   }
 
   layer_mark_dirty(s_canvas_layer);
@@ -499,6 +625,14 @@ static void window_unload(Window *window) {
 static void init(void) {
   srand((unsigned int)time(NULL));
   strcpy(s_weather_buffer, "-- WEATHER");
+  strcpy(s_wind_buffer, "-- WIND");
+
+  if (persist_exists(PERSIST_KEY_UNIT)) {
+    s_unit_celsius = persist_read_bool(PERSIST_KEY_UNIT);
+  }
+  if (persist_exists(PERSIST_KEY_ACCENT)) {
+    s_accent_mode = (AccentMode)persist_read_int(PERSIST_KEY_ACCENT);
+  }
 
   s_window = window_create();
   window_set_window_handlers(s_window, (WindowHandlers){
@@ -513,6 +647,7 @@ static void init(void) {
   connection_service_subscribe((ConnectionHandlers){
       .pebble_app_connection_handler = bt_handler,
   });
+  accel_tap_service_subscribe(accel_tap_handler);
 
   app_message_register_inbox_received(inbox_received_handler);
   app_message_open(app_message_inbox_size_maximum(),
@@ -524,6 +659,7 @@ static void deinit(void) {
   tick_timer_service_unsubscribe();
   battery_state_service_unsubscribe();
   connection_service_unsubscribe();
+  accel_tap_service_unsubscribe();
   window_destroy(s_window);
 }
 
