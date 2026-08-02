@@ -1,28 +1,23 @@
-# Cyber Matrix — a Pebble watchface
+# Halo — a Pebble watchface
 
-A "go crazy" digital watchface for Pebble, built primarily for **Gabbro**
-(Pebble Round 2, the 260x260 round display) with the layout scaling down
-cleanly to Emery, Chalk, Basalt, Diorite, and Aplite too:
+A sleek, fully-digital watchface built primarily for **Gabbro** (Pebble
+Round 2, the 260x260 round display), designed around concentric rings so
+it reads naturally on a circular screen instead of forcing a rectangular
+layout into a circle. No clock hands, no clutter.
 
-- **Live digital-rain background** — falling character columns, à la The
-  Matrix, running behind everything and continuously animating every second.
-- **Glitch HUD clock** — big monospace time readout in a terminal-style
-  panel, with seconds and date underneath (plus today's step count on
-  watches with the Health service).
-- **Chromatic-aberration glitch bursts** — the clock randomly "glitches"
-  for a few frames (red/cyan mis-registered copies + a burst of rain
-  scrambling), with a small chance every second, or on demand.
-- **Shake to glitch** — tap/shake the watch to trigger the glitch burst
-  and a vibration on demand.
-- **Radial battery ring** — a colored arc traced around the very edge of
-  the screen showing charge level (green/yellow/red, cyan while charging).
-- **Bluetooth status dot** — solid dot when connected, an "X" plus a
-  double vibration pulse when the phone disconnects.
-- Full color on Gabbro/Basalt/Chalk/Emery, sensible white-on-black
-  fallback on the 1-bit Aplite/Diorite displays. The HUD box, fonts, and
-  matrix-rain grid density all scale with screen size, and round platforms
-  (Gabbro, Chalk) get a narrower box so corners aren't clipped by the
-  circular display mask.
+- **Numeric time, centered** — big light-weight digits, date and (on
+  Health-capable watches) today's step count beneath, all vertically
+  centered in the circle.
+- **Seconds ring** — a thin accent-colored ring traces around the very
+  edge of the screen, sweeping a full revolution once a minute.
+- **Battery ring** — a second, slightly inset ring shows charge level
+  (green/yellow/red, cyan while charging) — two clean concentric rings
+  instead of one loud one.
+- **Bluetooth alert** — a small dot appears near the top only when the
+  phone disconnects (with a vibration), and disappears once reconnected —
+  visible only when it's actionable.
+- Full color on Gabbro/Basalt/Chalk/Emery, clean white-on-black fallback
+  on the 1-bit Aplite/Diorite displays. Layout scales with screen size.
 
 ## Project layout
 
@@ -51,13 +46,10 @@ in the browser.
 
 ## Customizing
 
-- `s_charset` in `main.c` controls which characters fall in the rain —
-  swap in different symbols for a different vibe.
-- The rain grid's cell size and the HUD box/font sizing scale off screen
-  width (see `BASE_WIDTH`, `matrix_init`, and `compute_layout` in
-  `main.c`) rather than being hardcoded per platform.
-- `GLITCH_FRAME_COUNT` / `GLITCH_FRAME_MS` control how long/fast glitch
-  bursts play.
-- The `rand() % 45` check in `tick_handler` controls how often random
-  glitches fire on their own — raise it to calm the watchface down, lower
-  it to make it glitchier.
+- `compute_layout` in `main.c` picks fonts/line heights based on screen
+  width — tweak the `big` threshold or the font keys to change sizing.
+- `draw_ring`'s `inset`/`thickness` arguments (called from
+  `draw_seconds_ring`/`draw_battery_ring`) control how thick the rings are
+  and how far apart they sit.
+- The accent color for the seconds ring is set in `draw_seconds_ring`
+  (`GColorVividCerulean` by default) — swap it for a different vibe.

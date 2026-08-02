@@ -1,14 +1,14 @@
 {
-  "name": "cyber-matrix",
+  "name": "halo",
   "author": "ttrjet",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "keywords": [
     "pebble-app"
   ],
   "private": true,
   "dependencies": {},
   "pebble": {
-    "displayName": "Cyber Matrix",
+    "displayName": "Halo",
     "uuid": "dc6eaa79-c51e-4e4a-8fae-ddeec450fb8f",
     "sdkVersion": "3",
     "enableMultiJS": false,
