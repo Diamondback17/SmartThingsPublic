@@ -118,25 +118,30 @@ static ThemePeriod current_period(void) {
 
 // A darker shade of the same hue, for background/track elements that
 // should carry the theme without competing with the bright accent uses.
+// Uses ceiling division so a channel that's already nonzero never gets
+// dimmed all the way to 0 - if this ever gets applied twice to the same
+// color by mistake, the result is "very dim" rather than invisible black
+// against the black background.
 static GColor dim_color(GColor c) {
 #if !defined(PBL_COLOR)
   return GColorDarkGray;
 #else
   GColor out = c;
-  out.r = c.r / 2;
-  out.g = c.g / 2;
-  out.b = c.b / 2;
+  out.r = (c.r + 1) / 2;
+  out.g = (c.g + 1) / 2;
+  out.b = (c.b + 1) / 2;
   return out;
 #endif
 }
 
 // A manual accent override wins outright. Otherwise weather is the
 // primary driver: dramatic conditions (storm/snow/fog/rain) get their
-// own fixed mood color outright, clear skies get the full-bright
-// time-of-day color, and cloudy cover dims that same color - so cloudy
-// days visibly read as duller than clear ones instead of looking
-// identical. Monochrome platforms always just get white.
-static GColor theme_accent(void) {
+// own fixed mood color outright, and clear/cloudy skies get the
+// time-of-day color. This is the *undimmed* base - callers that want
+// their own "dim" variant (night ticks, chapter ring, battery track,
+// grain) should dim this, not theme_accent() below, or cloudy weather
+// would get dimmed twice and collapse to invisible black.
+static GColor theme_base_color(void) {
 #if !defined(PBL_COLOR)
   return GColorWhite;
 #else
@@ -160,14 +165,24 @@ static GColor theme_accent(void) {
     default: break;
   }
 
-  GColor time_color;
   switch (current_period()) {
-    case PERIOD_DAWN: time_color = GColorSunsetOrange; break;
-    case PERIOD_DAY: time_color = GColorVividCerulean; break;
-    case PERIOD_DUSK: time_color = GColorVividViolet; break;
-    default: time_color = GColorDukeBlue; break;
+    case PERIOD_DAWN: return GColorSunsetOrange;
+    case PERIOD_DAY: return GColorVividCerulean;
+    case PERIOD_DUSK: return GColorVividViolet;
+    default: return GColorDukeBlue;
   }
-  return s_weather_category == WX_CLOUDY ? dim_color(time_color) : time_color;
+#endif
+}
+
+// The color actually used for bright/direct display (weather icon, moon,
+// lit bezel ticks, countdown text): the base color, dimmed once more if
+// it's cloudy so cloudy days read as duller than clear ones.
+static GColor theme_accent(void) {
+  GColor base = theme_base_color();
+#if !defined(PBL_COLOR)
+  return base;
+#else
+  return s_weather_category == WX_CLOUDY ? dim_color(base) : base;
 #endif
 }
 
@@ -195,7 +210,10 @@ static void draw_day_night_bezel(GContext *ctx, GRect bounds) {
   if (major_len < 7) major_len = 7;
 
   GColor day_color = theme_accent();
-  GColor night_color = dim_color(day_color);
+  // Dim the undimmed base, not theme_accent() - it may already be dimmed
+  // once for cloudy weather, and dimming that again risks collapsing to
+  // black (invisible against the background).
+  GColor night_color = dim_color(theme_base_color());
 
   for (int i = 0; i < DAY_TICKS; i++) {
     bool major = (i % 4 == 0);  // on the hour
@@ -217,7 +235,7 @@ static void draw_day_night_bezel(GContext *ctx, GRect bounds) {
 static void draw_chapter_ring(GContext *ctx, GRect bounds) {
   GRect ring_rect = GRect(bounds.origin.x + s_chapter_inset, bounds.origin.y + s_chapter_inset,
                            bounds.size.w - 2 * s_chapter_inset, bounds.size.h - 2 * s_chapter_inset);
-  graphics_context_set_fill_color(ctx, dim_color(theme_accent()));
+  graphics_context_set_fill_color(ctx, dim_color(theme_base_color()));
   graphics_fill_radial(ctx, ring_rect, GOvalScaleModeFillCircle, 1,
                         DEG_TO_TRIGANGLE(0), DEG_TO_TRIGANGLE(360));
 }
@@ -231,7 +249,7 @@ static void draw_chapter_ring(GContext *ctx, GRect bounds) {
 // live category, but nothing here animates - it's still a static texture,
 // just one that matches whatever the sky is doing right now.
 static void draw_grain(GContext *ctx) {
-  GColor color = dim_color(theme_accent());
+  GColor color = dim_color(theme_base_color());
 
   switch (s_weather_category) {
     case WX_RAIN:
@@ -270,7 +288,7 @@ static void draw_grain(GContext *ctx) {
 }
 
 static void draw_battery_ring(GContext *ctx, GRect bounds) {
-  GColor track = dim_color(theme_accent());
+  GColor track = dim_color(theme_base_color());
   GColor color;
   if (s_battery_charging) {
     color = PBL_IF_COLOR_ELSE(GColorCyan, GColorWhite);
