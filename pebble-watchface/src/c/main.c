@@ -3,12 +3,14 @@
 // ---------------------------------------------------------------------------
 // "Halo" watchface
 //
-// A sleek, fully-digital face built around concentric rings so it reads
-// naturally on round displays (primarily Gabbro's 260x260 Pebble Round 2
-// screen): a thin sweeping ring traces the current minute's seconds, a
-// second inner ring shows battery level, and the numeric time sits
-// centered with date and steps beneath it. No hands, no clutter.
+// A sleek, fully-digital face built for round displays (primarily Gabbro's
+// 260x260 Pebble Round 2 screen): a static tick-mark bezel and a thin
+// chapter ring give it dial-like texture, a battery ring sits just inside
+// them, and numeric time/date/steps sit centered. Nothing on screen moves
+// on its own — no seconds hand, no sweeping indicator.
 // ---------------------------------------------------------------------------
+
+#define GRAIN_COUNT 46
 
 static Window *s_window;
 static Layer *s_canvas_layer;
@@ -17,7 +19,6 @@ static char s_time_buffer[8];
 static char s_date_buffer[24];
 static char s_steps_buffer[24];
 
-static int s_seconds = 0;
 static int s_battery_percent = 100;
 static bool s_battery_charging = false;
 static bool s_bt_connected = true;
@@ -28,32 +29,62 @@ static GFont s_detail_font;
 static int s_time_h;
 static int s_line_h;
 
+static GPoint s_grain[GRAIN_COUNT];
+
 // ---------------------------------------------------------------------------
-// Rings
+// Static dial texture: tick bezel, chapter ring, grain
 // ---------------------------------------------------------------------------
 
-static void draw_ring(GContext *ctx, GRect bounds, int inset, int thickness,
-                       GColor track_color, GColor progress_color,
-                       float fraction) {
-  GRect ring_rect = GRect(bounds.origin.x + inset, bounds.origin.y + inset,
-                           bounds.size.w - 2 * inset,
-                           bounds.size.h - 2 * inset);
-
-  graphics_context_set_fill_color(ctx, track_color);
-  graphics_fill_radial(ctx, ring_rect, GOvalScaleModeFillCircle, thickness,
-                        DEG_TO_TRIGANGLE(0), DEG_TO_TRIGANGLE(360));
-
-  if (fraction <= 0) return;
-  graphics_context_set_fill_color(ctx, progress_color);
-  int32_t angle_end = (int32_t)(TRIG_MAX_ANGLE * fraction);
-  graphics_fill_radial(ctx, ring_rect, GOvalScaleModeFillCircle, thickness,
-                        DEG_TO_TRIGANGLE(0), angle_end);
+static GPoint point_on_circle(GPoint center, int32_t angle, int radius) {
+  return GPoint(center.x + (int16_t)(sin_lookup(angle) * radius / TRIG_MAX_RATIO),
+                center.y - (int16_t)(cos_lookup(angle) * radius / TRIG_MAX_RATIO));
 }
 
-static void draw_seconds_ring(GContext *ctx, GRect bounds) {
-  GColor track = PBL_IF_COLOR_ELSE(GColorDarkGray, GColorLightGray);
-  GColor accent = PBL_IF_COLOR_ELSE(GColorVividCerulean, GColorWhite);
-  draw_ring(ctx, bounds, 4, 4, track, accent, s_seconds / 60.0f);
+// A fixed 60-tick bezel (5 major ticks per hour mark) around the very edge.
+// Purely decorative and static - it doesn't move, so it reads as dial
+// texture rather than a hand.
+static void draw_tick_bezel(GContext *ctx, GRect bounds) {
+  GPoint center = GPoint(bounds.size.w / 2, bounds.size.h / 2);
+  int radius = (bounds.size.w < bounds.size.h ? bounds.size.w : bounds.size.h) / 2 - 3;
+  int minor_len = bounds.size.w / 40;
+  int major_len = bounds.size.w / 18;
+  if (minor_len < 3) minor_len = 3;
+  if (major_len < 7) major_len = 7;
+
+  for (int i = 0; i < 60; i++) {
+    bool major = (i % 5 == 0);
+    int32_t angle = TRIG_MAX_ANGLE * i / 60;
+    int len = major ? major_len : minor_len;
+
+    GColor color = major ? PBL_IF_COLOR_ELSE(GColorLightGray, GColorWhite)
+                          : PBL_IF_COLOR_ELSE(GColorDarkGray, GColorLightGray);
+    graphics_context_set_stroke_color(ctx, color);
+    graphics_context_set_stroke_width(ctx, major ? 3 : 1);
+    graphics_draw_line(ctx, point_on_circle(center, angle, radius),
+                        point_on_circle(center, angle, radius - len));
+  }
+}
+
+// A thin decorative circle just inside the bezel - separates the tick
+// texture from the battery ring/center readout, like a chapter ring on a
+// dial.
+static void draw_chapter_ring(GContext *ctx, GRect bounds) {
+  int inset = bounds.size.w / 6;
+  GRect ring_rect = GRect(bounds.origin.x + inset, bounds.origin.y + inset,
+                           bounds.size.w - 2 * inset, bounds.size.h - 2 * inset);
+  graphics_context_set_fill_color(ctx, PBL_IF_COLOR_ELSE(GColorDarkGray, GColorLightGray));
+  graphics_fill_radial(ctx, ring_rect, GOvalScaleModeFillCircle, 1,
+                        DEG_TO_TRIGANGLE(0), DEG_TO_TRIGANGLE(360));
+}
+
+// Sparse static speckle inside the chapter ring for a bit of grain/texture
+// on the otherwise flat black face. Positions are fixed per screen size
+// (computed once in compute_layout), so this never animates.
+static void draw_grain(GContext *ctx) {
+  graphics_context_set_stroke_color(ctx, PBL_IF_COLOR_ELSE(GColorDarkGray, GColorLightGray));
+  for (int i = 0; i < GRAIN_COUNT; i++) {
+    graphics_draw_pixel(ctx, s_grain[i]);
+  }
 }
 
 static void draw_battery_ring(GContext *ctx, GRect bounds) {
@@ -68,7 +99,20 @@ static void draw_battery_ring(GContext *ctx, GRect bounds) {
   } else {
     color = PBL_IF_COLOR_ELSE(GColorRed, GColorWhite);
   }
-  draw_ring(ctx, bounds, 12, 3, track, color, s_battery_percent / 100.0f);
+
+  int inset = bounds.size.w / 6 + 8;
+  int thickness = 3;
+  GRect ring_rect = GRect(bounds.origin.x + inset, bounds.origin.y + inset,
+                           bounds.size.w - 2 * inset, bounds.size.h - 2 * inset);
+
+  graphics_context_set_fill_color(ctx, track);
+  graphics_fill_radial(ctx, ring_rect, GOvalScaleModeFillCircle, thickness,
+                        DEG_TO_TRIGANGLE(0), DEG_TO_TRIGANGLE(360));
+
+  graphics_context_set_fill_color(ctx, color);
+  int32_t angle_end = (int32_t)(TRIG_MAX_ANGLE * s_battery_percent / 100);
+  graphics_fill_radial(ctx, ring_rect, GOvalScaleModeFillCircle, thickness,
+                        DEG_TO_TRIGANGLE(0), angle_end);
 }
 
 // A small dot at 12 o'clock, visible only when the phone is disconnected -
@@ -92,6 +136,22 @@ static void compute_layout(GRect bounds) {
       fonts_get_system_font(big ? FONT_KEY_GOTHIC_18 : FONT_KEY_GOTHIC_14);
   s_time_h = big ? 54 : 46;
   s_line_h = big ? 22 : 16;
+
+  // Scatter the grain speckle once per screen size, in the annulus between
+  // the center text block and the chapter ring, so it never overlaps
+  // either and never needs recomputing on every redraw.
+  GPoint center = GPoint(bounds.size.w / 2, bounds.size.h / 2);
+  int r_max = bounds.size.w / 2 - bounds.size.w / 6 - 6;
+  int r_min = s_time_h;
+  if (r_min > r_max - 10) r_min = r_max / 3;
+  int span = r_max - r_min;
+  if (span < 1) span = 1;
+
+  for (int i = 0; i < GRAIN_COUNT; i++) {
+    int32_t angle = rand() % TRIG_MAX_ANGLE;
+    int r = r_min + rand() % span;
+    s_grain[i] = point_on_circle(center, angle, r);
+  }
 }
 
 static void draw_center(GContext *ctx, GRect bounds) {
@@ -130,7 +190,9 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
   graphics_context_set_fill_color(ctx, GColorBlack);
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
 
-  draw_seconds_ring(ctx, bounds);
+  draw_tick_bezel(ctx, bounds);
+  draw_chapter_ring(ctx, bounds);
+  draw_grain(ctx);
   draw_battery_ring(ctx, bounds);
   draw_center(ctx, bounds);
   draw_bluetooth_alert(ctx, bounds);
@@ -144,7 +206,6 @@ static void update_time_buffers(struct tm *tick_time) {
   strftime(s_time_buffer, sizeof(s_time_buffer),
            clock_is_24h_style() ? "%H:%M" : "%I:%M", tick_time);
   strftime(s_date_buffer, sizeof(s_date_buffer), "%a %d %b", tick_time);
-  s_seconds = tick_time->tm_sec;
 }
 
 static void update_steps(void) {
@@ -214,6 +275,7 @@ static void window_unload(Window *window) {
 // ---------------------------------------------------------------------------
 
 static void init(void) {
+  srand((unsigned int)time(NULL));
   strcpy(s_steps_buffer, "-- STEPS");
 
 #if defined(PBL_HEALTH)
@@ -231,7 +293,7 @@ static void init(void) {
   window_set_background_color(s_window, GColorBlack);
   window_stack_push(s_window, true);
 
-  tick_timer_service_subscribe(SECOND_UNIT, tick_handler);
+  tick_timer_service_subscribe(MINUTE_UNIT, tick_handler);
   battery_state_service_subscribe(battery_handler);
   connection_service_subscribe((ConnectionHandlers){
       .pebble_app_connection_handler = bt_handler,
