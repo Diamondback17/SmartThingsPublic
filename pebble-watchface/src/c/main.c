@@ -94,6 +94,8 @@ static GFont s_detail_font;
 static int s_time_h;
 static int s_line_h;
 static int s_icon_row_h;
+static int s_battery_inset;
+static int s_chapter_inset;
 
 static GPoint s_grain[GRAIN_COUNT];
 
@@ -207,9 +209,8 @@ static void draw_day_night_bezel(GContext *ctx, GRect bounds) {
 // texture from the battery ring/center readout, like a chapter ring on a
 // dial.
 static void draw_chapter_ring(GContext *ctx, GRect bounds) {
-  int inset = bounds.size.w / 6;
-  GRect ring_rect = GRect(bounds.origin.x + inset, bounds.origin.y + inset,
-                           bounds.size.w - 2 * inset, bounds.size.h - 2 * inset);
+  GRect ring_rect = GRect(bounds.origin.x + s_chapter_inset, bounds.origin.y + s_chapter_inset,
+                           bounds.size.w - 2 * s_chapter_inset, bounds.size.h - 2 * s_chapter_inset);
   graphics_context_set_fill_color(ctx, dim_color(theme_accent()));
   graphics_fill_radial(ctx, ring_rect, GOvalScaleModeFillCircle, 1,
                         DEG_TO_TRIGANGLE(0), DEG_TO_TRIGANGLE(360));
@@ -238,10 +239,9 @@ static void draw_battery_ring(GContext *ctx, GRect bounds) {
     color = PBL_IF_COLOR_ELSE(GColorRed, GColorWhite);
   }
 
-  int inset = bounds.size.w / 6 + 8;
   int thickness = 3;
-  GRect ring_rect = GRect(bounds.origin.x + inset, bounds.origin.y + inset,
-                           bounds.size.w - 2 * inset, bounds.size.h - 2 * inset);
+  GRect ring_rect = GRect(bounds.origin.x + s_battery_inset, bounds.origin.y + s_battery_inset,
+                           bounds.size.w - 2 * s_battery_inset, bounds.size.h - 2 * s_battery_inset);
 
   graphics_context_set_fill_color(ctx, track);
   graphics_fill_radial(ctx, ring_rect, GOvalScaleModeFillCircle, thickness,
@@ -383,16 +383,36 @@ static void compute_layout(GRect bounds) {
   s_time_font = fonts_get_system_font(FONT_KEY_BITHAM_42_LIGHT);
   s_detail_font =
       fonts_get_system_font(big ? FONT_KEY_GOTHIC_18 : FONT_KEY_GOTHIC_14);
-  s_time_h = big ? 54 : 46;
-  s_line_h = big ? 22 : 14;
-  s_icon_row_h = big ? 30 : 20;
+  s_time_h = big ? 50 : 42;
+  s_line_h = big ? 20 : 12;
+  s_icon_row_h = big ? 26 : 18;
+
+  // time, date, icon, weather/wind, countdown - keep in sync with draw_center.
+  int content_h = s_time_h + 3 * s_line_h + s_icon_row_h;
+  int content_half = content_h / 2 + 6;  // safety margin
+
+  // Derive the battery ring's position from how tall the center text
+  // block actually is, with a fixed clearance gap, instead of guessing a
+  // screen-fraction inset independently - that's what let the countdown
+  // row (added later) end up overlapping the ring despite an "adequate"
+  // fixed margin against the chapter ring, which isn't the boundary that
+  // actually matters here. The chapter ring then wraps just outside
+  // whatever the battery ring ends up being, so the two always stay
+  // correctly nested regardless of how content_h changes.
+  const int battery_thickness = 3;
+  const int battery_clearance = 6;
+  int min_inset_floor = bounds.size.w / 8;
+  s_battery_inset = bounds.size.h / 2 - content_half - battery_thickness - battery_clearance;
+  if (s_battery_inset < min_inset_floor) s_battery_inset = min_inset_floor;
+  s_chapter_inset = s_battery_inset - 4;
+  if (s_chapter_inset < 4) s_chapter_inset = 4;
 
   // Scatter the grain speckle once per screen size, in the annulus between
   // the center text block and the chapter ring, so it never overlaps
   // either and never needs recomputing on every redraw.
   GPoint center = GPoint(bounds.size.w / 2, bounds.size.h / 2);
-  int r_max = bounds.size.w / 2 - bounds.size.w / 6 - 6;
-  int r_min = (s_time_h + 2 * s_line_h + s_icon_row_h + s_line_h) / 2;
+  int r_max = bounds.size.w / 2 - s_chapter_inset - 6;
+  int r_min = content_half;
   if (r_min > r_max - 10) r_min = r_max / 3;
   int span = r_max - r_min;
   if (span < 1) span = 1;
