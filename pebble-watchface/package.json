@@ -1,0 +1,32 @@
+{
+  "name": "cyber-matrix",
+  "author": "ttrjet",
+  "version": "1.0.0",
+  "keywords": [
+    "pebble-app"
+  ],
+  "private": true,
+  "dependencies": {},
+  "pebble": {
+    "displayName": "Cyber Matrix",
+    "uuid": "dc6eaa79-c51e-4e4a-8fae-ddeec450fb8f",
+    "sdkVersion": "3",
+    "enableMultiJS": false,
+    "targetPlatforms": [
+      "aplite",
+      "basalt",
+      "chalk",
+      "diorite",
+      "emery"
+    ],
+    "watchapp": {
+      "watchface": true
+    },
+    "capabilities": [
+      "health"
+    ],
+    "resources": {
+      "media": []
+    }
+  }
+}
