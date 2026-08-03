@@ -186,6 +186,15 @@ static GColor theme_accent(void) {
 #endif
 }
 
+// A near-black wash tinted by the current weather/time theme, twice as
+// dim as the ring/chapter-ring tier so it reads as "black with a mood"
+// rather than a visible color - a storm should feel darker and bluer
+// than a clear night without the background ever competing with
+// anything drawn on top of it.
+static GColor background_color(void) {
+  return dim_color(dim_color(theme_base_color()));
+}
+
 // ---------------------------------------------------------------------------
 // Static dial texture: day/night bezel, chapter ring, grain
 // ---------------------------------------------------------------------------
@@ -353,7 +362,7 @@ static void draw_moon_phase(GContext *ctx, GPoint center, int r) {
   graphics_context_set_fill_color(ctx, theme_accent());
   graphics_fill_circle(ctx, center, r);
 
-  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_context_set_fill_color(ctx, background_color());
   graphics_fill_circle(ctx, GPoint(center.x - offset, center.y), r);
 
   GColor outline = PBL_IF_COLOR_ELSE(GColorDarkGray, GColorLightGray);
@@ -527,7 +536,7 @@ static void draw_center(GContext *ctx, GRect bounds) {
 static void canvas_update_proc(Layer *layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
 
-  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_context_set_fill_color(ctx, background_color());
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
 
   draw_day_night_bezel(ctx, bounds);

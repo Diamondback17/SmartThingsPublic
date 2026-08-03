@@ -41,6 +41,11 @@ layout into a circle. No clock hands, nothing on screen moves on its own.
   — so the whole face's texture reflects the current sky, not just its
   color. Still fully static (positions are fixed, only the style per dot
   changes with the category), so nothing here animates either.
+- **Weather-tinted backdrop** — the "black" background isn't flat: it's
+  tinted a near-invisible shade of the current theme color (twice as dim
+  as the rings, so it never competes with anything drawn on top). A storm
+  reads as a darker, cooler black than a clear night, without ever
+  looking like a colored background.
 - **Settings page** — accessible from the watch app's entry in the phone's
   Pebble app ("Settings"). Lets you override the accent to a fixed color
   (or leave it on Auto) and pick Fahrenheit or Celsius. Persists on the
@@ -102,10 +107,17 @@ separate "PebbleKit JS" tab for the JS file.
   size.
 - `draw_day_night_bezel`'s `minor_len`/`major_len` control tick length;
   `DAY_TICKS` controls its resolution (currently 15-minute steps).
-- `theme_accent` is the single place that maps accent override + weather
-  category + time-of-day period to a color; `dim_color` derives the
-  darker shade used for tracks/night ticks — edit the color tables there
-  to retheme.
+- `theme_base_color` maps accent override + weather category + time-of-day
+  period to the undimmed base color; `theme_accent` adds one dim step on
+  top for cloudy weather, for direct/bright display uses. Anything that
+  wants a "dim" tone (night ticks, chapter ring, battery track, grain,
+  `background_color`) should dim `theme_base_color`, not `theme_accent` -
+  dimming an already-dimmed cloudy color risks collapsing toward black.
+  `dim_color` itself uses ceiling division so it can't fully zero out a
+  channel even if that happens anyway.
+- `background_color` (twice-dimmed `theme_base_color`) is the "black"
+  background fill — kept deliberately dim so it never becomes a visible
+  colored background, just a mood shift in how black reads.
 - `draw_weather_icon`/`draw_cloud` are simple vector glyphs per weather
   category; tweak their shapes there.
 - `compute_moon_phase`/`draw_moon_phase` compute and render the moon —
