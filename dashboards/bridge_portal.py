@@ -354,6 +354,7 @@ PAGE_SHELL = """<!DOCTYPE html>
   th {{ text-align: left; color: var(--text-dim); font-weight: 700; text-transform: uppercase;
     font-size: 11px; letter-spacing: 0.04em; padding: 8px 10px; border-bottom: 2px solid var(--teal-tint); }}
   td {{ padding: 10px; border-bottom: 1px solid var(--border); vertical-align: top; }}
+  tbody tr:hover td {{ background: var(--panel-raised); }}
   td.time {{ color: var(--text-dim); white-space: nowrap; font-variant-numeric: tabular-nums; }}
   .empty {{ color: var(--text-faint); font-size: 13px; padding: 10px 0; }}
   .table-scroll {{ overflow-x: auto; }}
@@ -920,6 +921,8 @@ HYPERVIEW_COMPONENT_CSS = """
   table.matrix thead th, table.summary thead th, table.alarmlog thead th {
     font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-faint);
     background: var(--panel-raised); font-weight: 700; }
+  table.matrix tbody tr:hover td, table.summary tbody tr:hover td, table.alarmlog tbody tr:hover td {
+    filter: brightness(0.97); }
   .site-cell { font-weight: 600; white-space: nowrap; }
   tr.affected td { background: var(--danger-tint); }
   tr.affected .site-cell { color: var(--danger-dark); }
@@ -982,6 +985,18 @@ DASHBOARD_EXTRA_CSS = """
   .summary-row { display: grid; grid-template-columns: minmax(220px, 320px) minmax(220px, 320px) 1fr;
     gap: 18px; align-items: start; margin-bottom: 18px; }
   @media (max-width: 1080px) { .summary-row { grid-template-columns: 1fr; } }
+
+  /* /overview's per-system status cards - same .panel/.panel-head shell
+     every dashboard already uses, just wrapped in a link and given a
+     status dot + state line instead of a table. */
+  .status-grid { display: flex; flex-wrap: wrap; gap: 16px; }
+  a.panel.status-panel { flex: 1 1 220px; text-decoration: none; color: inherit;
+    display: block; transition: border-color 0.15s ease; }
+  a.panel.status-panel:hover { border-color: var(--teal); }
+  .status-panel .panel-head { border-bottom: none; }
+  .status-body { display: flex; align-items: center; gap: 10px; padding: 0 18px 16px; }
+  .status-dot { width: 14px; height: 14px; border-radius: 50%; flex-shrink: 0; }
+  .status-state { font-size: 13px; color: var(--text-dim); }
 """
 
 # Responsive overrides for /ipro, /ooma and /hyperview - no separate
@@ -1252,30 +1267,24 @@ def overview_page(username):
         g = OOMA_DASHBOARD["gauge"]
         cards.append(("Ooma AirDial", "/ooma", g["state"], g["tone"]))
 
+    # Reuses the exact .panel/.panel-head shell every other dashboard page
+    # is built from (see HYPERVIEW_COMPONENT_CSS) rather than a bespoke
+    # card style, so this page reads as part of the same family instead
+    # of a one-off landing screen.
     cards_html = "".join(f"""
-      <a class="status-card" href="{href}">
-        <span class="status-dot" style="background:var(--{tone})"></span>
-        <span class="status-name">{_esc(name)}</span>
-        <span class="status-state">{_esc(state)}</span>
+      <a class="panel status-panel" href="{href}">
+        <div class="panel-head"><h2>{_esc(name)}</h2></div>
+        <div class="status-body">
+          <span class="status-dot" style="background:var(--{tone})"></span>
+          <span class="status-state">{_esc(state)}</span>
+        </div>
       </a>""" for name, href, state, tone in cards)
 
     body = f"""
     <h1>System overview</h1>
     <p class="sub">At-a-glance status for every facility system you have access to.</p>
-    <style>
-      .status-cards {{ display: flex; flex-wrap: wrap; gap: 16px; }}
-      .status-card {{
-        flex: 1 1 220px; display: flex; flex-direction: column; gap: 8px;
-        background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-        padding: 20px; text-decoration: none; color: var(--text);
-        box-shadow: 0 1px 3px rgba(0,0,0,0.04); transition: border-color 0.15s ease;
-      }}
-      .status-card:hover {{ border-color: var(--teal); }}
-      .status-dot {{ width: 14px; height: 14px; border-radius: 50%; }}
-      .status-name {{ font-size: 15px; font-weight: 700; color: var(--teal-dark); }}
-      .status-state {{ font-size: 13px; color: var(--text-dim); }}
-    </style>
-    <div class="status-cards">{cards_html or '<p class="empty">Your account has no systems assigned.</p>'}</div>
+    <style>{HYPERVIEW_COMPONENT_CSS}{DASHBOARD_EXTRA_CSS}</style>
+    <div class="status-grid">{cards_html or '<p class="empty">Your account has no systems assigned.</p>'}</div>
     """
     return Response(render_shell("Overview", body, "overview", username), mimetype="text/html")
 
@@ -1411,6 +1420,8 @@ async function refreshAll() {
       clinics.filter(r => r.site).length + ' of ' + clinics.length + ' affected';
     document.getElementById('alarm-note').textContent =
       alarms.length + ' device' + (alarms.length === 1 ? '' : 's');
+    const lastUpdatedEl = document.getElementById('hv-last-updated');
+    if (lastUpdatedEl) lastUpdatedEl.textContent = new Date().toLocaleTimeString();
     if (statusEl) statusEl.textContent = '';
   } catch (err) {
     if (statusEl) statusEl.textContent = 'Could not reach Hyperview: ' + err.message;
@@ -1467,6 +1478,7 @@ def _hyperview_board_html():
           <div class="panel-head"><h2>Alarm Summary</h2></div>
           <table class="summary"><thead><tr><th>Category</th><th>Open</th><th>Ack'd</th></tr></thead>
             <tbody id="tiles-summary-body"></tbody></table>
+          <div class="updated-note">Last Updated: <span id="hv-last-updated">&mdash;</span></div>
         </div>
       </div>
       <div class="panel">
@@ -1517,7 +1529,7 @@ def hyperview_page(username):
     <p class="sub">Live alarm status across Covenant Health hospitals, datacenters, and clinics.
     &middot; <a href="/hyperview/kiosk" target="_blank" rel="noopener">Open kiosk view</a>
     (no login, for a wall display &mdash; opens in a new tab)</p>
-    <style>{HYPERVIEW_COMPONENT_CSS}{RESPONSIVE_DASHBOARD_CSS}</style>
+    <style>{HYPERVIEW_COMPONENT_CSS}{DASHBOARD_EXTRA_CSS}{RESPONSIVE_DASHBOARD_CSS}</style>
     {_hyperview_board_html()}
     {HYPERVIEW_SCRIPT % {'auto_refresh_ms': 30000}}
     """
