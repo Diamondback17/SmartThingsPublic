@@ -195,12 +195,21 @@ def _fetch_ipro_dashboard():
     }
 
 
+# Mirrors ooma.py's own _EFFECTIVE_STATUS_CREDIT / build_overall_health()
+# formula, but applied to /devices' record["effective_status"] - which
+# that route's own docstring guarantees is NEVER maintenance-suppressed -
+# instead of /overall-health, whose score is built from effective_issues()
+# and therefore jumps back up the moment a still-broken device is
+# acknowledged into a maintenance window. Same fix as iPRO's score, above.
+_OOMA_STATUS_CREDIT = {"OK": 1.0, "DEGRADED": 0.5, "DOWN": 0.0}
+
+
 def _fetch_ooma_dashboard():
     """Same idea as _fetch_ipro_dashboard(), against ooma.py's own
-    /overall-health, /accounts, /category-summary, /issues, /last-updated."""
+    /devices, /accounts, /category-summary, /issues, /last-updated."""
     base = SYSTEMS["ooma"]["base_url"]
     try:
-        health = requests.get(f"{base}/overall-health", timeout=REQUEST_TIMEOUT).json()[0]
+        devices = requests.get(f"{base}/devices", timeout=REQUEST_TIMEOUT).json()
         accounts = requests.get(f"{base}/accounts", timeout=REQUEST_TIMEOUT).json()
         category_rows = requests.get(f"{base}/category-summary", timeout=REQUEST_TIMEOUT).json()
         issues = requests.get(f"{base}/issues", timeout=REQUEST_TIMEOUT).json()
@@ -208,8 +217,12 @@ def _fetch_ooma_dashboard():
     except (requests.RequestException, ValueError, IndexError, KeyError):
         return None
 
+    total = len(devices)
+    credit = sum(_OOMA_STATUS_CREDIT[d["effective_status"]] for d in devices)
+    score = round(100 * credit / total) if total else 100
+
     return {
-        "gauge": {"score": health["health"], "state": health["state"], "tone": _health_tone(health["health"])},
+        "gauge": {"score": score, "state": _health_state_label(score), "tone": _health_tone(score)},
         # "All" is ooma.py's own precomputed total row (📋 All) - same
         # reasoning as iPRO's "Total Issues" above, drop it so
         # _summary_table_html's own generated totals row is the only one.
@@ -1307,7 +1320,7 @@ def _ooma_matrix_html(accounts):
     for a in accounts:
         cls = ' class="affected"' if a.get("site") else ""
         rows.append(
-            f'<tr{cls}><td class="site-cell" data-label="Location">&#127973; {_esc(a["account"])}</td>'
+            f'<tr{cls}><td class="site-cell" data-label="Location">{_esc(a["account"])}</td>'
             f'<td data-label="Connectivity">{_score_cell_html(a.get("connectivity_issues"), "open")}</td>'
             f'<td data-label="Battery">{_score_cell_html(a.get("battery_issues"), "open")}</td></tr>'
         )
@@ -1639,7 +1652,8 @@ function renderAlarmLog(rows) {
 }
 
 async function refreshAll() {
-  const statusEl = document.getElementById('fetch-status');
+  const contentEl = document.getElementById('hv-content');
+  const unreachableEl = document.getElementById('hv-unreachable');
   try {
     const [health, summary, hospitals, clinics, alarms, lastUpdated] = await Promise.all([
       fetch('/hyperview/api/overall-health').then(r => r.json()).then(rows => rows[0]),
@@ -1677,9 +1691,14 @@ async function refreshAll() {
     if (window.kioskCriticalCue) {
       window.kioskCriticalCue(alarms.some(a => String(a.severity).toLowerCase() === 'critical'));
     }
-    if (statusEl) statusEl.textContent = '';
+    if (contentEl) contentEl.style.display = '';
+    if (unreachableEl) unreachableEl.style.display = 'none';
   } catch (err) {
-    if (statusEl) statusEl.textContent = 'Could not reach Hyperview: ' + err.message;
+    if (contentEl) contentEl.style.display = 'none';
+    if (unreachableEl) unreachableEl.style.display = '';
+    const redundancyEl = document.getElementById('redundancy-alert');
+    if (redundancyEl) redundancyEl.style.display = 'none';
+    if (window.kioskCriticalCue) window.kioskCriticalCue(false);
   }
 }
 
@@ -1702,10 +1721,14 @@ if (AUTO_REFRESH_MS > 0) setInterval(refreshAll, AUTO_REFRESH_MS);
 # page, dark/oversized for the kiosk) and its own header, then appends
 # HYPERVIEW_SCRIPT.
 def _hyperview_board_html():
-    return """
+    return f"""
     <div class="redundancy-alert" id="redundancy-alert" style="display:none;">
       <span>&#128680;</span><span class="text"></span>
     </div>
+    <div id="hv-unreachable" style="display:none;">
+      {_bridge_unreachable_html("Hyperview", HYPERVIEW_BASE_URL)}
+    </div>
+    <div id="hv-content">
     <div class="board">
       <div class="panel">
         <div class="panel-head"><h2>Datacenters / Hospitals</h2><span class="count-note" id="hosp-note"></span></div>
@@ -1756,7 +1779,7 @@ def _hyperview_board_html():
         </table>
       </div>
     </div>
-    <div id="fetch-status" class="sub"></div>
+    </div>
     """
 
 
@@ -1992,7 +2015,7 @@ def hyperview_kiosk():
             title="Hyperview",
             component_css=HYPERVIEW_COMPONENT_CSS + DASHBOARD_EXTRA_CSS,
             board=_hyperview_board_html(),
-            script=HYPERVIEW_SCRIPT % {'auto_refresh_ms': 15000},
+            script=HYPERVIEW_SCRIPT % {'auto_refresh_ms': 30000},
             rotate=_kiosk_rotate_html(path),
         ),
         mimetype="text/html",
