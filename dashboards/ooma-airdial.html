@@ -1,0 +1,479 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ooma AirDial &middot; Bridge Portal</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@600;700&family=Public+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+<style>
+  :root {
+    --bg: #f4f7f7;
+    --panel: #ffffff;
+    --panel-raised: #f7fafa;
+    --border: #dbe6e6;
+    --border-strong: #c3d4d4;
+    --text: #1f2b2b;
+    --text-dim: #5b6c6c;
+    --text-faint: #8a9797;
+
+    --teal: #005898;
+    --teal-dark: #083880;
+    --teal-tint: #d9e6f0;
+    --danger: #a80030;
+    --danger-dark: #a00018;
+    --danger-tint: #f5e0e6;
+    --warn: #b9770e;
+    --warn-tint: #f6e9d3;
+    --ok: #1f7a4d;
+    --ok-tint: #dbeee2;
+
+    --shadow: 0 1px 2px rgba(8, 56, 128, 0.06), 0 6px 20px rgba(8, 56, 128, 0.05);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0d1416;
+      --panel: #141d20;
+      --panel-raised: #182226;
+      --border: #24343a;
+      --border-strong: #33474e;
+      --text: #e7eeee;
+      --text-dim: #a3b3b3;
+      --text-faint: #708080;
+
+      --teal: #5ea3e0;
+      --teal-dark: #8fc0ef;
+      --teal-tint: #16283b;
+      --danger: #ef6b8a;
+      --danger-dark: #f7a3b6;
+      --danger-tint: #3a1620;
+      --warn: #e3ab4c;
+      --warn-tint: #362a10;
+      --ok: #5cc491;
+      --ok-tint: #12291d;
+
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.35);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0d1416;
+    --panel: #141d20;
+    --panel-raised: #182226;
+    --border: #24343a;
+    --border-strong: #33474e;
+    --text: #e7eeee;
+    --text-dim: #a3b3b3;
+    --text-faint: #708080;
+
+    --teal: #5ea3e0;
+    --teal-dark: #8fc0ef;
+    --teal-tint: #16283b;
+    --danger: #ef6b8a;
+    --danger-dark: #f7a3b6;
+    --danger-tint: #3a1620;
+    --warn: #e3ab4c;
+    --warn-tint: #362a10;
+    --ok: #5cc491;
+    --ok-tint: #12291d;
+
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.35);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Public Sans", "Segoe UI", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  h1, h2, h3, .label {
+    font-family: "Barlow Semi Condensed", "Arial Narrow", sans-serif;
+    font-weight: 700;
+    text-wrap: balance;
+  }
+
+  a { color: var(--teal); }
+  :focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
+
+  /* ---------------- shell / nav ---------------- */
+  header.brand {
+    background: var(--teal-dark);
+    color: #fff;
+    padding: 0.85rem 1.5rem;
+    font-family: "Barlow Semi Condensed", sans-serif;
+    font-weight: 700;
+    font-size: 1.15rem;
+    letter-spacing: 0.02em;
+    display: flex;
+    align-items: baseline;
+    gap: 0.6rem;
+  }
+  header.brand .sub {
+    font-family: "Public Sans", sans-serif;
+    font-weight: 400;
+    font-size: 0.85rem;
+    opacity: 0.82;
+  }
+
+  nav.top {
+    background: var(--teal);
+    padding: 0 1.5rem;
+    display: flex;
+    align-items: center;
+    gap: 1.3rem;
+    font-size: 0.88rem;
+    overflow-x: auto;
+  }
+  nav.top a {
+    color: rgba(255,255,255,0.78);
+    text-decoration: none;
+    padding: 0.7rem 0;
+    border-bottom: 2px solid transparent;
+    white-space: nowrap;
+  }
+  nav.top a:hover { color: #fff; }
+  nav.top a.active { color: #fff; border-bottom-color: #fff; font-weight: 600; }
+  nav.top .spacer { flex: 1; }
+  nav.top .who { color: rgba(255,255,255,0.65); white-space: nowrap; }
+
+  main {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 1.6rem 1.5rem 3rem;
+    display: flex;
+    flex-direction: column;
+    gap: 1.2rem;
+  }
+
+  h1.page-title {
+    margin: 0 0 0.2rem;
+    font-size: 1.5rem;
+  }
+  .page-sub {
+    margin: 0 0 0.6rem;
+    color: var(--text-dim);
+    font-size: 0.9rem;
+  }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+  .panel-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.6rem;
+    padding: 0.9rem 1.1rem 0.7rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .panel-head h2 { margin: 0; font-size: 1.1rem; }
+  .panel-head .count-note { font-size: 0.8rem; color: var(--text-faint); }
+
+  /* ---------------- top summary row ---------------- */
+  .summary-row {
+    display: grid;
+    grid-template-columns: minmax(220px, 340px) minmax(240px, 360px) 1fr;
+    gap: 1rem;
+    align-items: start;
+  }
+  @media (max-width: 1000px) {
+    .summary-row { grid-template-columns: 1fr; }
+  }
+
+  /* gauge */
+  .gauge-card { text-align: center; padding: 1.1rem 1.1rem 1.3rem; }
+  .gauge-svg { width: 190px; height: 118px; margin: 0.2rem auto -0.6rem; display: block; }
+  .gauge-track { fill: none; stroke: var(--border); stroke-width: 16; stroke-linecap: round; }
+  .gauge-fill { fill: none; stroke-width: 16; stroke-linecap: round; }
+  .gauge-score-num { font-family: "Barlow Semi Condensed", sans-serif; font-weight: 700; font-size: 2.4rem; line-height: 1; }
+  .gauge-score-lbl { font-size: 0.85rem; color: var(--text-faint); margin-top: 0.15rem; }
+  .status-banner {
+    margin-top: 0.9rem;
+    background: var(--danger);
+    color: #fff;
+    font-family: "Barlow Semi Condensed", sans-serif;
+    font-weight: 700;
+    font-size: 1.1rem;
+    border-radius: 8px;
+    padding: 0.65rem 0.5rem;
+  }
+
+  /* alarm summary table */
+  table.summary { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+  table.summary th, table.summary td { padding: 0.55rem 0.9rem; text-align: left; border-bottom: 1px solid var(--border); }
+  table.summary thead th { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-faint); background: var(--panel-raised); }
+  table.summary td.n { text-align: center; font-weight: 700; font-family: "Barlow Semi Condensed", sans-serif; font-size: 1.05rem; border-radius: 6px; }
+  table.summary .n.open-n { background: var(--danger); color: #fff; }
+  table.summary .n.ack-n { background: var(--teal); color: #fff; }
+  table.summary .n.zero { color: var(--text-faint); background: transparent; font-weight: 500; }
+  table.summary tr.row-all td { background: var(--panel-raised); font-weight: 600; }
+  table.summary tr:last-child td { border-bottom: none; }
+  .updated-note { padding: 0.55rem 1.1rem 0.8rem; font-size: 0.78rem; color: var(--text-faint); text-align: center; }
+
+  /* big red phone panel */
+  .redphone-head {
+    background: var(--teal-dark);
+    color: #fff;
+    padding: 1.1rem 1.4rem;
+  }
+  .redphone-head h2 { margin: 0; font-size: 1.5rem; }
+
+  table.alarmlog { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  table.alarmlog th, table.alarmlog td { padding: 0.65rem 0.9rem; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; }
+  table.alarmlog thead th { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-faint); background: var(--panel-raised); }
+  table.alarmlog tr:last-child td { border-bottom: none; }
+  table.alarmlog tr.sev-degraded { box-shadow: inset 4px 0 0 var(--warn); }
+  table.alarmlog tr.sev-degraded td.loc { color: var(--warn-dark, var(--warn)); font-weight: 600; }
+  td.loc, td.dev { white-space: nowrap; }
+  td.sev-cell { font-weight: 700; color: var(--warn); }
+  .empty-note { padding: 1.4rem; text-align: center; color: var(--text-faint); font-size: 0.9rem; }
+
+  /* ---------------- site matrix table ---------------- */
+  .matrix-wrap { overflow-x: auto; }
+  table.matrix { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  table.matrix th, table.matrix td { padding: 0.6rem 0.9rem; text-align: left; border-bottom: 1px solid var(--border); }
+  table.matrix thead th { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-faint); background: var(--panel-raised); }
+  table.matrix thead th.icon-col, table.matrix td.icon-col { text-align: center; width: 64px; }
+  table.matrix tr:last-child td { border-bottom: none; }
+  table.matrix tr.affected td { background: var(--danger-tint); }
+  table.matrix tr.affected .site-cell { color: var(--danger-dark); font-weight: 600; }
+  .clear-mark { color: var(--ok); font-size: 1.05rem; }
+  .badge { display: inline-flex; min-width: 1.5rem; justify-content: center; border-radius: 5px; padding: 0.15rem 0.4rem; font-weight: 700; font-family: "Barlow Semi Condensed", sans-serif; font-size: 0.95rem; }
+  .badge.open { background: var(--danger); color: #fff; }
+  .badge.ack { background: var(--teal-tint); color: var(--teal); border: 1px solid var(--teal); }
+  .badge.live-dot { background: var(--teal); color: #fff; border-radius: 999px; width: 0.65rem; height: 0.65rem; min-width: 0; padding: 0; display: inline-block; }
+
+  footer.updated { text-align: center; color: var(--text-faint); font-size: 0.8rem; padding: 0.5rem 0 0; }
+</style>
+</head>
+<body>
+
+<header class="brand">
+  Covenant Health <span class="sub">Bridge Portal &middot; Facility Systems</span>
+</header>
+<nav class="top">
+  <a href="maintenance.html">Maintenance</a>
+  <a href="#">Event search</a>
+  <a href="hyperview.html">Hyperview</a>
+  <a href="ipro-cameras.html">iPRO Cameras</a>
+  <a href="ooma-airdial.html" class="active">Ooma AirDial</a>
+  <span class="spacer"></span>
+  <span class="who">Signed in as chadmin</span>
+  <a href="#">Log out</a>
+</nav>
+
+<main>
+
+  <div>
+    <h1 class="page-title">Ooma AirDial</h1>
+    <p class="page-sub">Emergency red phone connectivity &amp; battery health across all sites</p>
+  </div>
+
+  <div class="summary-row">
+
+    <!-- gauge + action banner -->
+    <div class="panel gauge-card">
+      <svg class="gauge-svg" viewBox="0 0 190 118">
+        <path class="gauge-track" d="M15 105 A80 80 0 0 1 175 105" />
+        <path class="gauge-fill" d="M15 105 A80 80 0 0 1 175 105"
+              stroke="var(--warn)"
+              stroke-dasharray="251.2" stroke-dashoffset="22.6" />
+      </svg>
+      <div class="gauge-score-num" style="color:var(--warn)">91</div>
+      <div class="gauge-score-lbl">System Health</div>
+      <div class="status-banner">Action Required</div>
+    </div>
+
+    <!-- alarm summary -->
+    <div class="panel">
+      <table class="summary">
+        <thead><tr><th>Alarm Summary</th><th>Open</th><th>Ack'd</th></tr></thead>
+        <tbody>
+          <tr><td>&#128246; Connectivity</td><td class="n open-n">7</td><td class="n ack-n">1</td></tr>
+          <tr><td>&#128267; Battery</td><td class="n zero">0</td><td class="n zero">0</td></tr>
+          <tr class="row-all"><td>&#128203; All</td><td class="n open-n">7</td><td class="n ack-n">1</td></tr>
+        </tbody>
+      </table>
+      <div class="updated-note">Last Updated: <span id="lastUpdated">7:48:01 am</span></div>
+    </div>
+
+    <!-- red phone system panel, full detail table -->
+    <div class="panel">
+      <div class="redphone-head">
+        <h2>Ooma AirDial &mdash; Emergency Red Phone System</h2>
+      </div>
+      <div class="matrix-wrap">
+        <table class="alarmlog">
+          <thead><tr><th>Location</th><th>Device</th><th>Severity</th><th>Category</th><th>Detail</th></tr></thead>
+          <tbody>
+            <tr class="sev-degraded">
+              <td class="loc">Fort Sanders Regional Medical Center</td>
+              <td class="dev">Fort Sanders AD1</td>
+              <td class="sev-cell">Degraded</td>
+              <td>Connectivity</td>
+              <td>LTE carrier temporarily disconnected</td>
+            </tr>
+            <tr class="sev-degraded">
+              <td class="loc">Fort Sanders Regional Medical Center</td>
+              <td class="dev">Fort Sanders AD10</td>
+              <td class="sev-cell">Degraded</td>
+              <td>Connectivity</td>
+              <td>LTE carrier temporarily disconnected</td>
+            </tr>
+            <tr class="sev-degraded">
+              <td class="loc">Fort Sanders Regional Medical Center</td>
+              <td class="dev">Fort Sanders AD14</td>
+              <td class="sev-cell">Degraded</td>
+              <td>Connectivity</td>
+              <td>LTE carrier temporarily disconnected</td>
+            </tr>
+            <tr class="sev-degraded">
+              <td class="loc">Fort Sanders Regional Medical Center</td>
+              <td class="dev">Fort Sanders AD9</td>
+              <td class="sev-cell">Degraded</td>
+              <td>Connectivity</td>
+              <td>LTE carrier temporarily disconnected</td>
+            </tr>
+            <tr class="sev-degraded">
+              <td class="loc">Methodist Medical Center</td>
+              <td class="dev">Methodist Medical AD4</td>
+              <td class="sev-cell">Degraded</td>
+              <td>Connectivity</td>
+              <td>LTE unstable &mdash; flapping (3+ changes in the last 30 min)</td>
+            </tr>
+            <tr class="sev-degraded">
+              <td class="loc">Methodist Medical Center</td>
+              <td class="dev">Methodist Medical AD5</td>
+              <td class="sev-cell">Degraded</td>
+              <td>Connectivity</td>
+              <td>Running on cellular backup &mdash; primary WAN is down</td>
+            </tr>
+            <tr class="sev-degraded">
+              <td class="loc">Parkwest Medical Center</td>
+              <td class="dev">Parkwest Medical AD11</td>
+              <td class="sev-cell">Degraded</td>
+              <td>Connectivity</td>
+              <td>LTE unstable &mdash; flapping (3+ changes in the last 30 min)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- per-site matrix, full width -->
+  <div class="panel">
+    <div class="panel-head">
+      <h2>Site Status</h2>
+      <span class="count-note">3 of 13 affected</span>
+    </div>
+    <div class="matrix-wrap">
+      <table class="matrix">
+        <thead>
+          <tr>
+            <th>Location</th>
+            <th class="icon-col" title="Connectivity">&#128246;</th>
+            <th class="icon-col" title="Battery">&#128267;</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="site-cell">&#127970; Covenant IT</td>
+            <td class="icon-col"><span class="badge live-dot" title="Live"></span></td>
+            <td class="icon-col"><span class="clear-mark">&#10003;</span></td>
+          </tr>
+          <tr class="affected">
+            <td class="site-cell">&#127973; Fort Sanders Regional Medical Center</td>
+            <td class="icon-col"><span class="badge open">4</span></td>
+            <td class="icon-col"><span class="clear-mark">&#10003;</span></td>
+          </tr>
+          <tr class="affected">
+            <td class="site-cell">&#127973; Methodist Medical Center</td>
+            <td class="icon-col"><span class="badge open">2</span></td>
+            <td class="icon-col"><span class="clear-mark">&#10003;</span></td>
+          </tr>
+          <tr class="affected">
+            <td class="site-cell">&#127973; Parkwest Medical Center</td>
+            <td class="icon-col"><span class="badge open">1</span></td>
+            <td class="icon-col"><span class="clear-mark">&#10003;</span></td>
+          </tr>
+          <tr>
+            <td class="site-cell">&#127973; Centerpoint</td>
+            <td class="icon-col"><span class="clear-mark">&#10003;</span></td>
+            <td class="icon-col"><span class="clear-mark">&#10003;</span></td>
+          </tr>
+          <tr>
+            <td class="site-cell">&#127973; Claiborne Medical Center</td>
+            <td class="icon-col"><span class="clear-mark">&#10003;</span></td>
+            <td class="icon-col"><span class="clear-mark">&#10003;</span></td>
+          </tr>
+          <tr>
+            <td class="site-cell">&#127973; Covenant Health Roane</td>
+            <td class="icon-col"><span class="clear-mark">&#10003;</span></td>
+            <td class="icon-col"><span class="clear-mark">&#10003;</span></td>
+          </tr>
+          <tr>
+            <td class="site-cell">&#127973; Cumberland Medical Center</td>
+            <td class="icon-col"><span class="clear-mark">&#10003;</span></td>
+            <td class="icon-col"><span class="clear-mark">&#10003;</span></td>
+          </tr>
+          <tr>
+            <td class="site-cell">&#127973; Fort Loudoun Medical Center</td>
+            <td class="icon-col"><span class="clear-mark">&#10003;</span></td>
+            <td class="icon-col"><span class="clear-mark">&#10003;</span></td>
+          </tr>
+          <tr>
+            <td class="site-cell">&#127973; LeConte Medical Center</td>
+            <td class="icon-col"><span class="clear-mark">&#10003;</span></td>
+            <td class="icon-col"><span class="clear-mark">&#10003;</span></td>
+          </tr>
+          <tr>
+            <td class="site-cell">&#127973; Morristown-Hamblen Healthcare System</td>
+            <td class="icon-col"><span class="clear-mark">&#10003;</span></td>
+            <td class="icon-col"><span class="clear-mark">&#10003;</span></td>
+          </tr>
+          <tr>
+            <td class="site-cell">&#127973; Peninsula Hospital</td>
+            <td class="icon-col"><span class="clear-mark">&#10003;</span></td>
+            <td class="icon-col"><span class="clear-mark">&#10003;</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <footer class="updated">Last updated <span id="footerUpdated">7:48:01</span></footer>
+
+</main>
+
+<script>
+  (function () {
+    function pad(n) { return n.toString().padStart(2, "0"); }
+    function stamp() {
+      var d = new Date();
+      var h = d.getHours() % 12 || 12;
+      var ampm = d.getHours() < 12 ? "am" : "pm";
+      var text12 = h + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds()) + " " + ampm;
+      var text24 = pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+      var lu = document.getElementById("lastUpdated");
+      var fu = document.getElementById("footerUpdated");
+      if (lu) lu.textContent = text12;
+      if (fu) fu.textContent = text24;
+    }
+    stamp();
+    setInterval(stamp, 15000);
+  })();
+</script>
+
+</body>
+</html>
