@@ -973,16 +973,6 @@ HYPERVIEW_COMPONENT_CSS = """
 DASHBOARD_EXTRA_CSS = """
   .badge.warn { background: var(--warn); color: #fff; }
   .dash-mark { color: var(--text-faint); }
-  /* Same teal-dark/white treatment as header.brand - the vendor name is
-     the only thing that changes per system (i-PRO here; a future
-     system's own badge would follow the same look, not its own brand
-     colors) so this reads as part of the portal, not a foreign widget. */
-  .vendor-mark {
-    background: var(--teal-dark); color: #fff; text-align: center; padding: 14px;
-    font-weight: 700; font-size: 18px; letter-spacing: 0.05em; border-radius: 10px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.04); margin-bottom: 18px;
-  }
-  .vendor-mark .dots { letter-spacing: 0.2em; margin-right: 6px; opacity: 0.8; }
   .stat-row { display: flex; }
   .stat-tile { flex: 1; padding: 14px 10px; text-align: center; border-right: 1px solid var(--border); }
   .stat-tile:last-child { border-right: none; }
@@ -1063,6 +1053,14 @@ RESPONSIVE_DASHBOARD_CSS = """
     button, nav.top a { min-height: 40px; }
   }
 """
+
+# Every dashboard page's <style> tag was independently concatenating the
+# same 2-3 constants (HYPERVIEW_COMPONENT_CSS + DASHBOARD_EXTRA_CSS,
+# sometimes + RESPONSIVE_DASHBOARD_CSS) - collected here once so a future
+# dashboard route just uses DASHBOARD_CSS and there's one place that
+# decides what "the dashboard family's styling" means.
+DASHBOARD_BASE_CSS = HYPERVIEW_COMPONENT_CSS + DASHBOARD_EXTRA_CSS
+DASHBOARD_CSS = DASHBOARD_BASE_CSS + RESPONSIVE_DASHBOARD_CSS
 
 
 def _gauge_html(score, state, tone):
@@ -1157,7 +1155,6 @@ def _ipro_board_html(data):
     <div class="board">
       {_ipro_matrix_html("Datacenters / Hospitals", f"{affected} of {len(data['hospitals'])} affected", data["hospitals"])}
       <div class="center-col">
-        <div class="vendor-mark"><span class="dots">&#9673;&#9673;&#9673;</span>i-PRO</div>
         {_summary_table_html(data["summary"])}
         {_gauge_html(data["gauge"]["score"], data["gauge"]["state"], data["gauge"]["tone"])}
         <div class="panel">
@@ -1248,8 +1245,10 @@ def ipro_page(username):
         return denied
     body = f"""
     <h1>iPRO Cameras</h1>
-    <p class="sub">Camera health &amp; infrastructure status across all sites.</p>
-    <style>{HYPERVIEW_COMPONENT_CSS}{DASHBOARD_EXTRA_CSS}{RESPONSIVE_DASHBOARD_CSS}</style>
+    <p class="sub">Camera health &amp; infrastructure status across all sites.
+    &middot; <a href="/ipro/kiosk" target="_blank" rel="noopener">Open kiosk view</a>
+    (no login, for a wall display &mdash; opens in a new tab)</p>
+    <style>{DASHBOARD_CSS}</style>
     {_ipro_board_html(IPRO_DASHBOARD)}
     """
     return Response(render_shell("iPRO Cameras", body, "ipro", username), mimetype="text/html")
@@ -1263,8 +1262,10 @@ def ooma_page(username):
         return denied
     body = f"""
     <h1>Ooma AirDial</h1>
-    <p class="sub">Emergency red phone connectivity &amp; battery health across all sites.</p>
-    <style>{HYPERVIEW_COMPONENT_CSS}{DASHBOARD_EXTRA_CSS}{RESPONSIVE_DASHBOARD_CSS}</style>
+    <p class="sub">Emergency red phone connectivity &amp; battery health across all sites.
+    &middot; <a href="/ooma/kiosk" target="_blank" rel="noopener">Open kiosk view</a>
+    (no login, for a wall display &mdash; opens in a new tab)</p>
+    <style>{DASHBOARD_CSS}</style>
     {_ooma_board_html(OOMA_DASHBOARD)}
     """
     return Response(render_shell("Ooma AirDial", body, "ooma", username), mimetype="text/html")
@@ -1326,19 +1327,22 @@ def overview_page(username):
 
     # Maintenance/event-search only ever cover the auth-forwarding
     # bridges (see accessible_systems) - Hyperview has no windows/events
-    # of its own, so an account with only hyperview access sees status
-    # cards above but no quick links here, same as it sees no
-    # Maintenance/Event search nav items with anything to act on.
-    systems = accessible_systems(username)
-    quick_links_html = ""
-    if systems:
-        quick_links_html = """
+    # of its own, so an account with only hyperview access sees no
+    # Maintenance/Event search link here, same as it sees no
+    # Maintenance/Event search nav items with anything to act on. Kiosk
+    # mode is offered unconditionally - its routes are unauthenticated
+    # already (see the "kiosk" section below), so the link exposes
+    # nothing this account couldn't already reach by URL.
+    quick_link_items = ["<a class=\"quick-link\" href=\"/kiosk\">Kiosk mode &rarr;</a>"]
+    if accessible_systems(username):
+        quick_link_items = [
+            "<a class=\"quick-link\" href=\"/maintenance\">Maintenance &rarr;</a>",
+            "<a class=\"quick-link\" href=\"/events-search\">Event search &rarr;</a>",
+        ] + quick_link_items
+    quick_links_html = f"""
         <div class="panel">
           <div class="panel-head"><h2>Quick Links</h2></div>
-          <div class="quick-links">
-            <a class="quick-link" href="/maintenance">Maintenance &rarr;</a>
-            <a class="quick-link" href="/events-search">Event search &rarr;</a>
-          </div>
+          <div class="quick-links">{''.join(quick_link_items)}</div>
         </div>"""
 
     body = f"""
@@ -1346,7 +1350,7 @@ def overview_page(username):
     <p class="sub">One login for every Covenant Health facility system you have access to
     &mdash; camera health, emergency phone lines, and site infrastructure today, with more
     systems landing here over time.</p>
-    <style>{HYPERVIEW_COMPONENT_CSS}{DASHBOARD_EXTRA_CSS}</style>
+    <style>{DASHBOARD_BASE_CSS}</style>
     <div class="status-grid">{cards_html or '<p class="empty">Your account has no systems assigned.</p>'}</div>
     {quick_links_html}
     """
@@ -1593,7 +1597,7 @@ def hyperview_page(username):
     <p class="sub">Live alarm status across Covenant Health hospitals, datacenters, and clinics.
     &middot; <a href="/hyperview/kiosk" target="_blank" rel="noopener">Open kiosk view</a>
     (no login, for a wall display &mdash; opens in a new tab)</p>
-    <style>{HYPERVIEW_COMPONENT_CSS}{DASHBOARD_EXTRA_CSS}{RESPONSIVE_DASHBOARD_CSS}</style>
+    <style>{DASHBOARD_CSS}</style>
     {_hyperview_board_html()}
     {HYPERVIEW_SCRIPT % {'auto_refresh_ms': 30000}}
     """
@@ -1604,12 +1608,17 @@ def hyperview_page(username):
 # wall-mounted display has no one there to log in, and shouldn't need a
 # browser session kept alive. Dark, oversized treatment for readability
 # across a room; own <style> block rather than PAGE_SHELL's light tokens.
-HYPERVIEW_KIOSK_SHELL = """<!DOCTYPE html>
+# Shared by all three dashboards' /kiosk routes below (and whatever the
+# next dashboard's /kiosk route turns out to be) - {title} is what goes
+# in the browser tab and the small subtitle under the big Covenant Health
+# heading, {board}/{script} are that dashboard's own markup/JS, and
+# {rotate} is the auto-rotate badge from _kiosk_rotate_html() below.
+DASHBOARD_KIOSK_SHELL = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Hyperview - Kiosk</title>
+<title>{title} - Kiosk</title>
 <style>
   :root {{
     --bg: #060b0d; --panel: #0e181b; --panel-raised: #122024; --border: #223338;
@@ -1626,6 +1635,7 @@ HYPERVIEW_KIOSK_SHELL = """<!DOCTYPE html>
   }}
   .kiosk-header {{ display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 20px; }}
   .kiosk-header h1 {{ margin: 0; font-size: 26px; }}
+  .kiosk-header .kiosk-subtitle {{ margin-top: 2px; font-size: 15px; color: var(--text-dim); }}
   .kiosk-header .clock {{ font-size: 22px; font-weight: 700; color: var(--text-dim); font-variant-numeric: tabular-nums; }}
   {component_css}
   .panel-head h2 {{ font-size: 18px; color: var(--text); }}
@@ -1638,29 +1648,151 @@ HYPERVIEW_KIOSK_SHELL = """<!DOCTYPE html>
     .sev-dot {{ animation: kiosk-pulse 2.4s ease-in-out infinite; }}
   }}
   @keyframes kiosk-pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.45; }} }}
+  .kiosk-rotate-badge {{
+    position: fixed; bottom: 18px; right: 22px; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 999px; padding: 8px 16px;
+    font-size: 13px; color: var(--text-dim); box-shadow: 0 4px 14px rgba(0,0,0,0.35);
+  }}
+  .kiosk-rotate-badge a {{ color: var(--teal); text-decoration: none; margin-left: 6px; }}
+  .kiosk-rotate-badge a:hover {{ text-decoration: underline; }}
 </style>
 </head>
 <body>
   <div class="kiosk-header">
-    <h1>Covenant Health &middot; Facility Systems</h1>
+    <div>
+      <h1>Covenant Health &middot; Facility Systems</h1>
+      <div class="kiosk-subtitle">{title}</div>
+    </div>
     <div class="clock" id="kiosk-clock">--:--:--</div>
   </div>
   {board}
   {script}
+  {rotate}
 </body>
 </html>"""
+
+# Order a wall display cycles through when auto-rotating (see
+# _kiosk_rotate_html) and what /kiosk itself starts on - a future
+# dashboard's own /<name>/kiosk route just gets appended to both of these
+# to join the rotation, nothing else below needs to change.
+KIOSK_CYCLE = ["/hyperview/kiosk", "/ipro/kiosk", "/ooma/kiosk"]
+KIOSK_LABELS = {
+    "/hyperview/kiosk": "Hyperview",
+    "/ipro/kiosk": "iPRO Cameras",
+    "/ooma/kiosk": "Ooma AirDial",
+}
+KIOSK_ROTATE_SECONDS = 30
+
+
+def _kiosk_rotate_html(current_path):
+    """Renders the bottom-right badge on a /kiosk page. Stateless by
+    design - there's no server-side timer keeping the rotation going,
+    just a per-page setTimeout that navigates to the next dashboard in
+    KIOSK_CYCLE with ?rotate=1 still attached, so each hop re-arms the
+    same countdown on the next page. Landing on any kiosk URL WITHOUT
+    ?rotate=1 (typing it directly, or clicking Pause) just stays parked
+    there - only /kiosk and links carrying ?rotate=1 start the cycle."""
+    idx = KIOSK_CYCLE.index(current_path)
+    next_path = KIOSK_CYCLE[(idx + 1) % len(KIOSK_CYCLE)]
+    if request.args.get("rotate") != "1":
+        return (f'<div class="kiosk-rotate-badge">'
+                 f'<a href="{current_path}?rotate=1">&#9654; Start rotating</a></div>')
+    next_url = f"{next_path}?rotate=1"
+    return f"""
+    <div class="kiosk-rotate-badge">
+      <span id="kiosk-rotate-countdown">{KIOSK_ROTATE_SECONDS}</span>s &middot;
+      next: {_esc(KIOSK_LABELS[next_path])}
+      &middot; <a href="{current_path}">Pause</a>
+    </div>
+    <script>
+      (function () {{
+        var remaining = {KIOSK_ROTATE_SECONDS};
+        var el = document.getElementById('kiosk-rotate-countdown');
+        var timer = setInterval(function () {{
+          remaining -= 1;
+          if (remaining <= 0) {{ clearInterval(timer); return; }}
+          if (el) el.textContent = remaining;
+        }}, 1000);
+        setTimeout(function () {{ location.href = {json.dumps(next_url)}; }}, {KIOSK_ROTATE_SECONDS * 1000});
+      }})();
+    </script>
+    """
+
+
+# iPRO/Ooma kiosk pages render from the same fixed snapshot as their
+# logged-in pages (see IPRO_DASHBOARD/OOMA_DASHBOARD's comment) rather
+# than live-fetching like Hyperview's HYPERVIEW_SCRIPT does, so they need
+# their own clock tick and - only when NOT auto-rotating, since rotating
+# already re-fetches this page fresh on every lap - a periodic reload to
+# pick up any change made server-side since the page loaded.
+KIOSK_CLOCK_SCRIPT = """
+<script>
+(function () {
+  function tickClock() {
+    var el = document.getElementById('kiosk-clock');
+    if (el) el.textContent = new Date().toLocaleTimeString([], { hour12: false });
+  }
+  tickClock();
+  setInterval(tickClock, 1000);
+  if (!location.search.includes('rotate=1')) {
+    setTimeout(function () { location.reload(); }, 30000);
+  }
+})();
+</script>
+"""
 
 
 @app.route("/hyperview/kiosk")
 def hyperview_kiosk():
+    path = "/hyperview/kiosk"
     return Response(
-        HYPERVIEW_KIOSK_SHELL.format(
-            component_css=HYPERVIEW_COMPONENT_CSS,
+        DASHBOARD_KIOSK_SHELL.format(
+            title="Hyperview",
+            component_css=HYPERVIEW_COMPONENT_CSS + DASHBOARD_EXTRA_CSS,
             board=_hyperview_board_html(),
             script=HYPERVIEW_SCRIPT % {'auto_refresh_ms': 15000},
+            rotate=_kiosk_rotate_html(path),
         ),
         mimetype="text/html",
     )
+
+
+@app.route("/ipro/kiosk")
+def ipro_kiosk():
+    path = "/ipro/kiosk"
+    return Response(
+        DASHBOARD_KIOSK_SHELL.format(
+            title="iPRO Cameras",
+            component_css=HYPERVIEW_COMPONENT_CSS + DASHBOARD_EXTRA_CSS,
+            board=_ipro_board_html(IPRO_DASHBOARD),
+            script=KIOSK_CLOCK_SCRIPT,
+            rotate=_kiosk_rotate_html(path),
+        ),
+        mimetype="text/html",
+    )
+
+
+@app.route("/ooma/kiosk")
+def ooma_kiosk():
+    path = "/ooma/kiosk"
+    return Response(
+        DASHBOARD_KIOSK_SHELL.format(
+            title="Ooma AirDial",
+            component_css=HYPERVIEW_COMPONENT_CSS + DASHBOARD_EXTRA_CSS,
+            board=_ooma_board_html(OOMA_DASHBOARD),
+            script=KIOSK_CLOCK_SCRIPT,
+            rotate=_kiosk_rotate_html(path),
+        ),
+        mimetype="text/html",
+    )
+
+
+@app.route("/kiosk")
+def kiosk_entry():
+    """Friendly, memorable entry point for a wall display - bookmark
+    this instead of any one dashboard's own /kiosk route, and it always
+    starts the rotation at the same place (KIOSK_CYCLE[0])."""
+    return redirect(f"{KIOSK_CYCLE[0]}?rotate=1")
 
 
 @app.route("/logout")
