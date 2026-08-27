@@ -167,6 +167,7 @@ def _fetch_ipro_dashboard():
         alarm_rows = requests.get(f"{base}/alarm-summary", timeout=REQUEST_TIMEOUT).json()
         totals = requests.get(f"{base}/camera-health-summary", timeout=REQUEST_TIMEOUT).json()[0]
         devices = requests.get(f"{base}/camera-outage-log", timeout=REQUEST_TIMEOUT).json()
+        last_updated = requests.get(f"{base}/last-updated", timeout=REQUEST_TIMEOUT).json()[0]["updated"]
     except (requests.RequestException, ValueError, IndexError, KeyError):
         return None
 
@@ -187,18 +188,23 @@ def _fetch_ipro_dashboard():
         "hospitals": hospitals,
         "clinics": clinics,
         "devices": devices,
+        # ipro2.py's own last successful poll time (see last_refresh_time
+        # in ipro2.py), not this portal's render time - see
+        # _summary_table_html's docstring for why that distinction matters.
+        "last_updated": _format_ipro_last_updated(last_updated),
     }
 
 
 def _fetch_ooma_dashboard():
     """Same idea as _fetch_ipro_dashboard(), against ooma.py's own
-    /overall-health, /accounts, /category-summary, /issues."""
+    /overall-health, /accounts, /category-summary, /issues, /last-updated."""
     base = SYSTEMS["ooma"]["base_url"]
     try:
         health = requests.get(f"{base}/overall-health", timeout=REQUEST_TIMEOUT).json()[0]
         accounts = requests.get(f"{base}/accounts", timeout=REQUEST_TIMEOUT).json()
         category_rows = requests.get(f"{base}/category-summary", timeout=REQUEST_TIMEOUT).json()
         issues = requests.get(f"{base}/issues", timeout=REQUEST_TIMEOUT).json()
+        last_updated = requests.get(f"{base}/last-updated", timeout=REQUEST_TIMEOUT).json()[0]["timestamp"]
     except (requests.RequestException, ValueError, IndexError, KeyError):
         return None
 
@@ -210,6 +216,12 @@ def _fetch_ooma_dashboard():
         "summary": [r for r in category_rows if "All" not in r["category"]],
         "accounts": accounts,
         "issues": issues,
+        # ooma.py's own last completed poll cycle (Poller._last_poll_ts,
+        # via /last-updated), not this portal's render time - see
+        # _summary_table_html's docstring for why that distinction matters
+        # (especially post the poller-hang fix: a cycle that hit
+        # cycle_timeout still costs freshness for the devices it dropped).
+        "last_updated": _format_epoch_ms(last_updated),
     }
 
 
@@ -1124,14 +1136,47 @@ def _gauge_html(score, state, tone):
     </div>"""
 
 
-def _summary_table_html(rows):
+def _format_epoch_ms(epoch_ms):
+    """Renders the epoch-ms timestamp Hyperview's and Ooma's own
+    /last-updated share (matrix.py and ooma.py use the identical shape -
+    see ooma.py's own last_updated() docstring) as 12-hour local time,
+    matching this file's existing time display convention. None means
+    that bridge's poller hasn't completed a first cycle yet."""
+    if epoch_ms is None:
+        return "Never"
+    return datetime.fromtimestamp(epoch_ms / 1000).strftime('%I:%M:%S %p').lstrip('0')
+
+
+def _format_ipro_last_updated(value):
+    """ipro2.py's /last-updated is shaped differently from Hyperview's/
+    Ooma's - {'updated': 'HH:MM:SS'} (24-hour, local time) instead of an
+    epoch-ms timestamp, or the literal string 'Never' before its first
+    successful refresh."""
+    if not value or value == "Never":
+        return "Never"
+    try:
+        return datetime.strptime(value, "%H:%M:%S").strftime('%I:%M:%S %p').lstrip('0')
+    except ValueError:
+        return value
+
+
+def _summary_table_html(rows, last_updated):
     """rows use the shape both bridges' own summary endpoints already
     return - {category, open, acknowledged} - so this renders them
     directly rather than translating into a portal-specific shape first.
     Always computes its own totals row from whatever categories it's
     given; callers strip the backend's own precomputed total row before
     calling this (see _fetch_ipro_dashboard/_fetch_ooma_dashboard) so it
-    isn't rendered twice."""
+    isn't rendered twice.
+
+    last_updated is the bridge's own real /last-updated value (already
+    formatted by _format_epoch_ms/_format_ipro_last_updated) - NOT this
+    portal's own render time. Those aren't the same thing: this portal
+    can render a page (or a kiosk page can reload) well after the
+    bridge's last successful poll - especially now that a hung poll can
+    cost a bridge up to a full cycle_timeout (see ooma.py's Poller fix) -
+    so a server-render timestamp would silently claim data is fresher
+    than it actually is."""
     total_open = sum(r["open"] for r in rows)
     total_ack = sum(r["acknowledged"] for r in rows)
     body_rows = "".join(
@@ -1150,7 +1195,7 @@ def _summary_table_html(rows):
       <div class="panel-head"><h2>Alarm Summary</h2></div>
       <table class="summary"><thead><tr><th>Category</th><th>Open</th><th>Ack'd</th></tr></thead>
         <tbody>{body_rows}</tbody></table>
-      <div class="updated-note">Last Updated: {datetime.now().strftime('%I:%M:%S %p').lstrip('0')}</div>
+      <div class="updated-note">Last Updated: {_esc(last_updated)}</div>
     </div>"""
 
 
@@ -1232,7 +1277,7 @@ def _ipro_board_html(data):
       {_ipro_matrix_html("Datacenters / Hospitals", data["hospitals"])}
       <div class="center-col">
         {_gauge_html(data["gauge"]["score"], _health_state_label(data["gauge"]["score"]), data["gauge"]["tone"])}
-        {_summary_table_html(data["summary"])}
+        {_summary_table_html(data["summary"], data["last_updated"])}
         <div class="panel">
           <div class="stat-row">
             <div class="stat-tile"><div class="stat-lbl">Total Cameras</div><div class="stat-num">{data['totals']['totalCameras']}</div></div>
@@ -1304,7 +1349,7 @@ def _ooma_board_html(data):
       {_ooma_matrix_html(data["accounts"])}
       <div class="center-col">
         {_gauge_html(data["gauge"]["score"], data["gauge"]["state"], data["gauge"]["tone"])}
-        {_summary_table_html(data["summary"])}
+        {_summary_table_html(data["summary"], data["last_updated"])}
       </div>
     </div>
     <div class="panel">
@@ -1596,12 +1641,13 @@ function renderAlarmLog(rows) {
 async function refreshAll() {
   const statusEl = document.getElementById('fetch-status');
   try {
-    const [health, summary, hospitals, clinics, alarms] = await Promise.all([
+    const [health, summary, hospitals, clinics, alarms, lastUpdated] = await Promise.all([
       fetch('/hyperview/api/overall-health').then(r => r.json()).then(rows => rows[0]),
       fetch('/hyperview/api/category-summary').then(r => r.json()),
       fetch('/hyperview/api/location-health-matrix').then(r => r.json()),
       fetch('/hyperview/api/clinic-health-matrix').then(r => r.json()),
       fetch('/hyperview/api/active-alarm-log').then(r => r.json()),
+      fetch('/hyperview/api/last-updated').then(r => r.json()).then(rows => rows[0]),
     ]);
     renderGauge(health);
     renderSummary(summary);
@@ -1614,8 +1660,17 @@ async function refreshAll() {
       clinics.filter(r => r.site).length + ' of ' + clinics.length + ' affected';
     document.getElementById('alarm-note').textContent =
       alarms.length + ' device' + (alarms.length === 1 ? '' : 's');
+    // matrix.py's own last completed poll cycle (same {timestamp: epoch-ms
+    // or null} shape ooma.py's /last-updated uses - see its docstring),
+    // not "when this browser's fetch happened" - a page left open for a
+    // while, or a poll that's fallen behind, would otherwise silently
+    // claim data is fresher than it actually is.
     const lastUpdatedEl = document.getElementById('hv-last-updated');
-    if (lastUpdatedEl) lastUpdatedEl.textContent = new Date().toLocaleTimeString();
+    if (lastUpdatedEl) {
+      lastUpdatedEl.textContent = lastUpdated && lastUpdated.timestamp != null
+        ? new Date(lastUpdated.timestamp).toLocaleTimeString()
+        : 'Never';
+    }
     // No-op on the regular /hyperview page (kioskCriticalCue only exists
     // on /hyperview/kiosk, see DASHBOARD_KIOSK_SHELL) - this same
     // refreshAll() runs on both.
