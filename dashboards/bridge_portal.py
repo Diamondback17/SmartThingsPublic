@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 """
-Combined maintenance + event-search portal for the iPRO bridge (ipro2.py,
-port 5002) and the Ooma AirDial bridge (ooma.py, port 5003).
+Bridge Portal - the one human-facing login for Covenant Health's facility
+systems. Today that's the iPRO camera bridge (ipro2.py, port 5002), the
+Ooma AirDial bridge (ooma.py, port 5003), and the Hyperview facility-health
+dashboard (matrix.py, port 5001); SYSTEMS below is where a future system's
+maintenance/events wiring gets added, and /overview, /ipro-, /ooma- and
+/hyperview-style dashboard routes are the pattern a new one would follow.
 
-This is the ONE human-facing login for both bridges now - each bridge's own
-/maintenance and /events-search pages were retired (see their
+For iPRO and Ooma specifically: this replaces each bridge's own
+/maintenance and /events-search pages, which were retired (see their
 BRIDGE_PORTAL_URL / portal_url config) and now just redirect here. Their
 underlying JSON/CSV feeds and write-protected POST routes are UNCHANGED and
 still require each bridge's own maintenance_auth secret - this portal
 authenticates the HUMAN, then calls those routes server-to-server using
-that secret, same as an operator's browser used to.
+that secret, same as an operator's browser used to. Hyperview never had
+its own login (its JSON feeds are unauthenticated - see HYPERVIEW_BASE_URL
+below); the portal just puts a login in front of its dashboard page,
+nothing server-to-server to forward there.
 
-Three accounts, per-system scoped:
-    chadmin  - both ipro and ooma (same password as before: 3Xce11@nce)
+Four accounts, per-system scoped:
+    chadmin  - ipro, ooma, and hyperview (same password as before: 3Xce11@nce)
     security - ipro only
     network  - ooma only
 Passwords are salted+hashed (PBKDF2-HMAC-SHA256, 200k iterations) rather
@@ -29,6 +36,7 @@ Config (env vars, all optional - defaults assume everything runs on one
 host):
     IPRO_BASE_URL          default http://localhost:5002
     OOMA_BASE_URL          default http://localhost:5003
+    HYPERVIEW_BASE_URL     default http://localhost:5001
     IPRO_MAINTENANCE_AUTH  default matches ipro2.py's own default
     OOMA_MAINTENANCE_AUTH  default matches ooma.py's own default
     PORTAL_PORT            default 5004
@@ -373,7 +381,7 @@ PAGE_SHELL = """<!DOCTYPE html>
 <header class="brand">
   <div>
     <div class="brand-name">Covenant Health</div>
-    <div class="brand-sub">Bridge Portal - iPRO &amp; Ooma AirDial</div>
+    <div class="brand-sub">Bridge Portal &middot; Facility Systems</div>
   </div>
 </header>
 <nav class="top">
@@ -965,12 +973,16 @@ HYPERVIEW_COMPONENT_CSS = """
 DASHBOARD_EXTRA_CSS = """
   .badge.warn { background: var(--warn); color: #fff; }
   .dash-mark { color: var(--text-faint); }
+  /* Same teal-dark/white treatment as header.brand - the vendor name is
+     the only thing that changes per system (i-PRO here; a future
+     system's own badge would follow the same look, not its own brand
+     colors) so this reads as part of the portal, not a foreign widget. */
   .vendor-mark {
-    background: #17181c; color: #f4c518; text-align: center; padding: 14px;
+    background: var(--teal-dark); color: #fff; text-align: center; padding: 14px;
     font-weight: 700; font-size: 18px; letter-spacing: 0.05em; border-radius: 10px;
     box-shadow: 0 1px 3px rgba(0,0,0,0.04); margin-bottom: 18px;
   }
-  .vendor-mark .dots { letter-spacing: 0.2em; margin-right: 6px; }
+  .vendor-mark .dots { letter-spacing: 0.2em; margin-right: 6px; opacity: 0.8; }
   .stat-row { display: flex; }
   .stat-tile { flex: 1; padding: 14px 10px; text-align: center; border-right: 1px solid var(--border); }
   .stat-tile:last-child { border-right: none; }
@@ -980,8 +992,17 @@ DASHBOARD_EXTRA_CSS = """
   .updated-note { padding: 8px 18px 14px; font-size: 12px; color: var(--text-faint); text-align: center; }
   td.status-cell { font-weight: 700; color: var(--danger); }
   td.priority-cell.critical { color: var(--danger); font-weight: 700; }
-  .device-scroll tbody { display: block; max-height: 420px; overflow-y: auto; }
-  .device-scroll thead, .device-scroll tbody tr { display: table; width: 100%; table-layout: fixed; }
+  /* A capped-height scroll area with a frozen header - NOT the
+     display:table-per-row trick this used to use (tr{display:table}
+     inside a display:block tbody breaks the fixed-layout column-width
+     algorithm each row relied on, since every row becomes its own
+     unrelated table with no shared column metrics - that's what was
+     making Device/Status text run into each other in the Device Detail
+     table). A plain scrollable wrapper with a sticky <thead> gets the
+     same "long list, frozen header" effect without touching how the
+     table itself lays out its columns. */
+  .device-scroll { max-height: 420px; overflow-y: auto; }
+  .device-scroll table.alarmlog thead th { position: sticky; top: 0; z-index: 1; }
   .summary-row { display: grid; grid-template-columns: minmax(220px, 320px) minmax(220px, 320px) 1fr;
     gap: 18px; align-items: start; margin-bottom: 18px; }
   @media (max-width: 1080px) { .summary-row { grid-template-columns: 1fr; } }
@@ -994,9 +1015,13 @@ DASHBOARD_EXTRA_CSS = """
     display: block; transition: border-color 0.15s ease; }
   a.panel.status-panel:hover { border-color: var(--teal); }
   .status-panel .panel-head { border-bottom: none; }
-  .status-body { display: flex; align-items: center; gap: 10px; padding: 0 18px 16px; }
+  .status-body { display: flex; align-items: center; gap: 10px; padding: 0 18px 8px; }
   .status-dot { width: 14px; height: 14px; border-radius: 50%; flex-shrink: 0; }
   .status-state { font-size: 13px; color: var(--text-dim); }
+  .status-detail { padding: 0 18px 16px; font-size: 12px; color: var(--text-faint); }
+  .quick-links { display: flex; flex-wrap: wrap; gap: 8px 20px; padding: 0 18px 18px; }
+  .quick-link { color: var(--teal); text-decoration: none; font-weight: 600; font-size: 13px; }
+  .quick-link:hover { text-decoration: underline; }
 """
 
 # Responsive overrides for /ipro, /ooma and /hyperview - no separate
@@ -1030,8 +1055,11 @@ RESPONSIVE_DASHBOARD_CSS = """
       font-weight: 700; text-align: left;
     }
     table.matrix td.site-cell::before, table.alarmlog td.loc::before, table.alarmlog td.dev::before { content: ""; }
-    .device-scroll tbody { max-height: none; }
-    .device-scroll thead, .device-scroll tbody tr { display: block; width: auto; table-layout: auto; }
+    /* Stacked cards already keep each device's fields readable without a
+       capped-height nested scroll area - let the list flow with the page
+       instead of scrolling twice (page scroll + a tiny inner scrollbar). */
+    .device-scroll { max-height: none; overflow-y: visible; }
+    .device-scroll table.alarmlog thead th { position: static; }
     button, nav.top a { min-height: 40px; }
   }
 """
@@ -1143,8 +1171,8 @@ def _ipro_board_html(data):
     </div>
     <div class="panel">
       <div class="panel-head"><h2>Device Detail</h2><span class="count-note">{data['totals']['unhealthy_cameras']} unhealthy devices</span></div>
-      <div class="matrix-wrap">
-        <table class="alarmlog device-scroll">
+      <div class="matrix-wrap device-scroll">
+        <table class="alarmlog">
           <thead><tr><th>Device</th><th>Status</th><th>Detail</th><th>Duration</th><th>Priority</th></tr></thead>
           <tbody>{device_rows}</tbody>
         </table>
@@ -1250,27 +1278,42 @@ def overview_page(username):
     allowed = USERS[username]["systems"]
     cards = []
     if "hyperview" in allowed:
-        state, tone = "Could not reach Hyperview", "text-faint"
+        state, tone, detail = "Could not reach Hyperview", "text-faint", ""
         try:
             resp = requests.get(f"{HYPERVIEW_BASE_URL}/overall-health", timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
             health = resp.json()[0]
             state = health["state"]
             tone = "ok" if health["health"] == 100 else "warn" if health["health"] >= 70 else "danger"
+            summary_resp = requests.get(f"{HYPERVIEW_BASE_URL}/category-summary", timeout=REQUEST_TIMEOUT)
+            summary_resp.raise_for_status()
+            all_row = next((c for c in summary_resp.json() if "All" in c.get("category", "")), None)
+            if all_row:
+                detail = f"{all_row['open']} open issue(s) &middot; {all_row['ack']} acknowledged"
         except (requests.RequestException, KeyError, IndexError, ValueError):
             pass
-        cards.append(("Hyperview", "/hyperview", state, tone))
+        cards.append(("Hyperview", "/hyperview", state, tone, detail))
     if "ipro" in allowed:
         g = IPRO_DASHBOARD["gauge"]
-        cards.append(("iPRO Cameras", "/ipro", g["state"], g["tone"]))
+        totals = IPRO_DASHBOARD["totals"]
+        total_open = sum(r["open"] for r in IPRO_DASHBOARD["summary"])
+        detail = (f"{total_open} open issue(s) &middot; {totals['unhealthy_cameras']} of "
+                  f"{totals['total_cameras']} cameras unhealthy")
+        cards.append(("iPRO Cameras", "/ipro", g["state"], g["tone"], detail))
     if "ooma" in allowed:
         g = OOMA_DASHBOARD["gauge"]
-        cards.append(("Ooma AirDial", "/ooma", g["state"], g["tone"]))
+        sites = OOMA_DASHBOARD["sites"]
+        total_open = sum(r["open"] for r in OOMA_DASHBOARD["summary"])
+        affected = sum(1 for s in sites if isinstance(s["connectivity"], int) and s["connectivity"] > 0)
+        detail = f"{total_open} open alarm(s) &middot; {affected} of {len(sites)} sites affected"
+        cards.append(("Ooma AirDial", "/ooma", g["state"], g["tone"], detail))
 
     # Reuses the exact .panel/.panel-head shell every other dashboard page
     # is built from (see HYPERVIEW_COMPONENT_CSS) rather than a bespoke
     # card style, so this page reads as part of the same family instead
-    # of a one-off landing screen.
+    # of a one-off landing screen. New systems just append another card
+    # here the same way ipro/ooma/hyperview do above - nothing about the
+    # markup or CSS is specific to today's three.
     cards_html = "".join(f"""
       <a class="panel status-panel" href="{href}">
         <div class="panel-head"><h2>{_esc(name)}</h2></div>
@@ -1278,13 +1321,34 @@ def overview_page(username):
           <span class="status-dot" style="background:var(--{tone})"></span>
           <span class="status-state">{_esc(state)}</span>
         </div>
-      </a>""" for name, href, state, tone in cards)
+        {f'<div class="status-detail">{detail}</div>' if detail else ''}
+      </a>""" for name, href, state, tone, detail in cards)
+
+    # Maintenance/event-search only ever cover the auth-forwarding
+    # bridges (see accessible_systems) - Hyperview has no windows/events
+    # of its own, so an account with only hyperview access sees status
+    # cards above but no quick links here, same as it sees no
+    # Maintenance/Event search nav items with anything to act on.
+    systems = accessible_systems(username)
+    quick_links_html = ""
+    if systems:
+        quick_links_html = """
+        <div class="panel">
+          <div class="panel-head"><h2>Quick Links</h2></div>
+          <div class="quick-links">
+            <a class="quick-link" href="/maintenance">Maintenance &rarr;</a>
+            <a class="quick-link" href="/events-search">Event search &rarr;</a>
+          </div>
+        </div>"""
 
     body = f"""
     <h1>System overview</h1>
-    <p class="sub">At-a-glance status for every facility system you have access to.</p>
+    <p class="sub">One login for every Covenant Health facility system you have access to
+    &mdash; camera health, emergency phone lines, and site infrastructure today, with more
+    systems landing here over time.</p>
     <style>{HYPERVIEW_COMPONENT_CSS}{DASHBOARD_EXTRA_CSS}</style>
     <div class="status-grid">{cards_html or '<p class="empty">Your account has no systems assigned.</p>'}</div>
+    {quick_links_html}
     """
     return Response(render_shell("Overview", body, "overview", username), mimetype="text/html")
 
