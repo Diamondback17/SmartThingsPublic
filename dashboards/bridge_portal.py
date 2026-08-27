@@ -100,13 +100,15 @@ HYPERVIEW_ENDPOINTS = {
 # --- iPRO / Ooma dashboard data -------------------------------------------
 # ipro2.py and ooma.py don't yet expose a health-summary endpoint the way
 # matrix.py does (see HYPERVIEW_ENDPOINTS above) - there's no live
-# /overall-health or /location-health-matrix on either bridge yet. Until
-# that lands, /ipro and /ooma render from this fixed illustrative snapshot
-# instead of faking a fetch to an endpoint that doesn't exist. Once one
-# lands, swap the two constants below for a _fetch_windows-style
-# requests.get() against each bridge's own health route - the HTML
-# builders further down don't care where the dict comes from, only its
-# shape.
+# /overall-health or /location-health-matrix on either bridge yet. These
+# two constants are the fallback _fetch_dashboard_snapshot() below uses
+# whenever GET {base_url}/health-summary fails, which today is always
+# (neither bridge listens on that route). They also double as the
+# CONTRACT for that future endpoint: shape a real /health-summary
+# response exactly like the dict below and it starts rendering live with
+# no changes to _fetch_dashboard_snapshot, the HTML builders, or the
+# routes that call them - only these two dicts become dead weight, safe
+# to delete once the fallback path never fires.
 IPRO_DASHBOARD = {
     "gauge": {"score": 94, "state": "Needs Attention", "tone": "warn"},
     "totals": {"total_cameras": 429, "unhealthy_cameras": 26},
@@ -193,6 +195,24 @@ OOMA_DASHBOARD = {
          "detail": "LTE unstable — flapping (3+ changes in the last 30 min)"},
     ],
 }
+
+
+def _fetch_dashboard_snapshot(system, fallback):
+    """Tries {base_url}/health-summary - the live endpoint /ipro and
+    /ooma would use once ipro2.py/ooma.py grow one, shaped like
+    IPRO_DASHBOARD/OOMA_DASHBOARD above (see the comment there). Same
+    fail-soft shape as _fetch_windows/_fetch_options: any connection
+    failure, non-2xx, or response that isn't valid JSON just falls back
+    to the fixed snapshot rather than breaking the page - which is what
+    happens on every call today, since that route doesn't exist yet."""
+    cfg = SYSTEMS[system]
+    try:
+        resp = requests.get(f"{cfg['base_url']}/health-summary", timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        return resp.json()
+    except (requests.RequestException, ValueError):
+        return fallback
+
 
 # --- users -------------------------------------------------------------
 # PBKDF2-HMAC-SHA256, 200k iterations, per-user random salt - generated
@@ -1243,13 +1263,14 @@ def ipro_page(username):
     denied = _forbidden_or_unknown(username, "ipro")
     if denied:
         return denied
+    data = _fetch_dashboard_snapshot("ipro", IPRO_DASHBOARD)
     body = f"""
     <h1>iPRO Cameras</h1>
     <p class="sub">Camera health &amp; infrastructure status across all sites.
     &middot; <a href="/ipro/kiosk" target="_blank" rel="noopener">Open kiosk view</a>
     (no login, for a wall display &mdash; opens in a new tab)</p>
     <style>{DASHBOARD_CSS}</style>
-    {_ipro_board_html(IPRO_DASHBOARD)}
+    {_ipro_board_html(data)}
     """
     return Response(render_shell("iPRO Cameras", body, "ipro", username), mimetype="text/html")
 
@@ -1260,13 +1281,14 @@ def ooma_page(username):
     denied = _forbidden_or_unknown(username, "ooma")
     if denied:
         return denied
+    data = _fetch_dashboard_snapshot("ooma", OOMA_DASHBOARD)
     body = f"""
     <h1>Ooma AirDial</h1>
     <p class="sub">Emergency red phone connectivity &amp; battery health across all sites.
     &middot; <a href="/ooma/kiosk" target="_blank" rel="noopener">Open kiosk view</a>
     (no login, for a wall display &mdash; opens in a new tab)</p>
     <style>{DASHBOARD_CSS}</style>
-    {_ooma_board_html(OOMA_DASHBOARD)}
+    {_ooma_board_html(data)}
     """
     return Response(render_shell("Ooma AirDial", body, "ooma", username), mimetype="text/html")
 
@@ -1295,16 +1317,18 @@ def overview_page(username):
             pass
         cards.append(("Hyperview", "/hyperview", state, tone, detail))
     if "ipro" in allowed:
-        g = IPRO_DASHBOARD["gauge"]
-        totals = IPRO_DASHBOARD["totals"]
-        total_open = sum(r["open"] for r in IPRO_DASHBOARD["summary"])
+        ipro_data = _fetch_dashboard_snapshot("ipro", IPRO_DASHBOARD)
+        g = ipro_data["gauge"]
+        totals = ipro_data["totals"]
+        total_open = sum(r["open"] for r in ipro_data["summary"])
         detail = (f"{total_open} open issue(s) &middot; {totals['unhealthy_cameras']} of "
                   f"{totals['total_cameras']} cameras unhealthy")
         cards.append(("iPRO Cameras", "/ipro", g["state"], g["tone"], detail))
     if "ooma" in allowed:
-        g = OOMA_DASHBOARD["gauge"]
-        sites = OOMA_DASHBOARD["sites"]
-        total_open = sum(r["open"] for r in OOMA_DASHBOARD["summary"])
+        ooma_data = _fetch_dashboard_snapshot("ooma", OOMA_DASHBOARD)
+        g = ooma_data["gauge"]
+        sites = ooma_data["sites"]
+        total_open = sum(r["open"] for r in ooma_data["summary"])
         affected = sum(1 for s in sites if isinstance(s["connectivity"], int) and s["connectivity"] > 0)
         detail = f"{total_open} open alarm(s) &middot; {affected} of {len(sites)} sites affected"
         cards.append(("Ooma AirDial", "/ooma", g["state"], g["tone"], detail))
@@ -1490,6 +1514,12 @@ async function refreshAll() {
       alarms.length + ' device' + (alarms.length === 1 ? '' : 's');
     const lastUpdatedEl = document.getElementById('hv-last-updated');
     if (lastUpdatedEl) lastUpdatedEl.textContent = new Date().toLocaleTimeString();
+    // No-op on the regular /hyperview page (kioskCriticalCue only exists
+    // on /hyperview/kiosk, see DASHBOARD_KIOSK_SHELL) - this same
+    // refreshAll() runs on both.
+    if (window.kioskCriticalCue) {
+      window.kioskCriticalCue(alarms.some(a => String(a.severity).toLowerCase() === 'critical'));
+    }
     if (statusEl) statusEl.textContent = '';
   } catch (err) {
     if (statusEl) statusEl.textContent = 'Could not reach Hyperview: ' + err.message;
@@ -1593,7 +1623,7 @@ def hyperview_page(username):
     if "hyperview" not in USERS[username]["systems"]:
         return Response("Your account does not have access to Hyperview", 403)
     body = f"""
-    <h1>Facility health</h1>
+    <h1>Hyperview</h1>
     <p class="sub">Live alarm status across Covenant Health hospitals, datacenters, and clinics.
     &middot; <a href="/hyperview/kiosk" target="_blank" rel="noopener">Open kiosk view</a>
     (no login, for a wall display &mdash; opens in a new tab)</p>
@@ -1655,9 +1685,54 @@ DASHBOARD_KIOSK_SHELL = """<!DOCTYPE html>
   }}
   .kiosk-rotate-badge a {{ color: var(--teal); text-decoration: none; margin-left: 6px; }}
   .kiosk-rotate-badge a:hover {{ text-decoration: underline; }}
+  /* Unattended wall display, so a color change alone isn't enough - this
+     is what kioskCriticalCue() below turns on when the current dashboard
+     has any Critical item, a pulsing red vignette around the whole
+     screen that reads from across a room even before anyone's close
+     enough to read the table it's tied to. */
+  body.kiosk-alert::after {{
+    content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 9999;
+    animation: kiosk-critical-pulse 1.6s ease-in-out infinite;
+  }}
+  @keyframes kiosk-critical-pulse {{
+    0%, 100% {{ box-shadow: inset 0 0 0 0 rgba(255, 93, 128, 0); }}
+    50% {{ box-shadow: inset 0 0 0 14px rgba(255, 93, 128, 0.55); }}
+  }}
 </style>
 </head>
 <body>
+  <script>
+    // Shared by every /kiosk page (see kioskCriticalCue call sites in
+    // HYPERVIEW_SCRIPT and the ipro/ooma kiosk routes below) - one place
+    // that owns the flash + beep so a future dashboard's kiosk route
+    // just calls window.kioskCriticalCue(true/false) too, nothing new to
+    // wire up here. Wrapped in try/catch because WebAudio can throw if
+    // the browser is blocking autoplay before any user gesture on this
+    // page - common for a kiosk browser depending on how it's launched;
+    // the CSS flash still applies either way, only the beep is at risk.
+    (function () {{
+      var audioCtx = null;
+      var wasCritical = false;
+      window.kioskCriticalCue = function (hasCritical) {{
+        try {{
+          document.body.classList.toggle('kiosk-alert', !!hasCritical);
+          if (hasCritical && !wasCritical) {{
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            var osc = audioCtx.createOscillator();
+            var gain = audioCtx.createGain();
+            osc.frequency.value = 880;
+            gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.5);
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.start();
+            osc.stop(audioCtx.currentTime + 0.5);
+          }}
+          wasCritical = !!hasCritical;
+        }} catch (e) {{ /* autoplay blocked or WebAudio unsupported - flash still ran above */ }}
+      }};
+    }})();
+  </script>
   <div class="kiosk-header">
     <div>
       <h1>Covenant Health &middot; Facility Systems</h1>
@@ -1742,6 +1817,15 @@ KIOSK_CLOCK_SCRIPT = """
 """
 
 
+def _kiosk_critical_script(has_critical):
+    """iPRO/Ooma kiosk counterpart to the Hyperview refreshAll() call
+    into kioskCriticalCue() - their data is a fixed snapshot computed
+    once per request rather than live-polled, so this just calls it once
+    on load with whatever the current snapshot says, instead of on every
+    fetch like Hyperview does."""
+    return f"<script>if (window.kioskCriticalCue) window.kioskCriticalCue({'true' if has_critical else 'false'});</script>"
+
+
 @app.route("/hyperview/kiosk")
 def hyperview_kiosk():
     path = "/hyperview/kiosk"
@@ -1760,12 +1844,14 @@ def hyperview_kiosk():
 @app.route("/ipro/kiosk")
 def ipro_kiosk():
     path = "/ipro/kiosk"
+    data = _fetch_dashboard_snapshot("ipro", IPRO_DASHBOARD)
+    has_critical = any(d["priority"].lower() == "critical" for d in data["devices"])
     return Response(
         DASHBOARD_KIOSK_SHELL.format(
             title="iPRO Cameras",
             component_css=HYPERVIEW_COMPONENT_CSS + DASHBOARD_EXTRA_CSS,
-            board=_ipro_board_html(IPRO_DASHBOARD),
-            script=KIOSK_CLOCK_SCRIPT,
+            board=_ipro_board_html(data),
+            script=KIOSK_CLOCK_SCRIPT + _kiosk_critical_script(has_critical),
             rotate=_kiosk_rotate_html(path),
         ),
         mimetype="text/html",
@@ -1775,12 +1861,14 @@ def ipro_kiosk():
 @app.route("/ooma/kiosk")
 def ooma_kiosk():
     path = "/ooma/kiosk"
+    data = _fetch_dashboard_snapshot("ooma", OOMA_DASHBOARD)
+    has_critical = any(a["severity"].lower() == "critical" for a in data["alarms"])
     return Response(
         DASHBOARD_KIOSK_SHELL.format(
             title="Ooma AirDial",
             component_css=HYPERVIEW_COMPONENT_CSS + DASHBOARD_EXTRA_CSS,
-            board=_ooma_board_html(OOMA_DASHBOARD),
-            script=KIOSK_CLOCK_SCRIPT,
+            board=_ooma_board_html(data),
+            script=KIOSK_CLOCK_SCRIPT + _kiosk_critical_script(has_critical),
             rotate=_kiosk_rotate_html(path),
         ),
         mimetype="text/html",
@@ -1788,11 +1876,59 @@ def ooma_kiosk():
 
 
 @app.route("/kiosk")
-def kiosk_entry():
-    """Friendly, memorable entry point for a wall display - bookmark
-    this instead of any one dashboard's own /kiosk route, and it always
-    starts the rotation at the same place (KIOSK_CYCLE[0])."""
-    return redirect(f"{KIOSK_CYCLE[0]}?rotate=1")
+def kiosk_menu():
+    """Landing page for a wall display - unauthenticated, same as every
+    /*/kiosk route it links to. Lists each dashboard's kiosk view
+    individually (for parking a display on just one, same as visiting
+    its own /kiosk URL directly) plus a button that starts the
+    auto-rotating cycle across all of KIOSK_CYCLE. Bookmark this instead
+    of any one dashboard's own /kiosk route - it's the one URL that
+    doesn't change as dashboards are added or reordered."""
+    items_html = "".join(
+        f'<a class="kiosk-menu-item" href="{path}">{_esc(KIOSK_LABELS[path])}</a>'
+        for path in KIOSK_CYCLE
+    )
+    return Response(f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kiosk</title>
+<style>
+  :root {{
+    --bg: #060b0d; --panel: #0e181b; --border: #223338;
+    --text: #f2f6f6; --text-dim: #a9bcbc; --teal: #6cb2ef; --teal-dark: #8fc0ef;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+    font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, Arial, sans-serif;
+    display: flex; align-items: center; justify-content: center; padding: 2rem;
+  }}
+  .kiosk-menu {{ width: 100%; max-width: 420px; display: flex; flex-direction: column; gap: 0.7rem; text-align: center; }}
+  .kiosk-menu h1 {{ margin: 0 0 0.3rem; font-size: 1.6rem; }}
+  .kiosk-menu .sub {{ margin: 0 0 1rem; color: var(--text-dim); font-size: 0.9rem; }}
+  .kiosk-menu-item, .kiosk-menu-rotate {{
+    display: block; padding: 0.9rem; border-radius: 10px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--text); text-decoration: none; font-weight: 600;
+    transition: border-color 0.15s ease;
+  }}
+  .kiosk-menu-item:hover {{ border-color: var(--teal); }}
+  .kiosk-menu-rotate {{ background: var(--teal-dark); color: #06121c; border-color: var(--teal-dark); margin-top: 0.5rem; }}
+  .kiosk-menu-rotate:hover {{ opacity: 0.92; }}
+</style>
+</head>
+<body>
+  <div class="kiosk-menu">
+    <div>
+      <h1>Covenant Health &middot; Facility Systems</h1>
+      <p class="sub">Pick a dashboard to park on, or auto-rotate through all {len(KIOSK_CYCLE)}.</p>
+    </div>
+    {items_html}
+    <a class="kiosk-menu-rotate" href="{KIOSK_CYCLE[0]}?rotate=1">&#9654; Start rotating (every {KIOSK_ROTATE_SECONDS}s)</a>
+  </div>
+</body>
+</html>""", mimetype="text/html")
 
 
 @app.route("/logout")
