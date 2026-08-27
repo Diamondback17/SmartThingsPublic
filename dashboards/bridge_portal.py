@@ -984,38 +984,41 @@ DASHBOARD_EXTRA_CSS = """
   @media (max-width: 1080px) { .summary-row { grid-template-columns: 1fr; } }
 """
 
-# Mobile-only overrides for /ipro/mobile, /ooma/mobile and /hyperview/mobile:
-# forces every board grid to a single column and turns each matrix/summary/
-# alarmlog table into a stacked label:value card list (the standard
-# responsive-table pattern) instead of a wide table a phone has to scroll
-# sideways to read. Relies on the data-label attributes the HTML builders
-# below (and the updated HYPERVIEW_SCRIPT render functions) put on every
-# <td> - those attributes are inert on the desktop pages, this is the only
-# stylesheet that reads them.
-MOBILE_DASHBOARD_CSS = """
-  .wrap { width: 100%; padding: 16px 12px 40px; }
-  nav.top a { margin-left: 12px; font-size: 12px; }
-  .board, .summary-row { display: flex !important; flex-direction: column; }
-  .center-col { flex-direction: column !important; }
-  table.matrix thead, table.summary thead, table.alarmlog thead { display: none; }
-  table.matrix tbody tr, table.summary tbody tr, table.alarmlog tbody tr {
-    display: block; padding: 10px 4px; border-bottom: 1px solid var(--border);
+# Responsive overrides for /ipro, /ooma and /hyperview - no separate
+# /mobile routes or URL to remember, this is just a @media breakpoint on
+# the same page: below 720px it forces every board grid to a single
+# column and turns each matrix/summary/alarmlog table into a stacked
+# label:value card list (the standard responsive-table pattern) instead
+# of a wide table a phone has to scroll sideways to read. Relies on the
+# data-label attributes the HTML builders below (and the HYPERVIEW_SCRIPT
+# render functions) put on every <td> - those attributes are inert above
+# the breakpoint, this media query is the only place that reads them.
+RESPONSIVE_DASHBOARD_CSS = """
+  @media (max-width: 720px) {
+    .wrap { width: 100%; padding: 16px 12px 40px; }
+    nav.top a { margin-left: 12px; font-size: 12px; }
+    .board, .summary-row { display: flex !important; flex-direction: column; }
+    .center-col { flex-direction: column !important; }
+    table.matrix thead, table.summary thead, table.alarmlog thead { display: none; }
+    table.matrix tbody tr, table.summary tbody tr, table.alarmlog tbody tr {
+      display: block; padding: 10px 4px; border-bottom: 1px solid var(--border);
+    }
+    table.matrix td, table.summary td, table.alarmlog td {
+      display: flex; justify-content: space-between; align-items: center; gap: 10px;
+      padding: 6px 4px; border-bottom: none; text-align: right;
+    }
+    table.matrix td::before, table.summary td::before, table.alarmlog td::before {
+      content: attr(data-label); font-weight: 600; color: var(--text-faint);
+      text-align: left; flex-shrink: 0;
+    }
+    table.matrix td.site-cell, table.alarmlog td.loc, table.alarmlog td.dev {
+      font-weight: 700; text-align: left;
+    }
+    table.matrix td.site-cell::before, table.alarmlog td.loc::before, table.alarmlog td.dev::before { content: ""; }
+    .device-scroll tbody { max-height: none; }
+    .device-scroll thead, .device-scroll tbody tr { display: block; width: auto; table-layout: auto; }
+    button, nav.top a { min-height: 40px; }
   }
-  table.matrix td, table.summary td, table.alarmlog td {
-    display: flex; justify-content: space-between; align-items: center; gap: 10px;
-    padding: 6px 4px; border-bottom: none; text-align: right;
-  }
-  table.matrix td::before, table.summary td::before, table.alarmlog td::before {
-    content: attr(data-label); font-weight: 600; color: var(--text-faint);
-    text-align: left; flex-shrink: 0;
-  }
-  table.matrix td.site-cell, table.alarmlog td.loc, table.alarmlog td.dev {
-    font-weight: 700; text-align: left;
-  }
-  table.matrix td.site-cell::before, table.alarmlog td.loc::before, table.alarmlog td.dev::before { content: ""; }
-  .device-scroll tbody { max-height: none; }
-  .device-scroll thead, .device-scroll tbody tr { display: block; width: auto; table-layout: auto; }
-  button, nav.top a { min-height: 40px; }
 """
 
 
@@ -1202,27 +1205,11 @@ def ipro_page(username):
         return denied
     body = f"""
     <h1>iPRO Cameras</h1>
-    <p class="sub">Camera health &amp; infrastructure status across all sites.
-    &middot; <a href="/ipro/mobile">Open mobile view</a></p>
-    <style>{HYPERVIEW_COMPONENT_CSS}{DASHBOARD_EXTRA_CSS}</style>
+    <p class="sub">Camera health &amp; infrastructure status across all sites.</p>
+    <style>{HYPERVIEW_COMPONENT_CSS}{DASHBOARD_EXTRA_CSS}{RESPONSIVE_DASHBOARD_CSS}</style>
     {_ipro_board_html(IPRO_DASHBOARD)}
     """
     return Response(render_shell("iPRO Cameras", body, "ipro", username), mimetype="text/html")
-
-
-@app.route("/ipro/mobile")
-@require_login
-def ipro_mobile_page(username):
-    denied = _forbidden_or_unknown(username, "ipro")
-    if denied:
-        return denied
-    body = f"""
-    <h1>iPRO Cameras</h1>
-    <p class="sub">Mobile view &middot; <a href="/ipro">Open desktop view</a></p>
-    <style>{HYPERVIEW_COMPONENT_CSS}{DASHBOARD_EXTRA_CSS}{MOBILE_DASHBOARD_CSS}</style>
-    {_ipro_board_html(IPRO_DASHBOARD)}
-    """
-    return Response(render_shell("iPRO Cameras · Mobile", body, "ipro", username), mimetype="text/html")
 
 
 @app.route("/ooma")
@@ -1233,27 +1220,11 @@ def ooma_page(username):
         return denied
     body = f"""
     <h1>Ooma AirDial</h1>
-    <p class="sub">Emergency red phone connectivity &amp; battery health across all sites.
-    &middot; <a href="/ooma/mobile">Open mobile view</a></p>
-    <style>{HYPERVIEW_COMPONENT_CSS}{DASHBOARD_EXTRA_CSS}</style>
+    <p class="sub">Emergency red phone connectivity &amp; battery health across all sites.</p>
+    <style>{HYPERVIEW_COMPONENT_CSS}{DASHBOARD_EXTRA_CSS}{RESPONSIVE_DASHBOARD_CSS}</style>
     {_ooma_board_html(OOMA_DASHBOARD)}
     """
     return Response(render_shell("Ooma AirDial", body, "ooma", username), mimetype="text/html")
-
-
-@app.route("/ooma/mobile")
-@require_login
-def ooma_mobile_page(username):
-    denied = _forbidden_or_unknown(username, "ooma")
-    if denied:
-        return denied
-    body = f"""
-    <h1>Ooma AirDial</h1>
-    <p class="sub">Mobile view &middot; <a href="/ooma">Open desktop view</a></p>
-    <style>{HYPERVIEW_COMPONENT_CSS}{DASHBOARD_EXTRA_CSS}{MOBILE_DASHBOARD_CSS}</style>
-    {_ooma_board_html(OOMA_DASHBOARD)}
-    """
-    return Response(render_shell("Ooma AirDial · Mobile", body, "ooma", username), mimetype="text/html")
 
 
 # --- overview page ---------------------------------------------------------
@@ -1310,13 +1281,13 @@ def overview_page(username):
 
 
 # --- Hyperview dashboard --------------------------------------------------
-# Shared between the logged-in /hyperview page, the responsive
-# /hyperview/mobile page, and the unauthenticated /hyperview/kiosk wall
-# display - same rendering logic, different CSS theme and auto-refresh
-# interval (see the %(...)s placeholders each page fills in). Talks only
-# to /hyperview/api/* (this portal's own proxy), never straight to
-# HYPERVIEW_BASE_URL - keeps the real matrix.py host out of client-side
-# JS entirely.
+# Shared between the logged-in /hyperview page (responsive down to phone
+# widths via RESPONSIVE_DASHBOARD_CSS) and the unauthenticated
+# /hyperview/kiosk wall display - same rendering logic, different CSS
+# theme and auto-refresh interval (see the %(...)s placeholders each page
+# fills in). Talks only to /hyperview/api/* (this portal's own proxy),
+# never straight to HYPERVIEW_BASE_URL - keeps the real matrix.py host out
+# of client-side JS entirely.
 
 HYPERVIEW_SCRIPT = """
 <script>
@@ -1336,9 +1307,10 @@ function categoryCellHtml(count) {
   return '<span class="badge open">' + count + '</span>';
 }
 
-// data-label attributes below are inert on the desktop/kiosk pages - only
-// MOBILE_DASHBOARD_CSS's responsive-table rules read them, to turn each
-// row into a stacked label:value card on /hyperview/mobile.
+// data-label attributes below are inert on the kiosk page and above the
+// RESPONSIVE_DASHBOARD_CSS breakpoint - only that media query's
+// responsive-table rules read them, to turn each row into a stacked
+// label:value card on a narrow /hyperview viewport.
 function renderMatrixTable(tbodyId, rows) {
   const tbody = document.getElementById(tbodyId);
   tbody.innerHTML = '';
@@ -1458,11 +1430,11 @@ if (AUTO_REFRESH_MS > 0) setInterval(refreshAll, AUTO_REFRESH_MS);
 </script>
 """
 
-# Shared markup for /hyperview, /hyperview/mobile and /hyperview/kiosk -
-# the site matrices, gauge, category tiles, and alarm log. Each page wraps
-# this in its own <style> (branded-light for the logged-in page, the same
-# plus MOBILE_DASHBOARD_CSS for the mobile page, dark/oversized for the
-# kiosk) and its own header, then appends HYPERVIEW_SCRIPT.
+# Shared markup for /hyperview and /hyperview/kiosk - the site matrices,
+# gauge, category tiles, and alarm log. Each page wraps this in its own
+# <style> (branded-light plus RESPONSIVE_DASHBOARD_CSS for the logged-in
+# page, dark/oversized for the kiosk) and its own header, then appends
+# HYPERVIEW_SCRIPT.
 def _hyperview_board_html():
     return """
     <div class="redundancy-alert" id="redundancy-alert" style="display:none;">
@@ -1543,29 +1515,13 @@ def hyperview_page(username):
     body = f"""
     <h1>Facility health</h1>
     <p class="sub">Live alarm status across Covenant Health hospitals, datacenters, and clinics.
-    &middot; <a href="/hyperview/mobile">Open mobile view</a>
     &middot; <a href="/hyperview/kiosk" target="_blank" rel="noopener">Open kiosk view</a>
     (no login, for a wall display &mdash; opens in a new tab)</p>
-    <style>{HYPERVIEW_COMPONENT_CSS}</style>
+    <style>{HYPERVIEW_COMPONENT_CSS}{RESPONSIVE_DASHBOARD_CSS}</style>
     {_hyperview_board_html()}
     {HYPERVIEW_SCRIPT % {'auto_refresh_ms': 30000}}
     """
     return Response(render_shell("Hyperview", body, "hyperview", username), mimetype="text/html")
-
-
-@app.route("/hyperview/mobile")
-@require_login
-def hyperview_mobile_page(username):
-    if "hyperview" not in USERS[username]["systems"]:
-        return Response("Your account does not have access to Hyperview", 403)
-    body = f"""
-    <h1>Facility health</h1>
-    <p class="sub">Mobile view &middot; <a href="/hyperview">Open desktop view</a></p>
-    <style>{HYPERVIEW_COMPONENT_CSS}{MOBILE_DASHBOARD_CSS}</style>
-    {_hyperview_board_html()}
-    {HYPERVIEW_SCRIPT % {'auto_refresh_ms': 30000}}
-    """
-    return Response(render_shell("Hyperview · Mobile", body, "hyperview", username), mimetype="text/html")
 
 
 # Deliberately outside PAGE_SHELL/render_shell and unauthenticated - a
