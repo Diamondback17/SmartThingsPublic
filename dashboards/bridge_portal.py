@@ -395,6 +395,20 @@ PAGE_SHELL = """<!DOCTYPE html>
   .sev-degraded {{ color: var(--warn); font-weight: 600; }}
   .sev-recovered {{ color: var(--ok); font-weight: 600; }}
   .change .was {{ display: block; color: var(--text-faint); font-size: 11px; margin-top: 2px; }}
+  /* Same red-vignette cue as the kiosk pages (see kioskCriticalCue in
+     DASHBOARD_KIOSK_SHELL) toned down for this shell's light background -
+     a page that toggles this on via _critical_alert_script() gets the
+     same "something needs attention right now" signal a logged-in
+     person would otherwise only see by opening each dashboard. No beep
+     here - unlike a kiosk, someone's already looking at this page. */
+  body.critical-alert::after {{
+    content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 9999;
+    animation: critical-pulse 1.6s ease-in-out infinite;
+  }}
+  @keyframes critical-pulse {{
+    0%, 100% {{ box-shadow: inset 0 0 0 0 rgba(168, 0, 48, 0); }}
+    50% {{ box-shadow: inset 0 0 0 10px rgba(168, 0, 48, 0.45); }}
+  }}
 </style>
 </head>
 <body>
@@ -456,6 +470,15 @@ def _json_for_script(obj):
     text "</script>" (a device/camera name, however unlikely) can't
     break out of the <script> block it's embedded in."""
     return json.dumps(obj).replace("<", "\\u003c")
+
+
+def _critical_alert_script(has_critical):
+    """Toggles PAGE_SHELL's body.critical-alert flash (see its CSS
+    comment) - the logged-in-page counterpart to kioskCriticalCue, minus
+    the beep. One-shot on render, same as the iPRO/Ooma kiosk pages -
+    nothing here is polling, so it reflects whatever was true the moment
+    this page was generated."""
+    return f"<script>document.body.classList.toggle('critical-alert', {'true' if has_critical else 'false'});</script>"
 
 
 # --- backend calls ---------------------------------------------------
@@ -1002,6 +1025,7 @@ DASHBOARD_EXTRA_CSS = """
   .updated-note { padding: 8px 18px 14px; font-size: 12px; color: var(--text-faint); text-align: center; }
   td.status-cell { font-weight: 700; color: var(--danger); }
   td.priority-cell.critical { color: var(--danger); font-weight: 700; }
+  td.priority-cell.warning { color: var(--warn); font-weight: 700; }
   /* A capped-height scroll area with a frozen header - NOT the
      display:table-per-row trick this used to use (tr{display:table}
      inside a display:block tbody breaks the fixed-layout column-width
@@ -1130,25 +1154,25 @@ def _cam_badge(n, tone="open"):
     return f'<span class="badge {tone}">{n}</span>'
 
 
-def _ipro_matrix_html(title, count_note, rows, has_counts=True):
+def _ipro_matrix_html(title, rows, icon="&#127973;"):
+    """Renders one of iPRO's two site matrices (Datacenters/Hospitals,
+    Primary Care/Clinics) - both read infra/degraded/offline straight off
+    each row via .get(), so a row with no counts (today's clinic
+    snapshot, which only carries {"site": ...}) renders as all-dashes and
+    a row a live /health-summary DID include counts for renders exactly
+    like a hospital would, no separate code path or hardcoded "0
+    affected" to fall out of sync with what's actually in the data."""
+    affected_rows = [r for r in rows if any(r.get(k) for k in ("infra", "degraded", "offline"))]
     body_rows = []
     for r in rows:
-        if has_counts:
-            affected = any(r.get(k) for k in ("infra", "degraded", "offline"))
-            cls = ' class="affected"' if affected else ""
-            body_rows.append(
-                f'<tr{cls}><td class="site-cell" data-label="Location">&#127973; {_esc(r["site"])}</td>'
-                f'<td data-label="Infra Issues">{_cam_badge(r["infra"], "warn")}</td>'
-                f'<td data-label="Degraded Cams">{_cam_badge(r["degraded"], "warn")}</td>'
-                f'<td data-label="Offline Cams">{_cam_badge(r["offline"], "open")}</td></tr>'
-            )
-        else:
-            body_rows.append(
-                f'<tr><td class="site-cell" data-label="Location">&#129658; {_esc(r["site"])}</td>'
-                f'<td data-label="Infra Issues"><span class="dash-mark">&mdash;</span></td>'
-                f'<td data-label="Degraded Cams"><span class="dash-mark">&mdash;</span></td>'
-                f'<td data-label="Offline Cams"><span class="dash-mark">&mdash;</span></td></tr>'
-            )
+        cls = ' class="affected"' if r in affected_rows else ""
+        body_rows.append(
+            f'<tr{cls}><td class="site-cell" data-label="Location">{icon} {_esc(r["site"])}</td>'
+            f'<td data-label="Infra Issues">{_cam_badge(r.get("infra"), "warn")}</td>'
+            f'<td data-label="Degraded Cams">{_cam_badge(r.get("degraded"), "warn")}</td>'
+            f'<td data-label="Offline Cams">{_cam_badge(r.get("offline"), "open")}</td></tr>'
+        )
+    count_note = f"{len(affected_rows)} of {len(rows)} affected"
     return f"""
     <div class="panel">
       <div class="panel-head"><h2>{_esc(title)}</h2><span class="count-note">{_esc(count_note)}</span></div>
@@ -1161,19 +1185,29 @@ def _ipro_matrix_html(title, count_note, rows, has_counts=True):
     </div>"""
 
 
+def _severity_row_class(severity):
+    """Maps a device/alarm's own severity to the two-tier tr.sev-critical
+    / tr.sev-warning classes table.alarmlog already styles (see
+    HYPERVIEW_COMPONENT_CSS) - anything not literally "Critical" reads as
+    the warning tier, same convention Hyperview's own Active Alarms table
+    uses. Derived from the row's actual data rather than assumed, so a
+    live feed with a mix of severities (today's snapshot happens to be
+    all-Critical for iPRO, all-Degraded for Ooma) renders correctly."""
+    return "sev-critical" if str(severity).strip().lower() == "critical" else "sev-warning"
+
+
 def _ipro_board_html(data):
-    affected = sum(1 for r in data["hospitals"] if any(r.get(k) for k in ("infra", "degraded", "offline")))
     device_rows = "".join(
-        f'<tr class="sev-critical"><td class="dev" data-label="Device">{_esc(d["device"])}</td>'
+        f'<tr class="{_severity_row_class(d["priority"])}"><td class="dev" data-label="Device">{_esc(d["device"])}</td>'
         f'<td class="status-cell" data-label="Status">{_esc(d["status"])}</td>'
         f'<td data-label="Detail">{_esc(d["detail"])}</td>'
         f'<td class="dur" data-label="Duration">{_esc(d["duration"])}</td>'
-        f'<td class="priority-cell critical" data-label="Priority">{_esc(d["priority"])}</td></tr>'
+        f'<td class="priority-cell {_esc(d["priority"].strip().lower())}" data-label="Priority">{_esc(d["priority"])}</td></tr>'
         for d in data["devices"]
     )
     return f"""
     <div class="board">
-      {_ipro_matrix_html("Datacenters / Hospitals", f"{affected} of {len(data['hospitals'])} affected", data["hospitals"])}
+      {_ipro_matrix_html("Datacenters / Hospitals", data["hospitals"], icon="&#127973;")}
       <div class="center-col">
         {_summary_table_html(data["summary"])}
         {_gauge_html(data["gauge"]["score"], data["gauge"]["state"], data["gauge"]["tone"])}
@@ -1184,7 +1218,7 @@ def _ipro_board_html(data):
           </div>
         </div>
       </div>
-      {_ipro_matrix_html("Primary Care / Clinics", f"0 of {len(data['clinics'])} affected", data["clinics"], has_counts=False)}
+      {_ipro_matrix_html("Primary Care / Clinics", data["clinics"], icon="&#129658;")}
     </div>
     <div class="panel">
       <div class="panel-head"><h2>Device Detail</h2><span class="count-note">{data['totals']['unhealthy_cameras']} unhealthy devices</span></div>
@@ -1228,10 +1262,15 @@ def _ooma_matrix_html(sites):
 
 
 def _ooma_board_html(data):
+    # Row class (critical/warning tier, from table.alarmlog's CSS) and
+    # the Severity cell's own text color (PAGE_SHELL's .sev-critical /
+    # .sev-degraded / .sev-recovered) both come from each alarm's actual
+    # severity now, rather than every row being hardcoded to the
+    # "Degraded" look today's snapshot happens to be entirely made of.
     alarm_rows = "".join(
-        f'<tr class="sev-warning"><td class="loc" data-label="Location">{_esc(a["location"])}</td>'
+        f'<tr class="{_severity_row_class(a["severity"])}"><td class="loc" data-label="Location">{_esc(a["location"])}</td>'
         f'<td class="dev" data-label="Device">{_esc(a["device"])}</td>'
-        f'<td data-label="Severity"><span class="sev-degraded">{_esc(a["severity"])}</span></td>'
+        f'<td data-label="Severity"><span class="sev-{_esc(a["severity"].strip().lower())}">{_esc(a["severity"])}</span></td>'
         f'<td data-label="Category">{_esc(a["category"])}</td>'
         f'<td data-label="Detail">{_esc(a["detail"])}</td></tr>'
         for a in data["alarms"]
@@ -1301,13 +1340,14 @@ def overview_page(username):
     allowed = USERS[username]["systems"]
     cards = []
     if "hyperview" in allowed:
-        state, tone, detail = "Could not reach Hyperview", "text-faint", ""
+        state, tone, detail, critical = "Could not reach Hyperview", "text-faint", "", False
         try:
             resp = requests.get(f"{HYPERVIEW_BASE_URL}/overall-health", timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
             health = resp.json()[0]
             state = health["state"]
             tone = "ok" if health["health"] == 100 else "warn" if health["health"] >= 70 else "danger"
+            critical = tone == "danger"
             summary_resp = requests.get(f"{HYPERVIEW_BASE_URL}/category-summary", timeout=REQUEST_TIMEOUT)
             summary_resp.raise_for_status()
             all_row = next((c for c in summary_resp.json() if "All" in c.get("category", "")), None)
@@ -1315,7 +1355,7 @@ def overview_page(username):
                 detail = f"{all_row['open']} open issue(s) &middot; {all_row['ack']} acknowledged"
         except (requests.RequestException, KeyError, IndexError, ValueError):
             pass
-        cards.append(("Hyperview", "/hyperview", state, tone, detail))
+        cards.append(("Hyperview", "/hyperview", state, tone, detail, critical))
     if "ipro" in allowed:
         ipro_data = _fetch_dashboard_snapshot("ipro", IPRO_DASHBOARD)
         g = ipro_data["gauge"]
@@ -1323,7 +1363,8 @@ def overview_page(username):
         total_open = sum(r["open"] for r in ipro_data["summary"])
         detail = (f"{total_open} open issue(s) &middot; {totals['unhealthy_cameras']} of "
                   f"{totals['total_cameras']} cameras unhealthy")
-        cards.append(("iPRO Cameras", "/ipro", g["state"], g["tone"], detail))
+        critical = any(d["priority"].strip().lower() == "critical" for d in ipro_data["devices"])
+        cards.append(("iPRO Cameras", "/ipro", g["state"], g["tone"], detail, critical))
     if "ooma" in allowed:
         ooma_data = _fetch_dashboard_snapshot("ooma", OOMA_DASHBOARD)
         g = ooma_data["gauge"]
@@ -1331,7 +1372,10 @@ def overview_page(username):
         total_open = sum(r["open"] for r in ooma_data["summary"])
         affected = sum(1 for s in sites if isinstance(s["connectivity"], int) and s["connectivity"] > 0)
         detail = f"{total_open} open alarm(s) &middot; {affected} of {len(sites)} sites affected"
-        cards.append(("Ooma AirDial", "/ooma", g["state"], g["tone"], detail))
+        critical = any(a["severity"].strip().lower() == "critical" for a in ooma_data["alarms"])
+        cards.append(("Ooma AirDial", "/ooma", g["state"], g["tone"], detail, critical))
+
+    has_critical = any(critical for *_, critical in cards)
 
     # Reuses the exact .panel/.panel-head shell every other dashboard page
     # is built from (see HYPERVIEW_COMPONENT_CSS) rather than a bespoke
@@ -1347,7 +1391,7 @@ def overview_page(username):
           <span class="status-state">{_esc(state)}</span>
         </div>
         {f'<div class="status-detail">{detail}</div>' if detail else ''}
-      </a>""" for name, href, state, tone, detail in cards)
+      </a>""" for name, href, state, tone, detail, _critical in cards)
 
     # Maintenance/event-search only ever cover the auth-forwarding
     # bridges (see accessible_systems) - Hyperview has no windows/events
@@ -1377,6 +1421,7 @@ def overview_page(username):
     <style>{DASHBOARD_BASE_CSS}</style>
     <div class="status-grid">{cards_html or '<p class="empty">Your account has no systems assigned.</p>'}</div>
     {quick_links_html}
+    {_critical_alert_script(has_critical)}
     """
     return Response(render_shell("Overview", body, "overview", username), mimetype="text/html")
 
