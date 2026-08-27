@@ -144,10 +144,24 @@ def _fetch_ipro_dashboard():
     """Assembles /ipro's data dict from ipro2.py's real endpoints. Returns
     None if the bridge can't be reached or any response isn't the JSON
     shape expected - callers show an honest "could not reach" notice in
-    that case rather than ever falling back to invented numbers."""
+    that case rather than ever falling back to invented numbers.
+
+    Deliberately does NOT use ipro2.py's own /overall-health for the
+    gauge score - that route computes it from is_offline()/is_degraded(),
+    which are maintenance-aware (see _open_alarm_counts's docstring in
+    ipro2.py): acknowledging a camera removes it from that count
+    entirely, so the score visibly IMPROVED the moment something was
+    acknowledged, before the underlying problem was actually fixed. The
+    score below is built from /alarm-summary's own open+acknowledged
+    total per category instead - the TRUE count regardless of
+    acknowledgment, by that route's own design (see its docstring: "open"
+    + "acknowledged" on any row is the true total) - using the same
+    weighting /overall-health itself uses (offline full weight, degraded
+    half weight, infrastructure issues weighted 25 each), so the number
+    only moves when a camera/server actually recovers or a new one
+    actually breaks, never on an acknowledgment alone."""
     base = SYSTEMS["ipro"]["base_url"]
     try:
-        health = requests.get(f"{base}/overall-health", timeout=REQUEST_TIMEOUT).json()[0]
         hospitals = requests.get(f"{base}/location-health-matrix", timeout=REQUEST_TIMEOUT).json()
         clinics = requests.get(f"{base}/clinic-health-matrix", timeout=REQUEST_TIMEOUT).json()
         alarm_rows = requests.get(f"{base}/alarm-summary", timeout=REQUEST_TIMEOUT).json()
@@ -156,7 +170,12 @@ def _fetch_ipro_dashboard():
     except (requests.RequestException, ValueError, IndexError, KeyError):
         return None
 
-    score = round(health["health"])
+    true_counts = {r["category"]: r["open"] + r["acknowledged"] for r in alarm_rows}
+    score = round(max(0, min(100, 100
+        - true_counts.get("Offline Cams", 0)
+        - true_counts.get("Degraded Cams", 0) * 0.5
+        - true_counts.get("Infrastructure Issues", 0) * 25
+    )))
     return {
         "gauge": {"score": score, "tone": _health_tone(score)},
         "totals": totals,
@@ -1017,9 +1036,11 @@ DASHBOARD_EXTRA_CSS = """
      table itself lays out its columns. */
   .device-scroll { max-height: 420px; overflow-y: auto; }
   .device-scroll table.alarmlog thead th { position: sticky; top: 0; z-index: 1; }
-  .summary-row { display: grid; grid-template-columns: minmax(220px, 320px) minmax(220px, 320px) 1fr;
-    gap: 18px; align-items: start; margin-bottom: 18px; }
-  @media (max-width: 1080px) { .summary-row { grid-template-columns: 1fr; } }
+  /* Same 3-col .board Hyperview/iPRO use, but for a dashboard (Ooma)
+     with only one site matrix instead of two - a matrix column plus a
+     fixed-width center-col, no empty third column forced in just to
+     match column count. */
+  .board-2col { grid-template-columns: 1fr 320px; }
 
   /* /overview's per-system status cards - same .panel/.panel-head shell
      every dashboard already uses, just wrapped in a link and given a
@@ -1051,7 +1072,7 @@ RESPONSIVE_DASHBOARD_CSS = """
   @media (max-width: 720px) {
     .wrap { width: 100%; padding: 16px 12px 40px; }
     nav.top a { margin-left: 12px; font-size: 12px; }
-    .board, .summary-row { display: flex !important; flex-direction: column; }
+    .board, .board-2col { display: flex !important; flex-direction: column; }
     .center-col { flex-direction: column !important; }
     table.matrix thead, table.summary thead, table.alarmlog thead { display: none; }
     table.matrix tbody tr, table.summary tbody tr, table.alarmlog tbody tr {
@@ -1210,8 +1231,8 @@ def _ipro_board_html(data):
     <div class="board">
       {_ipro_matrix_html("Datacenters / Hospitals", data["hospitals"])}
       <div class="center-col">
-        {_summary_table_html(data["summary"])}
         {_gauge_html(data["gauge"]["score"], _health_state_label(data["gauge"]["score"]), data["gauge"]["tone"])}
+        {_summary_table_html(data["summary"])}
         <div class="panel">
           <div class="stat-row">
             <div class="stat-tile"><div class="stat-lbl">Total Cameras</div><div class="stat-num">{data['totals']['totalCameras']}</div></div>
@@ -1270,23 +1291,31 @@ def _ooma_board_html(data):
         f'<td data-label="Detail">{_esc(a["message"])}</td></tr>'
         for a in data["issues"]
     )
+    # Same board shape as Hyperview/iPRO: a site matrix beside a
+    # center-col (gauge, then Alarm Summary - same order as the other
+    # two), then the device/issue log as its own full-width panel below,
+    # plain .panel-head styling like Active Alarms / Device Detail rather
+    # than the one-off teal-dark header this used to have. Ooma only has
+    # one matrix (Site Status - ooma.py's /accounts has no
+    # hospital/clinic-style split the way ipro2.py does), so this uses
+    # board-2col instead of forcing an empty third column.
     return f"""
-    <div class="summary-row">
-      {_gauge_html(data["gauge"]["score"], data["gauge"]["state"], data["gauge"]["tone"])}
-      {_summary_table_html(data["summary"])}
-      <div class="panel">
-        <div class="panel-head" style="background:var(--teal-dark); color:#fff; border-bottom:none;">
-          <h2 style="color:#fff;">Ooma AirDial &mdash; Emergency Red Phone System</h2>
-        </div>
-        <div class="matrix-wrap">
-          <table class="alarmlog">
-            <thead><tr><th>Location</th><th>Device</th><th>Severity</th><th>Category</th><th>Detail</th></tr></thead>
-            <tbody>{alarm_rows or '<tr><td colspan="5" class="empty">No open AirDial issues.</td></tr>'}</tbody>
-          </table>
-        </div>
+    <div class="board board-2col">
+      {_ooma_matrix_html(data["accounts"])}
+      <div class="center-col">
+        {_gauge_html(data["gauge"]["score"], data["gauge"]["state"], data["gauge"]["tone"])}
+        {_summary_table_html(data["summary"])}
       </div>
     </div>
-    {_ooma_matrix_html(data["accounts"])}"""
+    <div class="panel">
+      <div class="panel-head"><h2>Ooma AirDial &mdash; Emergency Red Phone System</h2></div>
+      <div class="matrix-wrap">
+        <table class="alarmlog">
+          <thead><tr><th>Location</th><th>Device</th><th>Severity</th><th>Category</th><th>Detail</th></tr></thead>
+          <tbody>{alarm_rows or '<tr><td colspan="5" class="empty">No open AirDial issues.</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>"""
 
 
 # --- iPRO / Ooma dashboard pages ------------------------------------------
@@ -1298,6 +1327,18 @@ def _bridge_unreachable_html(label, base_url):
       <p class="empty" style="padding:16px 18px;">No response from {_esc(base_url)} - check that the
       bridge is running and reachable from this host.</p>
     </div>"""
+
+
+# /ipro and /ooma render server-side from a fresh fetch on every request
+# (see _fetch_ipro_dashboard/_fetch_ooma_dashboard) rather than
+# live-polling client-side like Hyperview's HYPERVIEW_SCRIPT does -
+# ipro2.py's raw feeds are deliberately localhost-only (camera names/
+# locations across a behavioral-health fleet are sensitive - see that
+# fetch function's own comment), so there's no client-safe JSON endpoint
+# on this portal to poll against. A plain reload gets the same "stays
+# current without a person refreshing" result without exposing one.
+# Same 30s cadence as Hyperview's own client-side poll.
+DASHBOARD_AUTO_REFRESH_SCRIPT = '<script>setTimeout(function () { location.reload(); }, 30000);</script>'
 
 
 @app.route("/ipro")
@@ -1315,6 +1356,7 @@ def ipro_page(username):
     (no login, for a wall display &mdash; opens in a new tab)</p>
     <style>{DASHBOARD_CSS}</style>
     {board}
+    {DASHBOARD_AUTO_REFRESH_SCRIPT}
     """
     return Response(render_shell("iPRO Cameras", body, "ipro", username), mimetype="text/html")
 
@@ -1334,6 +1376,7 @@ def ooma_page(username):
     (no login, for a wall display &mdash; opens in a new tab)</p>
     <style>{DASHBOARD_CSS}</style>
     {board}
+    {DASHBOARD_AUTO_REFRESH_SCRIPT}
     """
     return Response(render_shell("Ooma AirDial", body, "ooma", username), mimetype="text/html")
 
@@ -1507,15 +1550,17 @@ const GAUGE_ARC_LENGTH = 251.2;
 
 function renderGauge(health) {
   const scoreEl = document.getElementById('gauge-score');
-  const stateEl = document.getElementById('gauge-state');
   const fillEl = document.getElementById('gauge-fill');
   const bannerEl = document.getElementById('status-banner');
   const redundancyEl = document.getElementById('redundancy-alert');
 
+  // gauge-score-lbl stays a static "Health score" caption (see the HTML
+  // below) - same convention _gauge_html() uses for iPRO/Ooma - the
+  // dynamic state text lives in the banner only, not duplicated in both
+  // places.
   const color = health.health === 100 ? 'var(--ok)' : health.health >= 70 ? 'var(--warn)' : 'var(--danger)';
   scoreEl.textContent = health.health;
   scoreEl.style.color = color;
-  stateEl.textContent = health.state;
   fillEl.setAttribute('stroke', color);
   fillEl.setAttribute('stroke-dashoffset', String(GAUGE_ARC_LENGTH * (1 - health.health / 100)));
   bannerEl.textContent = health.emoji + ' ' + health.state;
@@ -1619,14 +1664,14 @@ def _hyperview_board_html():
       </div>
       <div class="center-col">
         <div class="panel gauge-card">
-          <div class="panel-head"><h2>Overall Health</h2></div>
+          <div class="panel-head"><h2>System Health</h2></div>
           <svg class="gauge-svg" viewBox="0 0 190 118">
             <path class="gauge-track" d="M15 105 A80 80 0 0 1 175 105" />
             <path class="gauge-fill" id="gauge-fill" d="M15 105 A80 80 0 0 1 175 105"
                   stroke="var(--warn)" stroke-dasharray="251.2" stroke-dashoffset="251.2" />
           </svg>
           <div class="gauge-score-num" id="gauge-score">&mdash;</div>
-          <div class="gauge-score-lbl" id="gauge-state">Loading&hellip;</div>
+          <div class="gauge-score-lbl">Health score</div>
           <div class="status-banner" id="status-banner"></div>
         </div>
         <div class="panel">
