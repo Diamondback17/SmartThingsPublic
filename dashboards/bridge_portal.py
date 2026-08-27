@@ -97,121 +97,101 @@ HYPERVIEW_ENDPOINTS = {
     "clinic-health-matrix", "active-alarm-log", "sites-affected", "last-updated",
 }
 
-# --- iPRO / Ooma dashboard data -------------------------------------------
-# ipro2.py and ooma.py don't yet expose a health-summary endpoint the way
-# matrix.py does (see HYPERVIEW_ENDPOINTS above) - there's no live
-# /overall-health or /location-health-matrix on either bridge yet. These
-# two constants are the fallback _fetch_dashboard_snapshot() below uses
-# whenever GET {base_url}/health-summary fails, which today is always
-# (neither bridge listens on that route). They also double as the
-# CONTRACT for that future endpoint: shape a real /health-summary
-# response exactly like the dict below and it starts rendering live with
-# no changes to _fetch_dashboard_snapshot, the HTML builders, or the
-# routes that call them - only these two dicts become dead weight, safe
-# to delete once the fallback path never fires.
-IPRO_DASHBOARD = {
-    "gauge": {"score": 94, "state": "Needs Attention", "tone": "warn"},
-    "totals": {"total_cameras": 429, "unhealthy_cameras": 26},
-    "summary": [
-        {"label": "Offline Cams", "open": 15, "ack": 0},
-        {"label": "Degraded Cams", "open": 1, "ack": 0},
-        {"label": "Infrastructure Issues", "open": 1, "ack": 0},
-    ],
-    "hospitals": [
-        {"site": "Cumberland", "infra": 0, "degraded": 0, "offline": 10},
-        {"site": "LeConte", "infra": 0, "degraded": 1, "offline": 4},
-        {"site": "Peninsula", "infra": 0, "degraded": 0, "offline": 1},
-        {"site": "Centerpoint", "infra": 0, "degraded": 0, "offline": 0},
-        {"site": "Claiborne", "infra": None, "degraded": None, "offline": None},
-        {"site": "Covenant West", "infra": None, "degraded": None, "offline": None},
-        {"site": "Fort Hill", "infra": None, "degraded": None, "offline": None},
-        {"site": "Fort Loudoun", "infra": 0, "degraded": 0, "offline": 0},
-        {"site": "Fort Sanders Regional", "infra": None, "degraded": None, "offline": None},
-        {"site": "Methodist", "infra": None, "degraded": None, "offline": None},
-        {"site": "Morristown-Hamblen", "infra": None, "degraded": None, "offline": None},
-        {"site": "Parkwest", "infra": None, "degraded": None, "offline": None},
-        {"site": "Roane", "infra": None, "degraded": None, "offline": None},
-    ],
-    "clinics": [
-        {"site": "Covenant HomeCare"}, {"site": "Crossville Medical"},
-        {"site": "Morristown West"}, {"site": "Peninsula Lighthouse"},
-        {"site": "Southern Medical"}, {"site": "Thompson Proton"},
-    ],
-    "devices": [
-        {"device": "Centerpoint", "status": "Infrastructure Issue",
-         "detail": "Correlated/Segment Event: 0 cameras went down together within "
-                   "5.0 min — likely shared infrastructure (switch/PoE), not independent faults",
-         "duration": "6m", "priority": "Critical"},
-        {"device": "LCMC | 1st Floor | ED West | Med Cart .38", "status": "Offline",
-         "detail": "down 30+ min; network OK, video issue", "duration": "1d 17h", "priority": "Critical"},
-        {"device": "LCMC | 2nd Floor | CV Stepdown Med Cart .34", "status": "Offline",
-         "detail": "down 30+ min; network OK, video issue", "duration": "1d 17h", "priority": "Critical"},
-        {"device": "LCMC | 1st Floor | Pharmacy .89", "status": "Offline",
-         "detail": "down 30+ min; no ping data", "duration": "13d 18h", "priority": "Critical"},
-        {"device": "LCMC | 1st Floor | Chest Pain Med Cart .39", "status": "Offline",
-         "detail": "down 30+ min; network OK, video issue", "duration": "1d 17h", "priority": "Critical"},
-        {"device": "PENH | Kids Unit | ISO .43", "status": "Offline",
-         "detail": "down 30+ min; no ping data", "duration": "13d 18h", "priority": "Critical"},
-    ],
-}
+# --- iPRO / Ooma live dashboard data ---------------------------------------
+# Both bridges expose their own purpose-built JSON feeds for exactly this -
+# ipro2.py's /overall-health, /location-health-matrix, /clinic-health-matrix,
+# /alarm-summary, /camera-health-summary, /camera-outage-log, and ooma.py's
+# /overall-health, /accounts, /category-summary, /issues - so the two
+# fetch functions below call those directly and assemble their results
+# into the shape the HTML builders further down expect. No portal-side
+# mock data, and no client-exposed proxy route either: ipro2.py
+# deliberately restricts every one of these routes to localhost callers
+# (see its own restrict_raw_endpoints_to_localhost - camera names/
+# locations across a behavioral-health fleet are sensitive), so this
+# fetch happens server-to-server only, same trust boundary as
+# _fetch_windows/_fetch_options above, and the rendered HTML (already
+# behind this portal's own login) is the only thing that ever leaves this
+# process with that data in it.
+#
+# Both bridges also share the same 0 / 1-999 / 1000+ cell encoding
+# matrix.py invented for Hyperview (0 = clear, 1-999 = that many OPEN
+# issues, 1000+ = fully acknowledged, subtract 1000 for the real count) -
+# see _score_cell_html() below for the shared decoder.
 
-OOMA_DASHBOARD = {
-    "gauge": {"score": 91, "state": "Action Required", "tone": "warn"},
-    "summary": [
-        {"label": "Connectivity", "open": 7, "ack": 1},
-        {"label": "Battery", "open": 0, "ack": 0},
-    ],
-    "sites": [
-        {"site": "Covenant IT", "connectivity": "live", "battery": 0},
-        {"site": "Fort Sanders Regional Medical Center", "connectivity": 4, "battery": 0},
-        {"site": "Methodist Medical Center", "connectivity": 2, "battery": 0},
-        {"site": "Parkwest Medical Center", "connectivity": 1, "battery": 0},
-        {"site": "Centerpoint", "connectivity": 0, "battery": 0},
-        {"site": "Claiborne Medical Center", "connectivity": 0, "battery": 0},
-        {"site": "Covenant Health Roane", "connectivity": 0, "battery": 0},
-        {"site": "Cumberland Medical Center", "connectivity": 0, "battery": 0},
-        {"site": "Fort Loudoun Medical Center", "connectivity": 0, "battery": 0},
-        {"site": "LeConte Medical Center", "connectivity": 0, "battery": 0},
-        {"site": "Morristown-Hamblen Healthcare System", "connectivity": 0, "battery": 0},
-        {"site": "Peninsula Hospital", "connectivity": 0, "battery": 0},
-    ],
-    "alarms": [
-        {"location": "Fort Sanders Regional Medical Center", "device": "Fort Sanders AD1",
-         "severity": "Degraded", "category": "Connectivity", "detail": "LTE carrier temporarily disconnected"},
-        {"location": "Fort Sanders Regional Medical Center", "device": "Fort Sanders AD10",
-         "severity": "Degraded", "category": "Connectivity", "detail": "LTE carrier temporarily disconnected"},
-        {"location": "Fort Sanders Regional Medical Center", "device": "Fort Sanders AD14",
-         "severity": "Degraded", "category": "Connectivity", "detail": "LTE carrier temporarily disconnected"},
-        {"location": "Fort Sanders Regional Medical Center", "device": "Fort Sanders AD9",
-         "severity": "Degraded", "category": "Connectivity", "detail": "LTE carrier temporarily disconnected"},
-        {"location": "Methodist Medical Center", "device": "Methodist Medical AD4",
-         "severity": "Degraded", "category": "Connectivity",
-         "detail": "LTE unstable — flapping (3+ changes in the last 30 min)"},
-        {"location": "Methodist Medical Center", "device": "Methodist Medical AD5",
-         "severity": "Degraded", "category": "Connectivity",
-         "detail": "Running on cellular backup — primary WAN is down"},
-        {"location": "Parkwest Medical Center", "device": "Parkwest Medical AD11",
-         "severity": "Degraded", "category": "Connectivity",
-         "detail": "LTE unstable — flapping (3+ changes in the last 30 min)"},
-    ],
-}
+def _score_cell_html(value, tone="open"):
+    """Renders one matrix/rollup cell from the shared 0 / 1-999 / 1000+
+    encoding: None = no data for this row (ipro2.py: no server configured
+    for that site yet), 0 = clear, 1-999 = that many OPEN issues, 1000+ =
+    every issue already acknowledged (subtract 1000 for the real count)."""
+    if value is None:
+        return '<span class="dash-mark">&mdash;</span>'
+    if value == 0:
+        return '<span class="clear-mark">&#10003;</span>'
+    if value >= 1000:
+        return f'<span class="badge ack">{value - 1000}</span>'
+    return f'<span class="badge {tone}">{value}</span>'
 
 
-def _fetch_dashboard_snapshot(system, fallback):
-    """Tries {base_url}/health-summary - the live endpoint /ipro and
-    /ooma would use once ipro2.py/ooma.py grow one, shaped like
-    IPRO_DASHBOARD/OOMA_DASHBOARD above (see the comment there). Same
-    fail-soft shape as _fetch_windows/_fetch_options: any connection
-    failure, non-2xx, or response that isn't valid JSON just falls back
-    to the fixed snapshot rather than breaking the page - which is what
-    happens on every call today, since that route doesn't exist yet."""
-    cfg = SYSTEMS[system]
+def _health_tone(score):
+    """The same three-bucket ok/warn/danger split Hyperview's own client
+    JS uses (renderGauge in HYPERVIEW_SCRIPT) - kept identical across all
+    three dashboards so the same CSS var(--{tone}) tokens (and the
+    Overview status dots) mean the same thing everywhere."""
+    return "ok" if score == 100 else "warn" if score >= 70 else "danger"
+
+
+def _fetch_ipro_dashboard():
+    """Assembles /ipro's data dict from ipro2.py's real endpoints. Returns
+    None if the bridge can't be reached or any response isn't the JSON
+    shape expected - callers show an honest "could not reach" notice in
+    that case rather than ever falling back to invented numbers."""
+    base = SYSTEMS["ipro"]["base_url"]
     try:
-        resp = requests.get(f"{cfg['base_url']}/health-summary", timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        return resp.json()
-    except (requests.RequestException, ValueError):
-        return fallback
+        health = requests.get(f"{base}/overall-health", timeout=REQUEST_TIMEOUT).json()[0]
+        hospitals = requests.get(f"{base}/location-health-matrix", timeout=REQUEST_TIMEOUT).json()
+        clinics = requests.get(f"{base}/clinic-health-matrix", timeout=REQUEST_TIMEOUT).json()
+        alarm_rows = requests.get(f"{base}/alarm-summary", timeout=REQUEST_TIMEOUT).json()
+        totals = requests.get(f"{base}/camera-health-summary", timeout=REQUEST_TIMEOUT).json()[0]
+        devices = requests.get(f"{base}/camera-outage-log", timeout=REQUEST_TIMEOUT).json()
+    except (requests.RequestException, ValueError, IndexError, KeyError):
+        return None
+
+    score = round(health["health"])
+    return {
+        "gauge": {"score": score, "tone": _health_tone(score)},
+        "totals": totals,
+        # Drop the "Total Issues" row - _summary_table_html computes its
+        # own totals row from whatever categories it's given, same as it
+        # always has, so passing the backend's own precomputed total
+        # alongside would just render it twice.
+        "summary": [r for r in alarm_rows if r["category"] != "Total Issues"],
+        "hospitals": hospitals,
+        "clinics": clinics,
+        "devices": devices,
+    }
+
+
+def _fetch_ooma_dashboard():
+    """Same idea as _fetch_ipro_dashboard(), against ooma.py's own
+    /overall-health, /accounts, /category-summary, /issues."""
+    base = SYSTEMS["ooma"]["base_url"]
+    try:
+        health = requests.get(f"{base}/overall-health", timeout=REQUEST_TIMEOUT).json()[0]
+        accounts = requests.get(f"{base}/accounts", timeout=REQUEST_TIMEOUT).json()
+        category_rows = requests.get(f"{base}/category-summary", timeout=REQUEST_TIMEOUT).json()
+        issues = requests.get(f"{base}/issues", timeout=REQUEST_TIMEOUT).json()
+    except (requests.RequestException, ValueError, IndexError, KeyError):
+        return None
+
+    return {
+        "gauge": {"score": health["health"], "state": health["state"], "tone": _health_tone(health["health"])},
+        # "All" is ooma.py's own precomputed total row (📋 All) - same
+        # reasoning as iPRO's "Total Issues" above, drop it so
+        # _summary_table_html's own generated totals row is the only one.
+        "summary": [r for r in category_rows if "All" not in r["category"]],
+        "accounts": accounts,
+        "issues": issues,
+    }
 
 
 # --- users -------------------------------------------------------------
@@ -1124,12 +1104,19 @@ def _gauge_html(score, state, tone):
 
 
 def _summary_table_html(rows):
+    """rows use the shape both bridges' own summary endpoints already
+    return - {category, open, acknowledged} - so this renders them
+    directly rather than translating into a portal-specific shape first.
+    Always computes its own totals row from whatever categories it's
+    given; callers strip the backend's own precomputed total row before
+    calling this (see _fetch_ipro_dashboard/_fetch_ooma_dashboard) so it
+    isn't rendered twice."""
     total_open = sum(r["open"] for r in rows)
-    total_ack = sum(r["ack"] for r in rows)
+    total_ack = sum(r["acknowledged"] for r in rows)
     body_rows = "".join(
-        f'<tr><td data-label="Category">{_esc(r["label"])}</td>'
+        f'<tr><td data-label="Category">{_esc(r["category"])}</td>'
         f'<td class="n open-n" data-label="Open">{r["open"]}</td>'
-        f'<td class="n ack-n" data-label="Ack\'d">{r["ack"]}</td></tr>'
+        f'<td class="n ack-n" data-label="Ack\'d">{r["acknowledged"]}</td></tr>'
         for r in rows
     )
     body_rows += (
@@ -1146,59 +1133,73 @@ def _summary_table_html(rows):
     </div>"""
 
 
-def _cam_badge(n, tone="open"):
-    if n is None:
-        return '<span class="dash-mark">&mdash;</span>'
-    if n == 0:
-        return '<span class="clear-mark">&#10003;</span>'
-    return f'<span class="badge {tone}">{n}</span>'
+def _health_state_label(score):
+    """iPRO's /overall-health returns only the raw score, no text label
+    (unlike Ooma's, which already includes one) - mirrors the same
+    four-tier wording ooma.py's own build_overall_health uses, so the two
+    dashboards read consistently even though only one bridge computes the
+    label itself."""
+    if score == 100:
+        return "Healthy"
+    if score >= 90:
+        return "Degraded"
+    if score >= 70:
+        return "Significant"
+    return "Critical"
 
 
-def _ipro_matrix_html(title, rows, icon="&#127973;"):
-    """Renders one of iPRO's two site matrices (Datacenters/Hospitals,
-    Primary Care/Clinics) - both read infra/degraded/offline straight off
-    each row via .get(), so a row with no counts (today's clinic
-    snapshot, which only carries {"site": ...}) renders as all-dashes and
-    a row a live /health-summary DID include counts for renders exactly
-    like a hospital would, no separate code path or hardcoded "0
-    affected" to fall out of sync with what's actually in the data."""
-    affected_rows = [r for r in rows if any(r.get(k) for k in ("infra", "degraded", "offline"))]
+def _ipro_matrix_html(title, rows):
+    """Renders one of iPRO's two site matrices, straight off
+    /location-health-matrix or /clinic-health-matrix - see
+    _build_location_matrix()'s docstring in ipro2.py for exactly what
+    'site', 'infrastructureIssues', 'degradedCams', 'offlineCams' and the
+    1000+ acknowledged-offset mean; _score_cell_html() decodes that offset."""
+    affected_count = sum(1 for r in rows if r.get("site"))
     body_rows = []
     for r in rows:
-        cls = ' class="affected"' if r in affected_rows else ""
+        cls = ' class="affected"' if r.get("site") else ""
         body_rows.append(
-            f'<tr{cls}><td class="site-cell" data-label="Location">{icon} {_esc(r["site"])}</td>'
-            f'<td data-label="Infra Issues">{_cam_badge(r.get("infra"), "warn")}</td>'
-            f'<td data-label="Degraded Cams">{_cam_badge(r.get("degraded"), "warn")}</td>'
-            f'<td data-label="Offline Cams">{_cam_badge(r.get("offline"), "open")}</td></tr>'
+            f'<tr{cls}><td class="site-cell" data-label="Location">{_esc(r["locationDisplay"])}</td>'
+            f'<td data-label="Infra Issues">{_score_cell_html(r.get("infrastructureIssues"), "warn")}</td>'
+            f'<td data-label="Degraded Cams">{_score_cell_html(r.get("degradedCams"), "warn")}</td>'
+            f'<td data-label="Offline Cams">{_score_cell_html(r.get("offlineCams"), "open")}</td></tr>'
         )
-    count_note = f"{len(affected_rows)} of {len(rows)} affected"
+    body_rows = "".join(body_rows)
+    count_note = f"{affected_count} of {len(rows)} affected"
     return f"""
     <div class="panel">
       <div class="panel-head"><h2>{_esc(title)}</h2><span class="count-note">{_esc(count_note)}</span></div>
       <div class="matrix-wrap">
         <table class="matrix">
           <thead><tr><th>Location</th><th>Infra Issues</th><th>Degraded Cams</th><th>Offline Cams</th></tr></thead>
-          <tbody>{''.join(body_rows)}</tbody>
+          <tbody>{body_rows}</tbody>
         </table>
       </div>
     </div>"""
 
 
 def _severity_row_class(severity):
-    """Maps a device/alarm's own severity to the two-tier tr.sev-critical
-    / tr.sev-warning classes table.alarmlog already styles (see
+    """Maps a row's own severity to the two-tier tr.sev-critical /
+    tr.sev-warning classes table.alarmlog already styles (see
     HYPERVIEW_COMPONENT_CSS) - anything not literally "Critical" reads as
     the warning tier, same convention Hyperview's own Active Alarms table
-    uses. Derived from the row's actual data rather than assumed, so a
-    live feed with a mix of severities (today's snapshot happens to be
-    all-Critical for iPRO, all-Degraded for Ooma) renders correctly."""
+    uses."""
     return "sev-critical" if str(severity).strip().lower() == "critical" else "sev-warning"
 
 
 def _ipro_board_html(data):
+    # /camera-outage-log's own "priority" field is camera IMPORTANCE
+    # (Critical/High/Standard - see camera_priority() in ipro2.py, a tag
+    # on which cameras matter more, e.g. a pharmacy cam vs a parking lot
+    # one) - NOT the failure severity. That's "status" (Offline/
+    # Infrastructure Issue vs Degraded), which is what decides this row's
+    # color. Conflating the two earlier was the bug: every device here
+    # happened to be Critical-priority in the one snapshot that got
+    # tested, which hid that "priority" was never the right field to
+    # color rows by in the first place.
     device_rows = "".join(
-        f'<tr class="{_severity_row_class(d["priority"])}"><td class="dev" data-label="Device">{_esc(d["device"])}</td>'
+        f'<tr class="{_severity_row_class("Critical" if d["status"] in ("Offline", "Infrastructure Issue") else "Degraded")}">'
+        f'<td class="dev" data-label="Device">{_esc(d["device"])}</td>'
         f'<td class="status-cell" data-label="Status">{_esc(d["status"])}</td>'
         f'<td data-label="Detail">{_esc(d["detail"])}</td>'
         f'<td class="dur" data-label="Duration">{_esc(d["duration"])}</td>'
@@ -1207,73 +1208,67 @@ def _ipro_board_html(data):
     )
     return f"""
     <div class="board">
-      {_ipro_matrix_html("Datacenters / Hospitals", data["hospitals"], icon="&#127973;")}
+      {_ipro_matrix_html("Datacenters / Hospitals", data["hospitals"])}
       <div class="center-col">
         {_summary_table_html(data["summary"])}
-        {_gauge_html(data["gauge"]["score"], data["gauge"]["state"], data["gauge"]["tone"])}
+        {_gauge_html(data["gauge"]["score"], _health_state_label(data["gauge"]["score"]), data["gauge"]["tone"])}
         <div class="panel">
           <div class="stat-row">
-            <div class="stat-tile"><div class="stat-lbl">Total Cameras</div><div class="stat-num">{data['totals']['total_cameras']}</div></div>
-            <div class="stat-tile unhealthy"><div class="stat-lbl">Unhealthy Cameras</div><div class="stat-num">{data['totals']['unhealthy_cameras']}</div></div>
+            <div class="stat-tile"><div class="stat-lbl">Total Cameras</div><div class="stat-num">{data['totals']['totalCameras']}</div></div>
+            <div class="stat-tile unhealthy"><div class="stat-lbl">Unhealthy Cameras</div><div class="stat-num">{data['totals']['unhealthyCameras']}</div></div>
           </div>
         </div>
       </div>
-      {_ipro_matrix_html("Primary Care / Clinics", data["clinics"], icon="&#129658;")}
+      {_ipro_matrix_html("Primary Care / Clinics", data["clinics"])}
     </div>
     <div class="panel">
-      <div class="panel-head"><h2>Device Detail</h2><span class="count-note">{data['totals']['unhealthy_cameras']} unhealthy devices</span></div>
+      <div class="panel-head"><h2>Device Detail</h2><span class="count-note">{data['totals']['unhealthyCameras']} unhealthy device(s)</span></div>
       <div class="matrix-wrap device-scroll">
         <table class="alarmlog">
           <thead><tr><th>Device</th><th>Status</th><th>Detail</th><th>Duration</th><th>Priority</th></tr></thead>
-          <tbody>{device_rows}</tbody>
+          <tbody>{device_rows or '<tr><td colspan="5" class="empty">No open camera issues.</td></tr>'}</tbody>
         </table>
       </div>
     </div>"""
 
 
-def _ooma_matrix_html(sites):
+def _ooma_matrix_html(accounts):
+    """Straight off ooma.py's own /accounts - see build_account_rollup()'s
+    docstring for exactly what 'site', 'connectivity_issues',
+    'battery_issues' and the 1000+ acknowledged-offset mean."""
+    affected_count = sum(1 for a in accounts if a.get("site"))
     rows = []
-    for s in sites:
-        conn = s["connectivity"]
-        if conn == "live":
-            conn_html = '<span class="badge ack" title="Live">&#9679;</span>'
-            affected = False
-        else:
-            conn_html = _cam_badge(conn, "open")
-            affected = isinstance(conn, int) and conn > 0
-        battery_html = _cam_badge(s["battery"], "open")
-        cls = ' class="affected"' if affected else ""
+    for a in accounts:
+        cls = ' class="affected"' if a.get("site") else ""
         rows.append(
-            f'<tr{cls}><td class="site-cell" data-label="Location">&#127973; {_esc(s["site"])}</td>'
-            f'<td data-label="Connectivity">{conn_html}</td>'
-            f'<td data-label="Battery">{battery_html}</td></tr>'
+            f'<tr{cls}><td class="site-cell" data-label="Location">&#127973; {_esc(a["account"])}</td>'
+            f'<td data-label="Connectivity">{_score_cell_html(a.get("connectivity_issues"), "open")}</td>'
+            f'<td data-label="Battery">{_score_cell_html(a.get("battery_issues"), "open")}</td></tr>'
         )
-    affected_count = sum(1 for s in sites if isinstance(s["connectivity"], int) and s["connectivity"] > 0)
+    rows = "".join(rows)
     return f"""
     <div class="panel">
-      <div class="panel-head"><h2>Site Status</h2><span class="count-note">{affected_count} of {len(sites)} affected</span></div>
+      <div class="panel-head"><h2>Site Status</h2><span class="count-note">{affected_count} of {len(accounts)} affected</span></div>
       <div class="matrix-wrap">
         <table class="matrix">
           <thead><tr><th>Location</th><th>Connectivity</th><th>Battery</th></tr></thead>
-          <tbody>{''.join(rows)}</tbody>
+          <tbody>{rows}</tbody>
         </table>
       </div>
     </div>"""
 
 
 def _ooma_board_html(data):
-    # Row class (critical/warning tier, from table.alarmlog's CSS) and
-    # the Severity cell's own text color (PAGE_SHELL's .sev-critical /
-    # .sev-degraded / .sev-recovered) both come from each alarm's actual
-    # severity now, rather than every row being hardcoded to the
-    # "Degraded" look today's snapshot happens to be entirely made of.
+    # Row class and the Severity cell's own text color both come from
+    # each issue's actual severity ("Critical"/"Degraded", straight off
+    # /issues - see get_device_issues() in ooma.py), not assumed.
     alarm_rows = "".join(
-        f'<tr class="{_severity_row_class(a["severity"])}"><td class="loc" data-label="Location">{_esc(a["location"])}</td>'
+        f'<tr class="{_severity_row_class(a["severity"])}"><td class="loc" data-label="Location">{_esc(a["account"])}</td>'
         f'<td class="dev" data-label="Device">{_esc(a["device"])}</td>'
         f'<td data-label="Severity"><span class="sev-{_esc(a["severity"].strip().lower())}">{_esc(a["severity"])}</span></td>'
         f'<td data-label="Category">{_esc(a["category"])}</td>'
-        f'<td data-label="Detail">{_esc(a["detail"])}</td></tr>'
-        for a in data["alarms"]
+        f'<td data-label="Detail">{_esc(a["message"])}</td></tr>'
+        for a in data["issues"]
     )
     return f"""
     <div class="summary-row">
@@ -1286,15 +1281,24 @@ def _ooma_board_html(data):
         <div class="matrix-wrap">
           <table class="alarmlog">
             <thead><tr><th>Location</th><th>Device</th><th>Severity</th><th>Category</th><th>Detail</th></tr></thead>
-            <tbody>{alarm_rows}</tbody>
+            <tbody>{alarm_rows or '<tr><td colspan="5" class="empty">No open AirDial issues.</td></tr>'}</tbody>
           </table>
         </div>
       </div>
     </div>
-    {_ooma_matrix_html(data["sites"])}"""
+    {_ooma_matrix_html(data["accounts"])}"""
 
 
 # --- iPRO / Ooma dashboard pages ------------------------------------------
+
+def _bridge_unreachable_html(label, base_url):
+    return f"""
+    <div class="panel">
+      <div class="panel-head"><h2>Could not reach {_esc(label)}</h2></div>
+      <p class="empty" style="padding:16px 18px;">No response from {_esc(base_url)} - check that the
+      bridge is running and reachable from this host.</p>
+    </div>"""
+
 
 @app.route("/ipro")
 @require_login
@@ -1302,14 +1306,15 @@ def ipro_page(username):
     denied = _forbidden_or_unknown(username, "ipro")
     if denied:
         return denied
-    data = _fetch_dashboard_snapshot("ipro", IPRO_DASHBOARD)
+    data = _fetch_ipro_dashboard()
+    board = _ipro_board_html(data) if data else _bridge_unreachable_html("iPRO Cameras", SYSTEMS["ipro"]["base_url"])
     body = f"""
     <h1>iPRO Cameras</h1>
     <p class="sub">Camera health &amp; infrastructure status across all sites.
     &middot; <a href="/ipro/kiosk" target="_blank" rel="noopener">Open kiosk view</a>
     (no login, for a wall display &mdash; opens in a new tab)</p>
     <style>{DASHBOARD_CSS}</style>
-    {_ipro_board_html(data)}
+    {board}
     """
     return Response(render_shell("iPRO Cameras", body, "ipro", username), mimetype="text/html")
 
@@ -1320,14 +1325,15 @@ def ooma_page(username):
     denied = _forbidden_or_unknown(username, "ooma")
     if denied:
         return denied
-    data = _fetch_dashboard_snapshot("ooma", OOMA_DASHBOARD)
+    data = _fetch_ooma_dashboard()
+    board = _ooma_board_html(data) if data else _bridge_unreachable_html("Ooma AirDial", SYSTEMS["ooma"]["base_url"])
     body = f"""
     <h1>Ooma AirDial</h1>
     <p class="sub">Emergency red phone connectivity &amp; battery health across all sites.
     &middot; <a href="/ooma/kiosk" target="_blank" rel="noopener">Open kiosk view</a>
     (no login, for a wall display &mdash; opens in a new tab)</p>
     <style>{DASHBOARD_CSS}</style>
-    {_ooma_board_html(data)}
+    {board}
     """
     return Response(render_shell("Ooma AirDial", body, "ooma", username), mimetype="text/html")
 
@@ -1357,23 +1363,29 @@ def overview_page(username):
             pass
         cards.append(("Hyperview", "/hyperview", state, tone, detail, critical))
     if "ipro" in allowed:
-        ipro_data = _fetch_dashboard_snapshot("ipro", IPRO_DASHBOARD)
-        g = ipro_data["gauge"]
-        totals = ipro_data["totals"]
-        total_open = sum(r["open"] for r in ipro_data["summary"])
-        detail = (f"{total_open} open issue(s) &middot; {totals['unhealthy_cameras']} of "
-                  f"{totals['total_cameras']} cameras unhealthy")
-        critical = any(d["priority"].strip().lower() == "critical" for d in ipro_data["devices"])
-        cards.append(("iPRO Cameras", "/ipro", g["state"], g["tone"], detail, critical))
+        ipro_data = _fetch_ipro_dashboard()
+        if ipro_data is None:
+            cards.append(("iPRO Cameras", "/ipro", "Could not reach iPRO Cameras", "text-faint", "", False))
+        else:
+            g = ipro_data["gauge"]
+            totals = ipro_data["totals"]
+            total_open = sum(r["open"] for r in ipro_data["summary"])
+            detail = (f"{total_open} open issue(s) &middot; {totals['unhealthyCameras']} of "
+                      f"{totals['totalCameras']} cameras unhealthy")
+            critical = any(d["status"] in ("Offline", "Infrastructure Issue") for d in ipro_data["devices"])
+            cards.append(("iPRO Cameras", "/ipro", _health_state_label(g["score"]), g["tone"], detail, critical))
     if "ooma" in allowed:
-        ooma_data = _fetch_dashboard_snapshot("ooma", OOMA_DASHBOARD)
-        g = ooma_data["gauge"]
-        sites = ooma_data["sites"]
-        total_open = sum(r["open"] for r in ooma_data["summary"])
-        affected = sum(1 for s in sites if isinstance(s["connectivity"], int) and s["connectivity"] > 0)
-        detail = f"{total_open} open alarm(s) &middot; {affected} of {len(sites)} sites affected"
-        critical = any(a["severity"].strip().lower() == "critical" for a in ooma_data["alarms"])
-        cards.append(("Ooma AirDial", "/ooma", g["state"], g["tone"], detail, critical))
+        ooma_data = _fetch_ooma_dashboard()
+        if ooma_data is None:
+            cards.append(("Ooma AirDial", "/ooma", "Could not reach Ooma AirDial", "text-faint", "", False))
+        else:
+            g = ooma_data["gauge"]
+            accounts = ooma_data["accounts"]
+            total_open = sum(r["open"] for r in ooma_data["summary"])
+            affected = sum(1 for a in accounts if a.get("site"))
+            detail = f"{total_open} open issue(s) &middot; {affected} of {len(accounts)} sites affected"
+            critical = any(a["severity"].strip().lower() == "critical" for a in ooma_data["issues"])
+            cards.append(("Ooma AirDial", "/ooma", g["state"], g["tone"], detail, critical))
 
     has_critical = any(critical for *_, critical in cards)
 
@@ -1839,12 +1851,13 @@ def _kiosk_rotate_html(current_path):
     """
 
 
-# iPRO/Ooma kiosk pages render from the same fixed snapshot as their
-# logged-in pages (see IPRO_DASHBOARD/OOMA_DASHBOARD's comment) rather
-# than live-fetching like Hyperview's HYPERVIEW_SCRIPT does, so they need
-# their own clock tick and - only when NOT auto-rotating, since rotating
-# already re-fetches this page fresh on every lap - a periodic reload to
-# pick up any change made server-side since the page loaded.
+# iPRO/Ooma kiosk pages render server-side from a fresh
+# _fetch_ipro_dashboard()/_fetch_ooma_dashboard() call on every page load,
+# rather than live-fetching client-side like Hyperview's HYPERVIEW_SCRIPT
+# does, so they need their own clock tick and - only when NOT
+# auto-rotating, since rotating already re-fetches this page fresh on
+# every lap - a periodic reload to pick up any change since the page
+# loaded.
 KIOSK_CLOCK_SCRIPT = """
 <script>
 (function () {
@@ -1864,10 +1877,10 @@ KIOSK_CLOCK_SCRIPT = """
 
 def _kiosk_critical_script(has_critical):
     """iPRO/Ooma kiosk counterpart to the Hyperview refreshAll() call
-    into kioskCriticalCue() - their data is a fixed snapshot computed
-    once per request rather than live-polled, so this just calls it once
-    on load with whatever the current snapshot says, instead of on every
-    fetch like Hyperview does."""
+    into kioskCriticalCue() - their data is fetched fresh server-side
+    once per page load rather than polled client-side, so this just
+    calls it once on load with whatever that fetch found, instead of on
+    every poll like Hyperview does."""
     return f"<script>if (window.kioskCriticalCue) window.kioskCriticalCue({'true' if has_critical else 'false'});</script>"
 
 
@@ -1889,13 +1902,18 @@ def hyperview_kiosk():
 @app.route("/ipro/kiosk")
 def ipro_kiosk():
     path = "/ipro/kiosk"
-    data = _fetch_dashboard_snapshot("ipro", IPRO_DASHBOARD)
-    has_critical = any(d["priority"].lower() == "critical" for d in data["devices"])
+    data = _fetch_ipro_dashboard()
+    if data is None:
+        board = _bridge_unreachable_html("iPRO Cameras", SYSTEMS["ipro"]["base_url"])
+        has_critical = False
+    else:
+        board = _ipro_board_html(data)
+        has_critical = any(d["status"] in ("Offline", "Infrastructure Issue") for d in data["devices"])
     return Response(
         DASHBOARD_KIOSK_SHELL.format(
             title="iPRO Cameras",
             component_css=HYPERVIEW_COMPONENT_CSS + DASHBOARD_EXTRA_CSS,
-            board=_ipro_board_html(data),
+            board=board,
             script=KIOSK_CLOCK_SCRIPT + _kiosk_critical_script(has_critical),
             rotate=_kiosk_rotate_html(path),
         ),
@@ -1906,13 +1924,18 @@ def ipro_kiosk():
 @app.route("/ooma/kiosk")
 def ooma_kiosk():
     path = "/ooma/kiosk"
-    data = _fetch_dashboard_snapshot("ooma", OOMA_DASHBOARD)
-    has_critical = any(a["severity"].lower() == "critical" for a in data["alarms"])
+    data = _fetch_ooma_dashboard()
+    if data is None:
+        board = _bridge_unreachable_html("Ooma AirDial", SYSTEMS["ooma"]["base_url"])
+        has_critical = False
+    else:
+        board = _ooma_board_html(data)
+        has_critical = any(a["severity"].lower() == "critical" for a in data["issues"])
     return Response(
         DASHBOARD_KIOSK_SHELL.format(
             title="Ooma AirDial",
             component_css=HYPERVIEW_COMPONENT_CSS + DASHBOARD_EXTRA_CSS,
-            board=_ooma_board_html(data),
+            board=board,
             script=KIOSK_CLOCK_SCRIPT + _kiosk_critical_script(has_critical),
             rotate=_kiosk_rotate_html(path),
         ),
