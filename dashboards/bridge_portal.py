@@ -6325,7 +6325,18 @@ RACK_AUDIT_ELEVATION_CSS = """
     background: var(--panel-raised); font-weight: 700; }
   table.ra-table td.chk { text-align: center; width: 55px; }
   table.ra-table .box { display: inline-block; width: 13px; height: 13px; border: 1.5px solid var(--text-dim); border-radius: 2px; }
-  @media print { .ra-sheet { border: none; box-shadow: none; padding: 0; } }
+  @media print {
+    .ra-sheet { border: none; box-shadow: none; padding: 0; }
+    /* Shrink the elevation for print - at the full screen row height, a
+       tall rack (40U+) doesn't fit one printed page and the diagram splits
+       across a page break, which defeats the point of a single audit
+       sheet. Scaled down, even a 48U rack's elevation stays well under a
+       page's height. Keep it from breaking mid-rack regardless. */
+    .ra-elevation-row { page-break-inside: avoid; break-inside: avoid; }
+    .ra-elevation { page-break-inside: avoid; break-inside: avoid; }
+    .ra-elevation .u-row { height: 10px; font-size: 6px; }
+    .ra-elevation .u-num { width: 14px; font-size: 6px; }
+  }
 """
 
 
@@ -6402,7 +6413,7 @@ def rack_audit_page(username):
       </div>
       <div class="ra-target">
         <div>
-          <span class="site-tag">{_esc(rack["site"])}</span>
+          <span class="site-tag">{_esc(rack.get("site_path") or rack["site"])}</span>
           <h2>{_esc(rack["name"] or rack["id"])}</h2>
           <div class="meta">Last audited {_rack_audit_last_audit_html(rack["last_audit"])}</div>
         </div>
@@ -6415,7 +6426,7 @@ def rack_audit_page(username):
         <div style="font-size:11.5px; color:var(--text-faint);">Generated {_esc(datetime.now().strftime("%b %-d, %Y &middot; %-I:%M %p"))}</div>
       </div>
       <div class="ra-id-grid">
-        <div><div class="f-lbl">Site</div><div class="f-val">{_esc(rack["site"])}</div></div>
+        <div><div class="f-lbl">Site</div><div class="f-val">{_esc(rack.get("site_path") or rack["site"])}</div></div>
         <div><div class="f-lbl">Rack</div><div class="f-val">{_esc(rack["name"] or rack["id"])}</div></div>
         <div><div class="f-lbl">Assets</div><div class="f-val">{len(assets)}</div></div>
         <div><div class="f-lbl">Auditor</div><div class="f-val">{_esc(username)}</div></div>

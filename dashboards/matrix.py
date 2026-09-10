@@ -469,6 +469,20 @@ def _rack_site_name(asset):
     return asset.get("parentName") or "Unknown"
 
 
+def _rack_site_path(asset):
+    """Display-only companion to _rack_site_name: the whole hierarchy path
+    (Site > Room > Row > Rack) with the generic "All" root stripped, instead
+    of just the first segment. Not used for site filtering/scoping - only
+    for showing an auditor exactly where a rack lives."""
+    path = asset.get("tabDelimitedPath") or ""
+    segments = [s.strip() for s in path.split("\t") if s.strip()]
+    if segments and segments[0].lower() == "all":
+        segments = segments[1:]
+    if segments:
+        return " › ".join(segments)
+    return asset.get("parentName") or "Unknown"
+
+
 def get_audit_date_property(asset_id):
     """The 'Last Audit Date' custom property record for one asset, or None
     if that asset has no such property (not applicable to its asset type,
@@ -532,6 +546,7 @@ def get_rack_audit_cache():
             "id": rack_id,
             "name": rack.get("name"),
             "site": _rack_site_name(rack),
+            "site_path": _rack_site_path(rack),
             "last_audit": audit_prop["value"] if audit_prop else None,
             # Total rack height in U - the elevation always shows every U
             # slot the rack actually has, not just the range that happens
