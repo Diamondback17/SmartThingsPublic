@@ -1975,7 +1975,7 @@ PAGE_SHELL = """<!DOCTYPE html>
 <header class="brand">
   <div>
     <div class="brand-logo-plate"><img class="brand-logo" src="data:image/png;base64,{logo_b64}" alt="Covenant Health"></div>
-    <div class="brand-sub">InfraWatch &middot; Facility Systems</div>
+    <div class="brand-sub">InfraWatch &middot; System Health</div>
   </div>
 </header>
 <nav class="top">
@@ -10387,7 +10387,7 @@ DASHBOARD_VIDEOWALL_SHELL = """<!DOCTYPE html>
   <div id="videowall-fit">
     <div class="videowall-header">
       <div>
-        <h1>Covenant Health &middot; Facility Systems</h1>
+        <h1>Covenant Health &middot; System Health</h1>
         <div class="videowall-subtitle">{title}</div>
       </div>
       <div style="display:flex; align-items:center; gap:16px;">
