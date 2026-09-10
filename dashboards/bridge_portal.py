@@ -4873,20 +4873,16 @@ HYPERVIEW_COMPONENT_CSS = """
   .board-viewport-wrap.alarms-right-split { display: grid;
     grid-template-columns: minmax(380px, 460px) minmax(260px, 340px) 1fr; gap: 14px; align-items: stretch; }
   .board-viewport-wrap.alarms-right-split .board-fill-panel { min-height: 0; margin-bottom: 0; }
-  /* Column 1 (Site Status) is stretched to the row's full height same as
-     the alarms panel, but without this it inherits .panel's
-     overflow:hidden with no scroll of its own - a long real site list
-     (20+ sites) would just get silently clipped past whatever height the
-     row happens to be, with no way to reach the rest. Same flex+scroll
-     treatment as .board-fill-panel's own matrix-wrap below. */
+  /* Column 1 (Site Status) opts out of the row's stretch/clip - the whole
+     point is every site is visible at once with no internal scrollbar, so
+     it keeps its own natural full height (align-self: start) instead of
+     being capped to match column 3's viewport-fit height. A long real
+     site list (20+ sites) pushes the row - and so the page itself -
+     taller than the viewport rather than getting clipped or trapped
+     behind a tiny scroll window; a normal page scroll (if needed) is the
+     tradeoff for seeing the whole list at a glance. */
   .board-viewport-wrap.alarms-right-split > .panel:first-child {
-    display: flex; flex-direction: column; min-height: 0; margin-bottom: 0;
-  }
-  .board-viewport-wrap.alarms-right-split > .panel:first-child .matrix-wrap {
-    flex: 1 1 auto; overflow-y: auto; min-height: 280px;
-  }
-  .board-viewport-wrap.alarms-right-split > .panel:first-child .matrix-wrap table thead th {
-    position: sticky; top: 0; z-index: 1;
+    align-self: start; margin-bottom: 0;
   }
 
   /* iPRO/Ooma/Hyperview's own dashboards: the whole board plus its
