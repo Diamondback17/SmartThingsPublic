@@ -1715,6 +1715,11 @@ PAGE_SHELL = """<!DOCTYPE html>
     --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.35);
   }}
   * {{ box-sizing: border-box; }}
+  html {{ scrollbar-color: var(--border-bright) var(--panel-raised); scrollbar-width: thin; }}
+  ::-webkit-scrollbar {{ width: 12px; height: 12px; }}
+  ::-webkit-scrollbar-track {{ background: var(--panel-raised); }}
+  ::-webkit-scrollbar-thumb {{ background: var(--border-bright); border-radius: 8px; border: 3px solid var(--panel-raised); }}
+  ::-webkit-scrollbar-thumb:hover {{ background: var(--text-faint); }}
   body {{
     margin: 0; background: var(--bg); color: var(--text);
     font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, Arial, sans-serif;
@@ -4903,6 +4908,34 @@ HYPERVIEW_COMPONENT_CSS = """
      when that means the page itself scrolls a bit past the viewport. */
   .board-fill-panel .matrix-wrap { flex: 1 1 auto; overflow-y: auto; min-height: 280px; }
   .board-fill-panel .matrix-wrap table thead th { position: sticky; top: 0; z-index: 1; }
+  /* Device Detail / Active Alarms tables: fixed per-column widths so the
+     wide Detail/Alarm column actually gets most of the panel's width
+     instead of the browser handing it whatever's left over after Location/
+     Device sit at their natural (nowrap) content width - which, for iPRO's
+     "LCMC | 1st Floor | ED West | Med Cart | .38"-style device names, left
+     almost nothing for Detail and wrapped it one word per line. Location/
+     Device wrap onto a second line here instead of forcing the row wider.
+     One ruleset per column count - the three boards (iPRO 6 columns, Ooma
+     5, Hyperview 4) don't share a layout. */
+  .board-fill-panel .matrix-wrap table.alarmlog { table-layout: fixed; }
+  .board-fill-panel .matrix-wrap table.alarmlog td.loc, .board-fill-panel .matrix-wrap table.alarmlog td.dev {
+    white-space: normal; overflow-wrap: break-word;
+  }
+  .board-fill-panel .matrix-wrap table.alarmlog-6col th:nth-child(1), .board-fill-panel .matrix-wrap table.alarmlog-6col td:nth-child(1) { width: 13%; }
+  .board-fill-panel .matrix-wrap table.alarmlog-6col th:nth-child(2), .board-fill-panel .matrix-wrap table.alarmlog-6col td:nth-child(2) { width: 20%; }
+  .board-fill-panel .matrix-wrap table.alarmlog-6col th:nth-child(3), .board-fill-panel .matrix-wrap table.alarmlog-6col td:nth-child(3) { width: 9%; }
+  .board-fill-panel .matrix-wrap table.alarmlog-6col th:nth-child(4), .board-fill-panel .matrix-wrap table.alarmlog-6col td:nth-child(4) { width: 40%; }
+  .board-fill-panel .matrix-wrap table.alarmlog-6col th:nth-child(5), .board-fill-panel .matrix-wrap table.alarmlog-6col td:nth-child(5) { width: 9%; }
+  .board-fill-panel .matrix-wrap table.alarmlog-6col th:nth-child(6), .board-fill-panel .matrix-wrap table.alarmlog-6col td:nth-child(6) { width: 9%; }
+  .board-fill-panel .matrix-wrap table.alarmlog-5col th:nth-child(1), .board-fill-panel .matrix-wrap table.alarmlog-5col td:nth-child(1) { width: 14%; }
+  .board-fill-panel .matrix-wrap table.alarmlog-5col th:nth-child(2), .board-fill-panel .matrix-wrap table.alarmlog-5col td:nth-child(2) { width: 20%; }
+  .board-fill-panel .matrix-wrap table.alarmlog-5col th:nth-child(3), .board-fill-panel .matrix-wrap table.alarmlog-5col td:nth-child(3) { width: 10%; }
+  .board-fill-panel .matrix-wrap table.alarmlog-5col th:nth-child(4), .board-fill-panel .matrix-wrap table.alarmlog-5col td:nth-child(4) { width: 44%; }
+  .board-fill-panel .matrix-wrap table.alarmlog-5col th:nth-child(5), .board-fill-panel .matrix-wrap table.alarmlog-5col td:nth-child(5) { width: 12%; }
+  .board-fill-panel .matrix-wrap table.alarmlog-4col th:nth-child(1), .board-fill-panel .matrix-wrap table.alarmlog-4col td:nth-child(1) { width: 16%; }
+  .board-fill-panel .matrix-wrap table.alarmlog-4col th:nth-child(2), .board-fill-panel .matrix-wrap table.alarmlog-4col td:nth-child(2) { width: 22%; }
+  .board-fill-panel .matrix-wrap table.alarmlog-4col th:nth-child(3), .board-fill-panel .matrix-wrap table.alarmlog-4col td:nth-child(3) { width: 12%; }
+  .board-fill-panel .matrix-wrap table.alarmlog-4col th:nth-child(4), .board-fill-panel .matrix-wrap table.alarmlog-4col td:nth-child(4) { width: 50%; }
   @media (max-width: 1080px), (max-height: 700px) {
     .board-viewport-wrap { height: auto; min-height: 0; }
     .board-viewport-wrap > .board-fill-panel { flex: none; }
@@ -5318,7 +5351,7 @@ def _ipro_board_html(data):
       <div class="panel board-fill-panel">
         <div class="panel-head"><h2>Device Detail</h2><span class="count-note">{data['totals']['unhealthyCameras']} unhealthy device(s)</span></div>
         <div class="matrix-wrap">
-          <table class="alarmlog">
+          <table class="alarmlog alarmlog-6col">
             <thead><tr><th>Location</th><th>Device</th><th>Status</th><th>Detail</th><th>Duration</th><th>Priority</th></tr></thead>
             <tbody>{device_rows or '<tr><td colspan="6" class="empty">No open camera issues.</td></tr>'}</tbody>
           </table>
@@ -5385,7 +5418,7 @@ def _ooma_board_html(data):
       <div class="panel board-fill-panel">
         <div class="panel-head"><h2>Ooma AirDial &mdash; Emergency Red Phone System</h2></div>
         <div class="matrix-wrap">
-          <table class="alarmlog">
+          <table class="alarmlog alarmlog-5col">
             <thead><tr><th>Location</th><th>Device</th><th>Severity</th><th>Detail</th><th>Category</th></tr></thead>
             <tbody>{alarm_rows or '<tr><td colspan="5" class="empty">No open AirDial issues.</td></tr>'}</tbody>
           </table>
@@ -5414,39 +5447,6 @@ DASHBOARD_HEADER_CLOCK_SCRIPT = """<script>
 })();
 </script>"""
 
-
-# Scales the board content (but not the surrounding nav/header chrome) to
-# fill whatever vertical space is left in the viewport, the same
-# fit-to-screen behavior the standalone videowall shell used to provide -
-# shrinking dense boards so they read at a glance on a wall display, and
-# growing sparse ones so they aren't dwarfed by empty space below.
-DASHBOARD_FIT_SCRIPT = """<script>
-(function () {
-  var el = document.getElementById('dashboard-fit');
-  if (!el) return;
-  var pending = false;
-  function fit() {
-    el.style.zoom = 1;
-    var rect = el.getBoundingClientRect();
-    var availHeight = window.innerHeight - rect.top - 24;
-    var availWidth = el.parentElement.clientWidth;
-    var factor = Math.min(availHeight / el.scrollHeight, availWidth / el.scrollWidth, 1.15);
-    if (isFinite(factor) && factor > 0) el.style.zoom = Math.max(factor, 0.5);
-  }
-  function scheduleFit() {
-    if (pending) return;
-    pending = true;
-    requestAnimationFrame(function () { pending = false; fit(); });
-  }
-  window.addEventListener('load', scheduleFit);
-  window.addEventListener('resize', scheduleFit);
-  if (window.MutationObserver) {
-    new MutationObserver(scheduleFit).observe(el, {childList: true, subtree: true, characterData: true});
-  }
-  setTimeout(scheduleFit, 400);
-  setTimeout(scheduleFit, 1500);
-})();
-</script>"""
 
 
 def _dashboard_page_header_html(title, extra_action_html="", subtitle=""):
@@ -5500,8 +5500,7 @@ def ipro_page(username):
     body = f"""
     {_dashboard_page_header_html("iPRO Cameras")}
     <style>{DASHBOARD_BASE_CSS}</style>
-    <div id="dashboard-fit">{board}</div>
-    {DASHBOARD_FIT_SCRIPT}
+    {board}
     {DASHBOARD_AUTO_REFRESH_SCRIPT}
     {alert_script}
     """
@@ -5520,8 +5519,7 @@ def ooma_page(username):
     body = f"""
     {_dashboard_page_header_html("Ooma AirDial")}
     <style>{DASHBOARD_BASE_CSS}</style>
-    <div id="dashboard-fit">{board}</div>
-    {DASHBOARD_FIT_SCRIPT}
+    {board}
     {DASHBOARD_AUTO_REFRESH_SCRIPT}
     {alert_script}
     """
@@ -7457,7 +7455,7 @@ def _hyperview_board_html():
       <div class="panel board-fill-panel">
         <div class="panel-head"><h2>Active Alarms</h2><span class="count-note" id="alarm-note"></span></div>
         <div class="matrix-wrap">
-          <table class="alarmlog">
+          <table class="alarmlog alarmlog-4col">
             <thead><tr><th>Location</th><th>Device</th><th>Severity</th><th>Alarm</th></tr></thead>
             <tbody id="alarmlog-body"></tbody>
           </table>
@@ -7491,8 +7489,7 @@ def hyperview_page(username):
     body = f"""
     {_dashboard_page_header_html("Hyperview")}
     <style>{DASHBOARD_BASE_CSS}</style>
-    <div id="dashboard-fit">{_hyperview_board_html()}</div>
-    {DASHBOARD_FIT_SCRIPT}
+    {_hyperview_board_html()}
     {HYPERVIEW_SCRIPT % {'auto_refresh_ms': 30000}}
     """
     return Response(render_shell("Hyperview", body, "hyperview", username), mimetype="text/html")
@@ -9838,8 +9835,7 @@ def downtime_page(username):
     body = f"""
     {_dashboard_page_header_html("Downtime Workstations", subtitle="Live reporting status for every downtime workstation.")}
     <style>{DOWNTIME_CSS}</style>
-    <div id="dashboard-fit">{board}</div>
-    {DASHBOARD_FIT_SCRIPT}
+    {board}
     {DOWNTIME_DETAIL_MODAL_HTML}
     {DOWNTIME_SCRIPT}
     {DASHBOARD_AUTO_REFRESH_SCRIPT}
