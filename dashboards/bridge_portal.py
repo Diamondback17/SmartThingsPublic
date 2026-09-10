@@ -2379,6 +2379,30 @@ def _maintenance_log_db():
             "INSERT OR IGNORE INTO app_settings (key, value) VALUES ('hyperview_ack_set_by_migrated', '1')"
         )
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS known_human_users (
+            username TEXT PRIMARY KEY,
+            first_seen INTEGER NOT NULL
+        )
+    """)
+    # One-time: seed known_human_users from every distinct set_by already in
+    # the log, excluding the non-human markers - a login can only ever
+    # produce a set_by via Access Management (local user row, individually
+    # granted LDAP user, or an LDAP group configured there; login itself
+    # refuses an account with no systems granted), so every pre-existing
+    # human set_by value is retroactively a legitimate entry here. Without
+    # this backfill, everyone who logged in before this table existed would
+    # wrongly stop counting as human until they logged in again.
+    if conn.execute("SELECT 1 FROM app_settings WHERE key = 'known_human_users_backfilled'").fetchone() is None:
+        placeholders = ",".join("?" * len(NON_HUMAN_SET_BY_VALUES))
+        conn.execute(
+            f"INSERT OR IGNORE INTO known_human_users (username, first_seen) "
+            f"SELECT DISTINCT set_by, ? FROM maintenance_actions WHERE set_by NOT IN ({placeholders})",
+            (int(time.time()), *NON_HUMAN_SET_BY_VALUES),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO app_settings (key, value) VALUES ('known_human_users_backfilled', '1')"
+        )
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS scheduled_maintenance (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             system TEXT NOT NULL,
@@ -5861,6 +5885,8 @@ def overview_page(username):
         for a in _query_maintenance_actions(key, since_ts=activity_since_ts):
             if a["action"] in ("alarm", "resolved"):
                 continue  # system-detected - the widget's own "System" side already covers both
+            if not _is_recognized_human_set_by(a["set_by"]):
+                continue  # a system/service actor (or not a real Access Management login) isn't a human action
             a["system_label"] = label
             human_actions.append(a)
     human_actions.sort(key=lambda a: a["ts"], reverse=True)
@@ -9775,6 +9801,42 @@ AUTO_RESTART_SET_BY = "auto-restart"
 # under it get excluded the same way. If another shared/non-human account
 # name shows up in this view, add it here too.
 NON_HUMAN_SET_BY_VALUES = {ALARM_MONITOR_SET_BY, AUTO_RESTART_SET_BY, HYPERVIEW_UPSTREAM_ACK_SET_BY, "system"}
+
+
+def _record_known_human_user(username):
+    """Called on every successful login - login itself already refused
+    anyone with no systems granted, so reaching here means Access
+    Management vouched for this username (a local account, an
+    individually-granted LDAP user, or an LDAP group configured there)."""
+    conn = _maintenance_log_db()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO known_human_users (username, first_seen) VALUES (?, ?)",
+            (username, int(time.time())),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _known_human_usernames():
+    conn = _maintenance_log_db()
+    try:
+        return {row[0] for row in conn.execute("SELECT username FROM known_human_users")}
+    finally:
+        conn.close()
+
+
+def _is_recognized_human_set_by(set_by):
+    """A set_by value counts as a real human responder only if it belongs
+    to someone who has actually logged in through Access Management - not
+    just any string that isn't one of InfraWatch's own system-detected
+    markers. A stray or since-removed account name in set_by (for
+    instance, from before it was added to Access Management, or a name
+    that was never a real login at all) doesn't count either way."""
+    if set_by in NON_HUMAN_SET_BY_VALUES:
+        return False
+    return set_by in _known_human_usernames()
 AUTO_RESTART_DOWNTIME_SETTING_KEY = "downtime_auto_restart_enabled"
 AUTO_RESTART_DOWNTIME_CHECK_INTERVAL_SECONDS = int(os.environ.get("AUTO_RESTART_DOWNTIME_CHECK_INTERVAL_SECONDS", "300"))
 AUTO_RESTART_DOWNTIME_MAX_ATTEMPTS = int(os.environ.get("AUTO_RESTART_DOWNTIME_MAX_ATTEMPTS", "2"))
@@ -11367,7 +11429,7 @@ def admin_activity_page(username):
         u = by_user.setdefault(a["set_by"], {
             "total": 0, "acknowledged": 0, "un-acknowledged": 0, "restarted": 0,
             "systems": {}, "first_ts": a["ts"], "last_ts": a["ts"],
-            "is_system": a["set_by"] in NON_HUMAN_SET_BY_VALUES,
+            "is_system": not _is_recognized_human_set_by(a["set_by"]),
         })
         u["total"] += 1
         u[a["action"]] = u.get(a["action"], 0) + 1
@@ -11628,8 +11690,8 @@ def admin_leadership_page(username):
 
     by_user = {}
     for a in all_actions:
-        if a["set_by"] in NON_HUMAN_SET_BY_VALUES:
-            continue  # system-detected (alarm, self-cleared resolved, auto-restart, etc.) - not a human responder
+        if not _is_recognized_human_set_by(a["set_by"]):
+            continue  # system-detected, or not a real Access Management login - not a human responder
         u = by_user.setdefault(a["set_by"], {"total": 0, "acknowledged": 0, "restarted": 0})
         u["total"] += 1
         u[a["action"]] = u.get(a["action"], 0) + 1
@@ -11743,8 +11805,8 @@ def admin_leadership_csv(username):
     writer.writerow(["User", "Total", "Acknowledged", "Restarted"])
     by_user = {}
     for a in all_actions:
-        if a["set_by"] in NON_HUMAN_SET_BY_VALUES:
-            continue  # system-detected (alarm, self-cleared resolved, auto-restart, etc.) - not a human responder
+        if not _is_recognized_human_set_by(a["set_by"]):
+            continue  # system-detected, or not a real Access Management login - not a human responder
         u = by_user.setdefault(a["set_by"], {"total": 0})
         u["total"] += 1
         u[a["action"]] = u.get(a["action"], 0) + 1
@@ -11855,6 +11917,7 @@ def login_page():
                 session["is_admin"] = is_admin
                 session["auth_source"] = source
                 session["ldap_groups"] = ldap_groups
+                _record_known_human_user(username)
                 if source == "ldap":
                     session["cred_token"] = _stash_ldap_credential(password)
                     if "downtime" in systems:
