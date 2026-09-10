@@ -6541,6 +6541,7 @@ RACK_AUDIT_ELEVATION_CSS = """
   .ra-target .meta .overdue { color: var(--danger); font-weight: 700; }
   .ra-sheet { max-width: 1100px; margin: 20px auto 0; background: var(--panel); border: 1px solid var(--border);
     border-radius: var(--radius); box-shadow: var(--shadow-sm); padding: 24px 28px; }
+  .ra-sheet-location { margin: 0 0 4px; font-size: 13px; font-weight: 600; color: var(--text-dim); }
   .ra-sheet-title { margin: 0 0 16px; font-size: 20px; font-weight: 700; color: var(--text); }
   /* Elevation view: print-only now - shown only inside @media print below,
      not on the live page at all. */
@@ -6565,9 +6566,12 @@ RACK_AUDIT_ELEVATION_CSS = """
     /* @page sizing and the dark-on-white text override are handled once,
        globally, in DASHBOARD_BASE_CSS - every printable page shares them. */
     .ra-sheet { border: none; box-shadow: none; padding: 0; max-width: none; }
-    /* The printout should be the rack name, elevation, and the device
-       table - the on-screen assignment/target context card isn't part of
-       the printed sheet. */
+    /* The printout should be the rack's location, elevation, and the
+       device table - the on-screen page title ("Rack Audit" / "Automatically
+       targeted..." - neither means anything on a printed sheet handed to
+       an auditor standing at the rack) and the assignment/target context
+       card aren't part of the printed sheet. */
+    .page-header { display: none !important; }
     .ra-context-panel { display: none !important; }
     /* The elevation is print-only - hidden everywhere else above, shown
        here. Keep it from breaking mid-rack across a page boundary. */
@@ -6698,6 +6702,7 @@ def rack_audit_page(username):
     </div>
 
     <div class="ra-sheet">
+      <div class="ra-sheet-location">{_esc(rack.get("site_path") or rack["site"])}</div>
       <h2 class="ra-sheet-title">{_esc(rack["name"] or rack["id"])}</h2>
       <div class="ra-elevation-row">
         <div class="ra-elevation-col"><div class="ev-label">Front</div>{_rack_audit_elevation_html(assets, "front", rack.get("total_u"))}</div>
