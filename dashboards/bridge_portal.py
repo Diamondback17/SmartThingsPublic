@@ -1801,7 +1801,23 @@ PAGE_SHELL = """<!DOCTYPE html>
   }}
   a.ghost.page-action:hover {{ border-color: var(--teal); color: var(--teal); }}
 
+  @page {{ size: letter portrait; margin: 0.5in; }}
   @media print {{
+    /* Force real dark-on-white text regardless of dark mode - printing with
+       :root[data-theme="dark"] active would otherwise send the dark theme's
+       near-white --text color to paper (all but invisible), and even in
+       light mode the --text-dim/--text-faint grays read paler on paper than
+       they do on a backlit screen. Every printable page (rack audit sheet,
+       shift handoff report, leadership dashboard) shares this base CSS, so
+       this covers all of them from one place. */
+    :root, :root[data-theme="dark"] {{
+      --bg: #ffffff; --panel: #ffffff; --panel-raised: #f3f6f8;
+      --border: #aebbc4; --border-bright: #8fa0ab;
+      --text: #0a0f14; --text-dim: #29323a; --text-faint: #48545e;
+      --teal: #06315e; --teal-dark: #06315e; --teal-tint: #e4edf5;
+      --danger: #8c0026; --danger-dark: #8c0026; --danger-tint: #faeaee;
+      --warn: #7a4c08; --ok: #0e5536;
+    }}
     header.brand, nav.top, .print-btn, .site-footer {{ display: none !important; }}
     body {{ padding: 0; }}
     .wrap {{ padding-top: 0; max-width: none; width: 100%; }}
@@ -6325,8 +6341,9 @@ RACK_AUDIT_ELEVATION_CSS = """
     background: var(--panel-raised); font-weight: 700; }
   table.ra-table td.chk { text-align: center; width: 55px; }
   table.ra-table .box { display: inline-block; width: 13px; height: 13px; border: 1.5px solid var(--text-dim); border-radius: 2px; }
-  @page { size: letter portrait; margin: 0.5in; }
   @media print {
+    /* @page sizing and the dark-on-white text override are handled once,
+       globally, in DASHBOARD_BASE_CSS - every printable page shares them. */
     .ra-sheet { border: none; box-shadow: none; padding: 0; max-width: none; }
     /* Shrink the elevation for print - at the full screen row height, a
        tall rack (40U+) doesn't fit one printed page and the diagram splits
