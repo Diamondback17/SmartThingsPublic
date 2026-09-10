@@ -6430,6 +6430,7 @@ RACK_AUDIT_ELEVATION_CSS = """
   table.ra-table th { font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.02em; color: var(--text-faint);
     border-bottom: 1.5px solid var(--border-bright); font-weight: 700; vertical-align: bottom; }
   table.ra-table td.notes-col { height: 40px; }
+  table.ra-table td.chk { text-align: center; }
   @media print {
     /* @page sizing and the dark-on-white text override are handled once,
        globally, in DASHBOARD_BASE_CSS - every printable page shares them. */
@@ -6443,6 +6444,9 @@ RACK_AUDIT_ELEVATION_CSS = """
     .ra-elevation-row { display: flex; page-break-inside: avoid; break-inside: avoid; }
     .ra-elevation { page-break-inside: avoid; break-inside: avoid; }
     table.ra-table td.notes-col { height: 46px; }
+    /* The Delete checkbox is an interactive control, not part of the
+       paper sheet - hidden from print same as the context panel. */
+    .ra-table .delete-col, .ra-table col.delete-col { display: none; }
   }
 """
 
@@ -6526,26 +6530,15 @@ def rack_audit_page(username):
         f'<td>{_esc(a.get("manufacturer") or "")}</td><td>{_esc(a.get("model") or "")}</td>'
         f'<td>{_esc(a.get("serial") or "")}</td>'
         f'<td>{_esc(", ".join(a.get("power_sources") or [])) or "&mdash;"}</td>'
-        f'<td class="notes-col"></td></tr>'
+        f'<td class="notes-col"></td>'
+        + (
+            f'<td class="chk delete-col"><input type="checkbox" name="remove_device_ids" '
+            f'value="{_esc(a["id"])}\x1f{_esc(a["name"])}" form="rack-audit-complete-form"></td>'
+            if a.get("id") else '<td class="chk delete-col"></td>'
+        )
+        + '</tr>'
         for a in assets
     )
-
-    remove_devices_html = ""
-    if assets:
-        remove_options = "".join(
-            f'<option value="{_esc(a["id"])}\x1f{_esc(a["name"])}">{_esc(a["name"])} ({_esc(_humanize_asset_type(a.get("type")) or "Unknown")})</option>'
-            for a in assets if a.get("id")
-        )
-        remove_devices_html = f"""
-          <div style="margin-top:14px; padding-top:14px; border-top:1px solid var(--border);">
-            <label for="remove-devices-select" style="font-size:12.5px; color:var(--text-dim); font-weight:600; display:block; margin-bottom:6px;">
-              Remove device(s) from inventory
-              <span style="font-weight:400; color:var(--text-faint);">&mdash; not present, decommissioned, etc. Selecting any and submitting deletes them from Hyperview along with marking the audit complete.</span>
-            </label>
-            <select id="remove-devices-select" name="remove_device_ids" multiple style="width:100%; min-height:88px;">
-              {remove_options}
-            </select>
-          </div>"""
 
     body = f"""
     <div class="page-header">
@@ -6582,33 +6575,34 @@ def rack_audit_page(username):
       </div>
       <table class="ra-table">
         <colgroup>
-          <col style="width:3%"><col style="width:8%"><col style="width:14%"><col style="width:10%">
-          <col style="width:9%"><col style="width:10%"><col style="width:10%"><col style="width:12%">
-          <col style="width:24%">
+          <col style="width:3%"><col style="width:8%"><col style="width:13%"><col style="width:9%">
+          <col style="width:8%"><col style="width:9%"><col style="width:9%"><col style="width:11%">
+          <col style="width:22%"><col class="delete-col" style="width:8%">
         </colgroup>
         <thead><tr>
           <th>U</th><th>Side</th><th>Device</th><th>Type</th><th>Make</th><th>Model</th><th>Serial</th><th>Power</th>
-          <th>Notes</th>
+          <th>Notes</th><th class="chk delete-col">Delete</th>
         </tr></thead>
-        <tbody>{asset_rows or '<tr><td colspan="9" class="empty">No assets.</td></tr>'}</tbody>
+        <tbody>{asset_rows or '<tr><td colspan="10" class="empty">No assets.</td></tr>'}</tbody>
       </table>
     </div>
 
     <div class="panel ra-context-panel" style="max-width:1100px; margin:16px auto 0;">
       <div style="padding:16px 24px;">
-        <form method="POST" action="/tools/rack-audit/complete" onsubmit="
-          var sel = document.getElementById('remove-devices-select');
-          var n = sel ? sel.selectedOptions.length : 0;
+        <form id="rack-audit-complete-form" method="POST" action="/tools/rack-audit/complete" onsubmit="
+          var n = document.querySelectorAll('input[name=&quot;remove_device_ids&quot;]:checked').length;
           if (n === 0) {{ return true; }}
-          return confirm('Delete ' + n + ' selected device(s) from Hyperview? This cannot be undone.');
+          return confirm('Delete ' + n + ' checked device(s) from Hyperview? This cannot be undone.');
         ">
           <input type="hidden" name="rack_id" value="{_esc(rack['id'])}">
           <input type="hidden" name="rack_name" value="{_esc(rack['name'] or rack['id'])}">
           <div style="display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap;">
-            <div style="font-size:13px; color:var(--text-dim);">Walked the rack? Mark it done.</div>
+            <div style="font-size:13px; color:var(--text-dim);">
+              Walked the rack? Mark it done.
+              <span style="color:var(--text-faint);">Checked the Delete box on any device above? Submitting also deletes those from Hyperview.</span>
+            </div>
             <button class="btn" style="background:var(--ok); color:#fff; border:none; padding:11px 22px; border-radius:8px; font-weight:700; cursor:pointer;" type="submit">&#10003; Mark Audit Complete</button>
           </div>
-          {remove_devices_html}
         </form>
       </div>
     </div>
