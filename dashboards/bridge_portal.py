@@ -403,16 +403,13 @@ def _fetch_ipro_dashboard():
     try:
         resp = _parallel_get(base, [
             "/location-health-matrix", "/clinic-health-matrix", "/alarm-summary",
-            "/camera-health-summary", "/camera-issue-log", "/last-updated",
+            "/camera-health-summary", "/camera-outage-log", "/last-updated",
         ])
         hospitals = resp["/location-health-matrix"].json()
         clinics = resp["/clinic-health-matrix"].json()
         alarm_rows = resp["/alarm-summary"].json()
         totals = resp["/camera-health-summary"].json()[0]
-        # /camera-issue-log, not /camera-outage-log: the outage log drops a
-        # camera the instant it's acknowledged, which wrongly reads as
-        # "resolved" to _open_target_names' diffing.
-        devices = resp["/camera-issue-log"].json()
+        devices = resp["/camera-outage-log"].json()
         last_updated = resp["/last-updated"].json()[0]["updated"]
     except (requests.RequestException, ValueError, IndexError, KeyError, FuturesTimeoutError):
         return None
@@ -447,13 +444,11 @@ _OOMA_STATUS_CREDIT = {"OK": 1.0, "DEGRADED": 0.5, "DOWN": 0.0}
 def _fetch_ooma_dashboard():
     base = SYSTEMS["ooma"]["base_url"]
     try:
-        resp = _parallel_get(base, ["/devices", "/accounts", "/category-summary", "/issue-log", "/last-updated"])
+        resp = _parallel_get(base, ["/devices", "/accounts", "/category-summary", "/issues", "/last-updated"])
         devices = resp["/devices"].json()
         accounts = resp["/accounts"].json()
         category_rows = resp["/category-summary"].json()
-        # /issue-log, not /issues: same gap as iPRO's /camera-outage-log
-        # above - /issues drops a device the instant it's acknowledged.
-        issues = resp["/issue-log"].json()
+        issues = resp["/issues"].json()
         last_updated = resp["/last-updated"].json()[0]["timestamp"]
     except (requests.RequestException, ValueError, IndexError, KeyError, FuturesTimeoutError):
         return None
