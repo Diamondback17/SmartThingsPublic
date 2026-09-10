@@ -5415,6 +5415,40 @@ DASHBOARD_HEADER_CLOCK_SCRIPT = """<script>
 </script>"""
 
 
+# Scales the board content (but not the surrounding nav/header chrome) to
+# fill whatever vertical space is left in the viewport, the same
+# fit-to-screen behavior the standalone videowall shell used to provide -
+# shrinking dense boards so they read at a glance on a wall display, and
+# growing sparse ones so they aren't dwarfed by empty space below.
+DASHBOARD_FIT_SCRIPT = """<script>
+(function () {
+  var el = document.getElementById('dashboard-fit');
+  if (!el) return;
+  var pending = false;
+  function fit() {
+    el.style.zoom = 1;
+    var rect = el.getBoundingClientRect();
+    var availHeight = window.innerHeight - rect.top - 24;
+    var availWidth = el.parentElement.clientWidth;
+    var factor = Math.min(availHeight / el.scrollHeight, availWidth / el.scrollWidth, 1.15);
+    if (isFinite(factor) && factor > 0) el.style.zoom = Math.max(factor, 0.5);
+  }
+  function scheduleFit() {
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(function () { pending = false; fit(); });
+  }
+  window.addEventListener('load', scheduleFit);
+  window.addEventListener('resize', scheduleFit);
+  if (window.MutationObserver) {
+    new MutationObserver(scheduleFit).observe(el, {childList: true, subtree: true, characterData: true});
+  }
+  setTimeout(scheduleFit, 400);
+  setTimeout(scheduleFit, 1500);
+})();
+</script>"""
+
+
 def _dashboard_page_header_html(title, extra_action_html="", subtitle=""):
     return f"""
     <div class="page-header">
@@ -5466,7 +5500,8 @@ def ipro_page(username):
     body = f"""
     {_dashboard_page_header_html("iPRO Cameras")}
     <style>{DASHBOARD_BASE_CSS}</style>
-    {board}
+    <div id="dashboard-fit">{board}</div>
+    {DASHBOARD_FIT_SCRIPT}
     {DASHBOARD_AUTO_REFRESH_SCRIPT}
     {alert_script}
     """
@@ -5485,7 +5520,8 @@ def ooma_page(username):
     body = f"""
     {_dashboard_page_header_html("Ooma AirDial")}
     <style>{DASHBOARD_BASE_CSS}</style>
-    {board}
+    <div id="dashboard-fit">{board}</div>
+    {DASHBOARD_FIT_SCRIPT}
     {DASHBOARD_AUTO_REFRESH_SCRIPT}
     {alert_script}
     """
@@ -7455,7 +7491,8 @@ def hyperview_page(username):
     body = f"""
     {_dashboard_page_header_html("Hyperview")}
     <style>{DASHBOARD_BASE_CSS}</style>
-    {_hyperview_board_html()}
+    <div id="dashboard-fit">{_hyperview_board_html()}</div>
+    {DASHBOARD_FIT_SCRIPT}
     {HYPERVIEW_SCRIPT % {'auto_refresh_ms': 30000}}
     """
     return Response(render_shell("Hyperview", body, "hyperview", username), mimetype="text/html")
@@ -9801,7 +9838,8 @@ def downtime_page(username):
     body = f"""
     {_dashboard_page_header_html("Downtime Workstations", subtitle="Live reporting status for every downtime workstation.")}
     <style>{DOWNTIME_CSS}</style>
-    {board}
+    <div id="dashboard-fit">{board}</div>
+    {DASHBOARD_FIT_SCRIPT}
     {DOWNTIME_DETAIL_MODAL_HTML}
     {DOWNTIME_SCRIPT}
     {DASHBOARD_AUTO_REFRESH_SCRIPT}
