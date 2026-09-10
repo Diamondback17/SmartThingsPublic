@@ -126,8 +126,6 @@ CONFIG = {
         {"myx_id": "6AB194", "name": "Centerpoint AD2", "account": "Centerpoint"},
         {"myx_id": "6B3198", "name": "Centerpoint AD3", "account": "Centerpoint"},
         {"myx_id": "6ABFD8", "name": "Centerpoint AD1", "account": "Centerpoint"},
-        # --- Covenant IT (1 device) ---
-        {"myx_id": "6B0488", "name": "Demo Airdial", "account": "Covenant IT"},
         # --- Methodist Medical Center (10 devices) ---
         {"myx_id": "795868", "name": "Methodist Medical AD10", "account": "Methodist Medical Center"},
         {"myx_id": "794930", "name": "Methodist Medical AD8", "account": "Methodist Medical Center"},

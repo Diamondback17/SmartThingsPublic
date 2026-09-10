@@ -346,7 +346,6 @@ OOMA_ACCOUNT_TO_SITE = {
     "Claiborne Medical Center": "Claiborne",
     "LeConte Medical Center": "LeConte",
     "Centerpoint": "Centerpoint",
-    "Covenant IT": None,
     "Methodist Medical Center": "Methodist",
     "Peninsula Hospital": "Peninsula",
     "Fort Loudoun Medical Center": "Fort Loudoun",
