@@ -6426,12 +6426,10 @@ RACK_AUDIT_ELEVATION_CSS = """
   .ra-elevation .u-slot.empty { color: var(--text-faint); }
   table.ra-table { width: 100%; border-collapse: collapse; font-size: 12px; table-layout: fixed; }
   table.ra-table th, table.ra-table td { padding: 8px 5px; border-bottom: 1px solid var(--border); text-align: left;
-    vertical-align: top; white-space: normal; overflow-wrap: break-word; overflow: hidden; }
+    vertical-align: top; white-space: normal; overflow-wrap: normal; word-break: normal; overflow: hidden; }
   table.ra-table th { font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.02em; color: var(--text-faint);
     border-bottom: 1.5px solid var(--border-bright); font-weight: 700; vertical-align: bottom; }
   table.ra-table td.notes-col { height: 40px; }
-  table.ra-table td.chk { text-align: center; }
-  table.ra-table .box { display: inline-block; width: 13px; height: 13px; border: 1.25px solid var(--text-dim); border-radius: 2px; }
   @media print {
     /* @page sizing and the dark-on-white text override are handled once,
        globally, in DASHBOARD_BASE_CSS - every printable page shares them. */
@@ -6528,7 +6526,6 @@ def rack_audit_page(username):
         f'<td>{_esc(a.get("manufacturer") or "")}</td><td>{_esc(a.get("model") or "")}</td>'
         f'<td>{_esc(a.get("serial") or "")}</td>'
         f'<td>{_esc(", ".join(a.get("power_sources") or [])) or "&mdash;"}</td>'
-        f'<td class="chk"><span class="box"></span></td><td class="chk"><span class="box"></span></td><td class="chk"><span class="box"></span></td>'
         f'<td class="notes-col"></td></tr>'
         for a in assets
     )
@@ -6585,15 +6582,15 @@ def rack_audit_page(username):
       </div>
       <table class="ra-table">
         <colgroup>
-          <col style="width:3%"><col style="width:7%"><col style="width:12%"><col style="width:9%">
-          <col style="width:8%"><col style="width:9%"><col style="width:9%"><col style="width:10%">
-          <col style="width:6%"><col style="width:6%"><col style="width:6%"><col style="width:15%">
+          <col style="width:3%"><col style="width:8%"><col style="width:14%"><col style="width:10%">
+          <col style="width:9%"><col style="width:10%"><col style="width:10%"><col style="width:12%">
+          <col style="width:24%">
         </colgroup>
         <thead><tr>
           <th>U</th><th>Side</th><th>Device</th><th>Type</th><th>Make</th><th>Model</th><th>Serial</th><th>Power</th>
-          <th class="chk">Present</th><th class="chk">Labeled</th><th class="chk">Serial</th><th>Notes</th>
+          <th>Notes</th>
         </tr></thead>
-        <tbody>{asset_rows or '<tr><td colspan="12" class="empty">No assets.</td></tr>'}</tbody>
+        <tbody>{asset_rows or '<tr><td colspan="9" class="empty">No assets.</td></tr>'}</tbody>
       </table>
     </div>
 
