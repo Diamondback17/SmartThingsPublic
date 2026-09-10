@@ -6366,69 +6366,38 @@ RACK_AUDIT_ELEVATION_CSS = """
   .ra-sheet { max-width: 1100px; margin: 20px auto 0; background: var(--panel); border: 1px solid var(--border);
     border-radius: var(--radius); box-shadow: var(--shadow-sm); padding: 24px 28px; }
   .ra-sheet-title { margin: 0 0 16px; font-size: 20px; font-weight: 700; color: var(--text); }
-  .ra-elevation-row { display: flex; gap: 20px; margin-bottom: 20px; flex-wrap: wrap; }
-  .ra-elevation-col .ev-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 700;
-    color: var(--text-dim); margin-bottom: 5px; text-align: center; }
-  .ra-elevation { width: 140px; border: 1px solid var(--border-bright); border-radius: 4px; overflow: hidden; }
-  .ra-elevation .u-row { display: flex; align-items: center; height: 21px; border-bottom: 1px solid var(--border); font-size: 9px; }
-  .ra-elevation .u-num { width: 20px; text-align: center; color: var(--text-faint); border-right: 1px solid var(--border);
-    height: 100%; display: flex; align-items: center; justify-content: center; }
-  .ra-elevation .u-slot { flex: 1; padding: 0 5px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-  .ra-elevation .u-slot.filled { font-weight: 600; }
-  .ra-elevation .u-slot.empty { color: var(--text-faint); }
-  table.ra-table { width: 100%; border-collapse: collapse; font-size: 11.5px; table-layout: fixed; }
-  table.ra-table th, table.ra-table td { padding: 6px 6px; border-bottom: 1px solid var(--border); text-align: left;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  table.ra-table th { font-size: 9px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-faint);
-    border-bottom: 1.5px solid var(--border-bright); font-weight: 700; }
-  table.ra-table td.notes-col { white-space: normal; height: 30px; }
+  table.ra-table { width: 100%; border-collapse: collapse; font-size: 12.5px; table-layout: fixed; }
+  table.ra-table th, table.ra-table td { padding: 9px 7px; border-bottom: 1px solid var(--border); text-align: left;
+    vertical-align: top; white-space: normal; overflow-wrap: break-word; }
+  table.ra-table th { font-size: 10px; text-transform: uppercase; letter-spacing: 0.03em; color: var(--text-faint);
+    border-bottom: 1.5px solid var(--border-bright); font-weight: 700; vertical-align: bottom; white-space: nowrap; }
+  table.ra-table td.notes-col { height: 40px; }
   table.ra-table td.chk { text-align: center; }
-  table.ra-table .box { display: inline-block; width: 12px; height: 12px; border: 1.25px solid var(--text-dim); border-radius: 2px; }
+  table.ra-table .box { display: inline-block; width: 13px; height: 13px; border: 1.25px solid var(--text-dim); border-radius: 2px; }
   @media print {
     /* @page sizing and the dark-on-white text override are handled once,
        globally, in DASHBOARD_BASE_CSS - every printable page shares them. */
     .ra-sheet { border: none; box-shadow: none; padding: 0; max-width: none; }
-    /* The printout should be just the rack name, elevation, and the
-       device table - the on-screen assignment/target context card isn't
-       part of the printed sheet. */
+    /* The printout should be just the rack name and the device table -
+       the on-screen assignment/target context card isn't part of the
+       printed sheet. */
     .ra-context-panel { display: none !important; }
-    /* Shrink the elevation for print - at the full screen row height, a
-       tall rack (40U+) doesn't fit one printed page and the diagram splits
-       across a page break, which defeats the point of a single audit
-       sheet. Scaled down, even a 48U rack's elevation stays well under a
-       page's height. Keep it from breaking mid-rack regardless. */
-    .ra-elevation-row { page-break-inside: avoid; break-inside: avoid; }
-    .ra-elevation { page-break-inside: avoid; break-inside: avoid; }
-    .ra-elevation .u-row { height: 10px; font-size: 6px; }
-    .ra-elevation .u-num { width: 14px; font-size: 6px; }
-    table.ra-table td.notes-col { height: 34px; }
+    table.ra-table td.notes-col { height: 46px; }
   }
 """
 
 
-def _rack_audit_elevation_html(assets, side, total_u=None):
-    """Always draws the rack's full physical height (U1 through its real
-    provided-rack-units capacity), not just the span between the highest
-    and lowest occupied slot - an audit sheet should show the whole rack,
-    empty space included, not a cropped view of only what's mounted.
-    Falls back to the occupied range if Hyperview has no recorded height
-    for this rack at all."""
-    rows = [a for a in assets if (a.get("side") or "").lower() == side and a.get("u_location") is not None]
-    by_u = {a["u_location"]: a for a in rows}
-    if total_u:
-        lo, hi = 1, total_u
-    elif by_u:
-        lo, hi = min(by_u), max(by_u)
-    else:
-        return '<div class="ra-elevation"><div class="u-row"><div class="u-slot empty" style="text-align:center; flex:1;">&mdash; none &mdash;</div></div></div>'
-    html = ['<div class="ra-elevation">']
-    for u in range(hi, lo - 1, -1):
-        a = by_u.get(u)
-        cls = "filled" if a else "empty"
-        label = _esc(a["name"]) if a else "&mdash;"
-        html.append(f'<div class="u-row"><div class="u-num">{u}</div><div class="u-slot {cls}">{label}</div></div>')
-    html.append("</div>")
-    return "".join(html)
+_RACK_AUDIT_TYPE_ACRONYMS = {"PDU", "UPS", "RPP"}
+
+
+def _humanize_asset_type(type_id):
+    """Hyperview's assetTypeId is raw camelCase ("networkDevice", "rackPdu")
+    - split it into real words for the audit sheet rather than truncating
+    or wrapping a run-together string mid-word."""
+    if not type_id:
+        return ""
+    words = re.sub(r"(?<!^)(?=[A-Z])", " ", type_id).split()
+    return " ".join(w.upper() if w.upper() in _RACK_AUDIT_TYPE_ACRONYMS else w.capitalize() for w in words)
 
 
 def _rack_audit_pdf_filename(rack_name, username):
@@ -6468,7 +6437,7 @@ def rack_audit_page(username):
     asset_rows = "".join(
         f'<tr><td>{a["u_location"] if a.get("u_location") is not None else "&mdash;"}</td>'
         f'<td>{_esc((a.get("side") or "").capitalize() or "&mdash;")}</td>'
-        f'<td>{_esc(a["name"])}</td><td>{_esc(a.get("type") or "")}</td>'
+        f'<td>{_esc(a["name"])}</td><td>{_esc(_humanize_asset_type(a.get("type")))}</td>'
         f'<td>{_esc(a.get("manufacturer") or "")}</td><td>{_esc(a.get("model") or "")}</td>'
         f'<td>{_esc(a.get("serial") or "")}</td>'
         f'<td>{_esc(", ".join(a.get("power_sources") or [])) or "&mdash;"}</td>'
@@ -6506,15 +6475,11 @@ def rack_audit_page(username):
 
     <div class="ra-sheet">
       <h2 class="ra-sheet-title">{_esc(rack["name"] or rack["id"])}</h2>
-      <div class="ra-elevation-row">
-        <div class="ra-elevation-col"><div class="ev-label">Front</div>{_rack_audit_elevation_html(assets, "front", rack.get("total_u"))}</div>
-        <div class="ra-elevation-col"><div class="ev-label">Rear</div>{_rack_audit_elevation_html(assets, "rear", rack.get("total_u"))}</div>
-      </div>
       <table class="ra-table">
         <colgroup>
-          <col style="width:4%"><col style="width:6%"><col style="width:13%"><col style="width:8%">
-          <col style="width:8%"><col style="width:9%"><col style="width:9%"><col style="width:10%">
-          <col style="width:5%"><col style="width:5%"><col style="width:5%"><col style="width:18%">
+          <col style="width:3%"><col style="width:5%"><col style="width:12%"><col style="width:9%">
+          <col style="width:8%"><col style="width:9%"><col style="width:10%"><col style="width:10%">
+          <col style="width:5%"><col style="width:5%"><col style="width:5%"><col style="width:19%">
         </colgroup>
         <thead><tr>
           <th>U</th><th>Side</th><th>Device</th><th>Type</th><th>Make</th><th>Model</th><th>Serial</th><th>Power</th>
