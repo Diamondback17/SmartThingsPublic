@@ -6412,11 +6412,23 @@ RACK_AUDIT_ELEVATION_CSS = """
   .ra-sheet { max-width: 1100px; margin: 20px auto 0; background: var(--panel); border: 1px solid var(--border);
     border-radius: var(--radius); box-shadow: var(--shadow-sm); padding: 24px 28px; }
   .ra-sheet-title { margin: 0 0 16px; font-size: 20px; font-weight: 700; color: var(--text); }
-  table.ra-table { width: 100%; border-collapse: collapse; font-size: 12.5px; table-layout: fixed; }
-  table.ra-table th, table.ra-table td { padding: 9px 7px; border-bottom: 1px solid var(--border); text-align: left;
-    vertical-align: top; white-space: normal; overflow-wrap: break-word; }
-  table.ra-table th { font-size: 10px; text-transform: uppercase; letter-spacing: 0.03em; color: var(--text-faint);
-    border-bottom: 1.5px solid var(--border-bright); font-weight: 700; vertical-align: bottom; white-space: nowrap; }
+  /* Elevation view: print-only now - shown only inside @media print below,
+     not on the live page at all. */
+  .ra-elevation-row { display: none; gap: 20px; margin-bottom: 20px; flex-wrap: wrap; }
+  .ra-elevation-col .ev-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 700;
+    color: var(--text-dim); margin-bottom: 5px; text-align: center; }
+  .ra-elevation { width: 140px; border: 1px solid var(--border-bright); border-radius: 4px; overflow: hidden; }
+  .ra-elevation .u-row { display: flex; align-items: center; height: 10px; border-bottom: 1px solid var(--border); font-size: 6px; }
+  .ra-elevation .u-num { width: 14px; text-align: center; color: var(--text-faint); border-right: 1px solid var(--border);
+    height: 100%; display: flex; align-items: center; justify-content: center; }
+  .ra-elevation .u-slot { flex: 1; padding: 0 4px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .ra-elevation .u-slot.filled { font-weight: 600; }
+  .ra-elevation .u-slot.empty { color: var(--text-faint); }
+  table.ra-table { width: 100%; border-collapse: collapse; font-size: 12px; table-layout: fixed; }
+  table.ra-table th, table.ra-table td { padding: 8px 5px; border-bottom: 1px solid var(--border); text-align: left;
+    vertical-align: top; white-space: normal; overflow-wrap: break-word; overflow: hidden; }
+  table.ra-table th { font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.02em; color: var(--text-faint);
+    border-bottom: 1.5px solid var(--border-bright); font-weight: 700; vertical-align: bottom; }
   table.ra-table td.notes-col { height: 40px; }
   table.ra-table td.chk { text-align: center; }
   table.ra-table .box { display: inline-block; width: 13px; height: 13px; border: 1.25px solid var(--text-dim); border-radius: 2px; }
@@ -6424,10 +6436,14 @@ RACK_AUDIT_ELEVATION_CSS = """
     /* @page sizing and the dark-on-white text override are handled once,
        globally, in DASHBOARD_BASE_CSS - every printable page shares them. */
     .ra-sheet { border: none; box-shadow: none; padding: 0; max-width: none; }
-    /* The printout should be just the rack name and the device table -
-       the on-screen assignment/target context card isn't part of the
-       printed sheet. */
+    /* The printout should be the rack name, elevation, and the device
+       table - the on-screen assignment/target context card isn't part of
+       the printed sheet. */
     .ra-context-panel { display: none !important; }
+    /* The elevation is print-only - hidden everywhere else above, shown
+       here. Keep it from breaking mid-rack across a page boundary. */
+    .ra-elevation-row { display: flex; page-break-inside: avoid; break-inside: avoid; }
+    .ra-elevation { page-break-inside: avoid; break-inside: avoid; }
     table.ra-table td.notes-col { height: 46px; }
   }
 """
@@ -6444,6 +6460,31 @@ def _humanize_asset_type(type_id):
         return ""
     words = re.sub(r"(?<!^)(?=[A-Z])", " ", type_id).split()
     return " ".join(w.upper() if w.upper() in _RACK_AUDIT_TYPE_ACRONYMS else w.capitalize() for w in words)
+
+
+def _rack_audit_elevation_html(assets, side, total_u=None):
+    """Always draws the rack's full physical height (U1 through its real
+    provided-rack-units capacity), not just the span between the highest
+    and lowest occupied slot - an audit sheet should show the whole rack,
+    empty space included, not a cropped view of only what's mounted.
+    Falls back to the occupied range if Hyperview has no recorded height
+    for this rack at all. Print-only - see .ra-elevation-row's CSS."""
+    rows = [a for a in assets if (a.get("side") or "").lower() == side and a.get("u_location") is not None]
+    by_u = {a["u_location"]: a for a in rows}
+    if total_u:
+        lo, hi = 1, total_u
+    elif by_u:
+        lo, hi = min(by_u), max(by_u)
+    else:
+        return '<div class="ra-elevation"><div class="u-row"><div class="u-slot empty" style="text-align:center; flex:1;">&mdash; none &mdash;</div></div></div>'
+    html = ['<div class="ra-elevation">']
+    for u in range(hi, lo - 1, -1):
+        a = by_u.get(u)
+        cls = "filled" if a else "empty"
+        label = _esc(a["name"]) if a else "&mdash;"
+        html.append(f'<div class="u-row"><div class="u-num">{u}</div><div class="u-slot {cls}">{label}</div></div>')
+    html.append("</div>")
+    return "".join(html)
 
 
 def _rack_audit_pdf_filename(rack_name, username):
@@ -6538,11 +6579,15 @@ def rack_audit_page(username):
 
     <div class="ra-sheet">
       <h2 class="ra-sheet-title">{_esc(rack["name"] or rack["id"])}</h2>
+      <div class="ra-elevation-row">
+        <div class="ra-elevation-col"><div class="ev-label">Front</div>{_rack_audit_elevation_html(assets, "front", rack.get("total_u"))}</div>
+        <div class="ra-elevation-col"><div class="ev-label">Rear</div>{_rack_audit_elevation_html(assets, "rear", rack.get("total_u"))}</div>
+      </div>
       <table class="ra-table">
         <colgroup>
-          <col style="width:3%"><col style="width:5%"><col style="width:12%"><col style="width:9%">
-          <col style="width:8%"><col style="width:9%"><col style="width:10%"><col style="width:10%">
-          <col style="width:5%"><col style="width:5%"><col style="width:5%"><col style="width:19%">
+          <col style="width:3%"><col style="width:7%"><col style="width:12%"><col style="width:9%">
+          <col style="width:8%"><col style="width:9%"><col style="width:9%"><col style="width:10%">
+          <col style="width:6%"><col style="width:6%"><col style="width:6%"><col style="width:15%">
         </colgroup>
         <thead><tr>
           <th>U</th><th>Side</th><th>Device</th><th>Type</th><th>Make</th><th>Model</th><th>Serial</th><th>Power</th>
