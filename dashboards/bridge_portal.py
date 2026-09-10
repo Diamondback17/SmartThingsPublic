@@ -4860,17 +4860,20 @@ HYPERVIEW_COMPONENT_CSS = """
     border: 1px solid var(--danger); color: var(--danger-dark); border-radius: 8px; padding: 9px 18px;
     font-size: 14px; margin-bottom: 12px; }
   .board { display: grid; grid-template-columns: 1fr minmax(280px, 380px) 1fr; gap: 14px; align-items: start; margin-bottom: 14px; }
-  /* Ooma's own layout: Site Status, then System Health stacked on top of
-     Alarm Summary, then the active-alarms table filling the rest of the
-     row at full column height (via .board-viewport-wrap's own
-     viewport-fit sizing below). Site Status gets the widest fixed column
-     of the three - facility names here are long ("Morristown-Hamblen
-     Healthcare System") and force-wrapped (.site-cell's white-space:
-     nowrap), so the other two columns (Connectivity/Battery) need real
-     room too or their headers clip. */
-  .board-viewport-wrap.ooma-split { display: grid;
+  /* Shared by Ooma and Hyperview: the location/status panel(s) stack in
+     column 1, System Health stacked on top of Alarm Summary in column 2,
+     and the active-alarms table fills the rest of the row at full column
+     height (via .board-viewport-wrap's own viewport-fit sizing below) -
+     instead of being squeezed into a short strip below a tall top row,
+     which is what was clipping it off before. Column 1 gets the widest
+     fixed width of the three - facility/site names here are long
+     ("Morristown-Hamblen Healthcare System") and force-wrapped
+     (.site-cell's white-space: nowrap), so column 2 needs real room too
+     or its own headers clip. */
+  .board-viewport-wrap.alarms-right-split { display: grid;
     grid-template-columns: minmax(380px, 460px) minmax(260px, 340px) 1fr; gap: 14px; align-items: stretch; }
-  .board-viewport-wrap.ooma-split .board-fill-panel { min-height: 0; margin-bottom: 0; }
+  .board-viewport-wrap.alarms-right-split .board-fill-panel { min-height: 0; margin-bottom: 0; }
+  .board-viewport-wrap.alarms-right-split .stacked-col { display: flex; flex-direction: column; gap: 14px; }
 
   /* iPRO/Ooma/Hyperview's own dashboards: the whole board plus its
      trailing alarm/device-detail panel is sized to the viewport instead
@@ -4893,7 +4896,7 @@ HYPERVIEW_COMPONENT_CSS = """
     .board-viewport-wrap { height: auto; min-height: 0; }
     .board-viewport-wrap > .board-fill-panel { flex: none; }
     .board-fill-panel .matrix-wrap { overflow-y: visible; }
-    .board-viewport-wrap.ooma-split { display: flex !important; flex-direction: column; }
+    .board-viewport-wrap.alarms-right-split { display: flex !important; flex-direction: column; }
   }
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius, 10px);
     box-shadow: var(--shadow-sm, 0 1px 3px rgba(0,0,0,0.04)); overflow: hidden; margin-bottom: 14px;
@@ -5360,7 +5363,7 @@ def _ooma_board_html(data):
     affected = sum(1 for a in data["accounts"] if a.get("site"))
     gauge_detail = f"{total_open} open issue(s) &middot; {affected} of {len(data['accounts'])} sites affected"
     return f"""
-    <div class="board-viewport-wrap ooma-split">
+    <div class="board-viewport-wrap alarms-right-split">
       {_ooma_matrix_html(data["accounts"])}
       <div class="center-col">
         {_gauge_html(data["gauge"]["state"], data["gauge"]["tone"], gauge_detail)}
@@ -7364,16 +7367,27 @@ def _hyperview_board_html():
       {_bridge_unreachable_html("Hyperview", HYPERVIEW_BASE_URL)}
     </div>
     <div id="hv-content">
-    <div class="board-viewport-wrap">
-    <div class="board">
-      <div class="panel">
-        <div class="panel-head"><h2>Datacenters / Hospitals</h2><span class="count-note" id="hosp-note"></span></div>
-        <div class="matrix-wrap">
-          <table class="matrix">
-            <thead><tr><th>Site</th><th title="Power">&#9889;</th><th title="Cooling">&#10052;</th>
-              <th title="Server">&#128421;</th><th title="Network">&#127760;</th></tr></thead>
-            <tbody id="hospitals-body"></tbody>
-          </table>
+    <div class="board-viewport-wrap alarms-right-split">
+      <div class="stacked-col">
+        <div class="panel">
+          <div class="panel-head"><h2>Datacenters / Hospitals</h2><span class="count-note" id="hosp-note"></span></div>
+          <div class="matrix-wrap">
+            <table class="matrix">
+              <thead><tr><th>Site</th><th title="Power">&#9889;</th><th title="Cooling">&#10052;</th>
+                <th title="Server">&#128421;</th><th title="Network">&#127760;</th></tr></thead>
+              <tbody id="hospitals-body"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>Primary Care / Clinics</h2><span class="count-note" id="clinic-note"></span></div>
+          <div class="matrix-wrap">
+            <table class="matrix">
+              <thead><tr><th>Site</th><th title="Power">&#9889;</th><th title="Cooling">&#10052;</th>
+                <th title="Server">&#128421;</th><th title="Network">&#127760;</th></tr></thead>
+              <tbody id="clinics-body"></tbody>
+            </table>
+          </div>
         </div>
       </div>
       <div class="center-col">
@@ -7392,26 +7406,15 @@ def _hyperview_board_html():
           <div class="updated-note">Last Updated: <span id="hv-last-updated">&mdash;</span></div>
         </div>
       </div>
-      <div class="panel">
-        <div class="panel-head"><h2>Primary Care / Clinics</h2><span class="count-note" id="clinic-note"></span></div>
+      <div class="panel board-fill-panel">
+        <div class="panel-head"><h2>Active Alarms</h2><span class="count-note" id="alarm-note"></span></div>
         <div class="matrix-wrap">
-          <table class="matrix">
-            <thead><tr><th>Site</th><th title="Power">&#9889;</th><th title="Cooling">&#10052;</th>
-              <th title="Server">&#128421;</th><th title="Network">&#127760;</th></tr></thead>
-            <tbody id="clinics-body"></tbody>
+          <table class="alarmlog">
+            <thead><tr><th>Location</th><th>Device</th><th>Severity</th><th>Alarm</th></tr></thead>
+            <tbody id="alarmlog-body"></tbody>
           </table>
         </div>
       </div>
-    </div>
-    <div class="panel board-fill-panel">
-      <div class="panel-head"><h2>Active Alarms</h2><span class="count-note" id="alarm-note"></span></div>
-      <div class="matrix-wrap">
-        <table class="alarmlog">
-          <thead><tr><th>Location</th><th>Device</th><th>Severity</th><th>Alarm</th></tr></thead>
-          <tbody id="alarmlog-body"></tbody>
-        </table>
-      </div>
-    </div>
     </div>
     </div>
     """
