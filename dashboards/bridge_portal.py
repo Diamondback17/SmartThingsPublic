@@ -6423,7 +6423,7 @@ def rack_audit_page(username):
     <div class="ra-sheet">
       <div class="ra-sheet-head">
         <h1>Rack Audit Sheet</h1>
-        <div style="font-size:11.5px; color:var(--text-faint);">Generated {_esc(datetime.now().strftime("%b %-d, %Y &middot; %-I:%M %p"))}</div>
+        <div style="font-size:11.5px; color:var(--text-faint);">Generated {_esc(datetime.now().strftime("%b %-d, %Y"))} &middot; {_esc(datetime.now().strftime("%-I:%M %p"))}</div>
       </div>
       <div class="ra-id-grid">
         <div><div class="f-lbl">Site</div><div class="f-val">{_esc(rack.get("site_path") or rack["site"])}</div></div>
