@@ -4978,6 +4978,12 @@ DASHBOARD_EXTRA_CSS = """
   .stat-tile .stat-lbl { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-faint); }
   .stat-tile .stat-num { font-size: 20px; font-weight: 700; }
   .stat-tile.unhealthy .stat-num { color: var(--danger); }
+  /* iPRO's stat tiles sitting under Alarm Summary in alarms-right-split's
+     narrow column 2 - smaller padding/label/number so "Total Cameras" /
+     "Unhealthy Cameras" don't feel cramped at that width. */
+  .stat-row-compact .stat-tile { padding: 6px 6px; }
+  .stat-row-compact .stat-tile .stat-lbl { font-size: 10px; }
+  .stat-row-compact .stat-tile .stat-num { font-size: 17px; }
   .updated-note { padding: 5px 18px 8px; font-size: 12px; color: var(--text-faint); text-align: center; }
   td.status-cell { font-weight: 700; color: var(--danger); }
   td.priority-cell.critical { color: var(--danger); font-weight: 700; }
@@ -5294,33 +5300,29 @@ def _ipro_board_html(data):
     total_open = sum(r["open"] for r in data["summary"])
     gauge_detail = (f"{total_open} open issue(s) &middot; {data['totals']['unhealthyCameras']} of "
                      f"{data['totals']['totalCameras']} cameras unhealthy")
+    sites = data["hospitals"] + data["clinics"]
     return f"""
-    <div class="board-viewport-wrap">
-    <div class="board">
-      {_ipro_matrix_html("Datacenters / Hospitals", data["hospitals"])}
+    <div class="board-viewport-wrap alarms-right-split">
+      {_ipro_matrix_html("Site Status", sites)}
       <div class="center-col">
         {_gauge_html(_health_state_label(data["gauge"]["score"]), data["gauge"]["tone"], gauge_detail)}
         {_summary_table_html(data["summary"], data["last_updated"])}
-      </div>
-      <div class="center-col">
-        {_ipro_matrix_html("Primary Care / Clinics", data["clinics"])}
         <div class="panel">
-          <div class="stat-row">
+          <div class="stat-row stat-row-compact">
             <div class="stat-tile"><div class="stat-lbl">Total Cameras</div><div class="stat-num">{data['totals']['totalCameras']}</div></div>
             <div class="stat-tile unhealthy"><div class="stat-lbl">Unhealthy Cameras</div><div class="stat-num">{data['totals']['unhealthyCameras']}</div></div>
           </div>
         </div>
       </div>
-    </div>
-    <div class="panel board-fill-panel">
-      <div class="panel-head"><h2>Device Detail</h2><span class="count-note">{data['totals']['unhealthyCameras']} unhealthy device(s)</span></div>
-      <div class="matrix-wrap">
-        <table class="alarmlog">
-          <thead><tr><th>Location</th><th>Device</th><th>Status</th><th>Detail</th><th>Duration</th><th>Priority</th></tr></thead>
-          <tbody>{device_rows or '<tr><td colspan="6" class="empty">No open camera issues.</td></tr>'}</tbody>
-        </table>
+      <div class="panel board-fill-panel">
+        <div class="panel-head"><h2>Device Detail</h2><span class="count-note">{data['totals']['unhealthyCameras']} unhealthy device(s)</span></div>
+        <div class="matrix-wrap">
+          <table class="alarmlog">
+            <thead><tr><th>Location</th><th>Device</th><th>Status</th><th>Detail</th><th>Duration</th><th>Priority</th></tr></thead>
+            <tbody>{device_rows or '<tr><td colspan="6" class="empty">No open camera issues.</td></tr>'}</tbody>
+          </table>
+        </div>
       </div>
-    </div>
     </div>"""
 
 
