@@ -1945,15 +1945,13 @@ PAGE_SHELL = """<!DOCTYPE html>
   </div>
   <div class="nav-secondary">
     {search_box}
+    {operations_menu}
     <details class="nav-dropdown {tools_has_active}">
       <summary>Tools</summary>
       <div class="nav-dropdown-menu">
-        {handoff_nav}
         {acknowledge_nav}
         {events_nav}
         {trends_nav}
-        {runbook_nav}
-        {rack_audit_nav}
       </div>
     </details>
     {admin_menu}
@@ -2210,6 +2208,20 @@ def render_shell(title, body, active, username=""):
         cls = "active" if active == active_flag else ""
         return f'<a href="{href}" class="{cls}">{label}{badge}</a>'
 
+    operations_menu = ""
+    if is_admin or has_operations:
+        operations_has_active = "nav-has-active" if active in ("handoff", "runbook-view", "rack-audit") else ""
+        rack_audit_nav = nav_link("/tools/rack-audit", "rack-audit", "Rack Audit") if "hyperview" in allowed else ""
+        operations_menu = f"""
+        <details class="nav-dropdown {operations_has_active}">
+          <summary>Operations</summary>
+          <div class="nav-dropdown-menu">
+            {nav_link("/handoff", "handoff", "Handoff")}
+            {nav_link("/hyperview/runbook", "runbook-view", "Runbook")}
+            {rack_audit_nav}
+          </div>
+        </details>"""
+
     admin_menu = ""
     if is_admin:
         admin_has_active = "nav-has-active" if active in ("admin-access", "admin-config", "admin-log", "admin-activity", "admin-leadership", "admin-runbook-manage", "admin-rack-audit-scope") else ""
@@ -2228,17 +2240,14 @@ def render_shell(title, body, active, username=""):
         </details>"""
 
     return PAGE_SHELL.format(
-        title=title, body=body, username=_esc(username), admin_menu=admin_menu,
+        title=title, body=body, username=_esc(username), admin_menu=admin_menu, operations_menu=operations_menu,
         pending_handoff_banner=_pending_handoff_banner_html(username) if username else "",
         logo_b64=COVENANT_LOGO_PNG_B64, favicon_b64=FAVICON_PNG_B64, theme_attr=theme_attr,
         overview_active="active" if active == "overview" else "",
-        tools_has_active="nav-has-active" if active in ("handoff", "acknowledge", "events", "trends", "runbook-view", "rack-audit") else "",
-        handoff_nav=nav_link("/handoff", "handoff", "Handoff") if (is_admin or has_operations) else "",
+        tools_has_active="nav-has-active" if active in ("acknowledge", "events", "trends") else "",
         acknowledge_nav=_acknowledge_nav_html(active, has_full_control_system),
         events_nav=nav_link("/events-search", "events", "Event search") if has_full_control_system else "",
         trends_nav=nav_link("/trends", "trends", "Trends") if full_allowed else "",
-        runbook_nav=nav_link("/hyperview/runbook", "runbook-view", "Runbook") if (is_admin or has_operations) else "",
-        rack_audit_nav=nav_link("/tools/rack-audit", "rack-audit", "Rack Audit") if "hyperview" in allowed else "",
         search_box=('<form class="nav-search" action="/search" method="GET">'
                      '<input type="text" name="q" id="nav-search-input" placeholder="Search... ( / )" autocomplete="off"></form>') if allowed else "",
         hyperview_nav=nav_link("/hyperview", "hyperview", "Hyperview", _nav_badge_html("hyperview")) if "hyperview" in allowed else "",
