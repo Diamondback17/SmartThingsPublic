@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 from flask import Flask, jsonify, request
@@ -437,7 +437,11 @@ def is_acknowledged(alarm):
 # (unlike Hyperview's own built-in asset properties) has no stable
 # cross-tenant identifier this service can hardcode.
 RACK_AUDIT_DATE_FIELD_NAME = os.environ.get("HYPERVIEW_AUDIT_DATE_FIELD_NAME", "Last Audit Date")
+RACK_AUDIT_FREQUENCY_FIELD_NAME = os.environ.get("HYPERVIEW_AUDIT_FREQUENCY_FIELD_NAME", "Audit Frequency")
 RACK_AUDIT_CACHE_SECONDS = int(os.environ.get("RACK_AUDIT_CACHE_SECONDS", "3600"))
+
+# How many days a rack's stated frequency allows between audits.
+RACK_AUDIT_FREQUENCY_DAYS = {"annually": 365, "biennially": 730}
 
 rack_audit_cache = None
 rack_audit_cache_time = 0
@@ -494,6 +498,45 @@ def get_audit_date_property(asset_id):
     return None
 
 
+def get_audit_frequency_property(asset_id):
+    """The 'Audit Frequency' custom property record for one asset (its
+    value is "Annually" or "Biennially"), or None if the asset has no such
+    property configured."""
+    props = _unwrap_list(hv_get(f"asset/customAssetProperties/{asset_id}"))
+    for p in props:
+        if p.get("name") == RACK_AUDIT_FREQUENCY_FIELD_NAME:
+            return p
+    return None
+
+
+def rack_audit_compliance(last_audit, frequency):
+    """How out of compliance a rack is, from its 'Last Audit Date' and
+    'Audit Frequency' custom properties. Returns a dict with a status
+    ("never_audited" / "overdue" / "due_soon" / "current" / "unknown") and,
+    where computable, days_overdue (negative once "due soon" turns
+    positive-in-the-future would be misleading, so this is only set once a
+    rack is actually overdue) and a due date. "unknown" covers a frequency
+    Hyperview holds that isn't one of the two values this tenant uses."""
+    if not last_audit:
+        return {"status": "never_audited", "due": None, "days_overdue": None}
+    freq_days = RACK_AUDIT_FREQUENCY_DAYS.get((frequency or "").strip().lower())
+    if freq_days is None:
+        return {"status": "unknown", "due": None, "days_overdue": None}
+    try:
+        audited = datetime.fromisoformat(last_audit.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return {"status": "unknown", "due": None, "days_overdue": None}
+    if audited.tzinfo is None:
+        audited = audited.replace(tzinfo=timezone.utc)
+    due = audited + timedelta(days=freq_days)
+    now = datetime.now(timezone.utc)
+    if now > due:
+        return {"status": "overdue", "due": due, "days_overdue": (now - due).days}
+    if now > due - timedelta(days=30):
+        return {"status": "due_soon", "due": due, "days_overdue": None}
+    return {"status": "current", "due": due, "days_overdue": None}
+
+
 def set_audit_date_now(asset_id):
     """Stamps this asset's 'Last Audit Date' custom property to now.
     Returns False (no-op) if the asset has no such property - nothing to
@@ -542,12 +585,21 @@ def get_rack_audit_cache():
         except requests.exceptions.RequestException:
             logger.exception("rack audit: could not read custom properties for rack %s", rack_id)
             audit_prop = None
+        try:
+            frequency_prop = get_audit_frequency_property(rack_id)
+        except requests.exceptions.RequestException:
+            logger.exception("rack audit: could not read audit frequency for rack %s", rack_id)
+            frequency_prop = None
+        last_audit = audit_prop["value"] if audit_prop else None
+        audit_frequency = frequency_prop["value"] if frequency_prop else None
         entries.append({
             "id": rack_id,
             "name": rack.get("name"),
             "site": _rack_site_name(rack),
             "site_path": _rack_site_path(rack),
-            "last_audit": audit_prop["value"] if audit_prop else None,
+            "last_audit": last_audit,
+            "audit_frequency": audit_frequency,
+            "compliance": rack_audit_compliance(last_audit, audit_frequency),
             # Total rack height in U - the elevation always shows every U
             # slot the rack actually has, not just the range that happens
             # to be occupied. None if Hyperview has no dimension on record
@@ -1147,6 +1199,27 @@ def rack_audit_next():
     if rack is None:
         return jsonify({"error": "No eligible rack with any mounted assets was found"}), 404
     return jsonify({"rack": rack, "assets": contained})
+
+
+@app.route("/rack-audit/compliance")
+def rack_audit_compliance_list():
+    """Every rack with its site, last audit date, audit frequency, and
+    computed compliance status - the data set behind the Rack Audit
+    Management page's compliance table. Unlike /rack-audit/next this
+    doesn't walk/stamp anything, it's a read-only report."""
+    try:
+        racks = get_rack_audit_cache()
+    except requests.exceptions.RequestException as e:
+        return jsonify({"error": f"Could not reach Hyperview: {e}"}), 502
+    out = []
+    for r in racks:
+        entry = dict(r)
+        compliance = dict(entry.get("compliance") or {})
+        if compliance.get("due") is not None:
+            compliance["due"] = compliance["due"].isoformat()
+        entry["compliance"] = compliance
+        out.append(entry)
+    return jsonify({"racks": out})
 
 
 @app.route("/rack-audit/complete/<rack_id>", methods=["POST"])

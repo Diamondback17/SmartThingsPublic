@@ -1818,7 +1818,7 @@ PAGE_SHELL = """<!DOCTYPE html>
       --danger: #8c0026; --danger-dark: #8c0026; --danger-tint: #faeaee;
       --warn: #7a4c08; --ok: #0e5536;
     }}
-    header.brand, nav.top, .print-btn, .site-footer {{ display: none !important; }}
+    header.brand, nav.top, .print-btn, .site-footer, .ack-panel, .ack-panel-backdrop {{ display: none !important; }}
     body {{ padding: 0; }}
     .wrap {{ padding-top: 0; max-width: none; width: 100%; }}
   }}
@@ -2222,7 +2222,7 @@ def render_shell(title, body, active, username=""):
             <a href="/admin/log" class="{'active' if active == 'admin-log' else ''}">Acknowledge Log (all systems)</a>
             <a href="/admin/activity" class="{'active' if active == 'admin-activity' else ''}">User Activity</a>
             <a href="/hyperview/runbook/manage" class="{'active' if active == 'admin-runbook-manage' else ''}">Runbook Management</a>
-            <a href="/admin/rack-audit-scope" class="{'active' if active == 'admin-rack-audit-scope' else ''}">Rack Audit - Shift Scope</a>
+            <a href="/admin/rack-audit-scope" class="{'active' if active == 'admin-rack-audit-scope' else ''}">Rack Audit Management</a>
             <a href="/admin/config" class="{'active' if active == 'admin-config' else ''}">System Config</a>
           </div>
         </details>"""
@@ -3312,6 +3312,43 @@ def _hyperview_set_ack_state(alarm_event_id, acknowledged):
 
 
 RACK_AUDIT_REQUEST_TIMEOUT = REQUEST_TIMEOUT + 45  # walks every eligible rack server-side - can run long
+
+
+def _rack_audit_compliance_list():
+    """Every rack's site/last-audit/audit-frequency/compliance status, for
+    the Rack Audit Management page's compliance report. (racks, error) -
+    racks is [] on error."""
+    try:
+        resp = requests.get(f"{HYPERVIEW_BASE_URL}/rack-audit/compliance", timeout=RACK_AUDIT_REQUEST_TIMEOUT)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        return [], f"Could not reach Hyperview: {e}"
+    return resp.json().get("racks", []), None
+
+
+_RACK_AUDIT_STATUS_SEVERITY = {"never_audited": 0, "overdue": 1, "due_soon": 2, "current": 3, "unknown": 4}
+
+
+def _rack_audit_compliance_badge_html(compliance):
+    status = (compliance or {}).get("status", "unknown")
+    if status == "never_audited":
+        return '<span class="msg err" style="display:inline-flex; padding:3px 10px; margin:0; font-size:11.5px;">Never audited</span>'
+    if status == "overdue":
+        days = compliance.get("days_overdue")
+        label = f"Overdue by {days} day{'s' if days != 1 else ''}" if days is not None else "Overdue"
+        return f'<span class="msg err" style="display:inline-flex; padding:3px 10px; margin:0; font-size:11.5px;">{_esc(label)}</span>'
+    if status == "due_soon":
+        return '<span class="msg warn" style="display:inline-flex; padding:3px 10px; margin:0; font-size:11.5px;">Due soon</span>'
+    if status == "current":
+        return '<span class="msg ok" style="display:inline-flex; padding:3px 10px; margin:0; font-size:11.5px;">Current</span>'
+    return '<span style="color:var(--text-faint); font-size:11.5px;">No frequency set</span>'
+
+
+def _rack_audit_compliance_sort_key(rack):
+    compliance = rack.get("compliance") or {}
+    severity = _RACK_AUDIT_STATUS_SEVERITY.get(compliance.get("status"), 5)
+    days_overdue = compliance.get("days_overdue") or 0
+    return (severity, -days_overdue, (rack.get("site") or ""), (rack.get("name") or ""))
 
 
 def _rack_audit_next(sites):
@@ -6383,6 +6420,17 @@ def _rack_audit_elevation_html(assets, side, total_u=None):
     return "".join(html)
 
 
+def _rack_audit_pdf_filename(rack_name, username):
+    """RACKNAME-MMDDYY-username-rackaudit, e.g. AI112-091026-wsharp2-rackaudit
+    - the suggested filename when the sheet is saved as a PDF. Strips
+    characters a filesystem would choke on rather than assuming the rack
+    name is already filename-safe."""
+    safe_rack = re.sub(r"[^A-Za-z0-9._-]+", "-", rack_name or "rack").strip("-") or "rack"
+    safe_user = re.sub(r"[^A-Za-z0-9._-]+", "-", username or "auditor").strip("-") or "auditor"
+    date_part = datetime.now().strftime("%m%d%y")
+    return f"{safe_rack}-{date_part}-{safe_user}-rackaudit"
+
+
 @app.route("/tools/rack-audit")
 @require_login
 def rack_audit_page(username):
@@ -6405,6 +6453,7 @@ def rack_audit_page(username):
         return Response(render_shell("Rack Audit", body, "rack-audit", username), mimetype="text/html")
 
     rack, assets = result
+    pdf_filename_js = json.dumps(_rack_audit_pdf_filename(rack["name"] or rack["id"], username))
     asset_rows = "".join(
         f'<tr><td>{a["u_location"] if a.get("u_location") is not None else "&mdash;"}</td>'
         f'<td>{_esc((a.get("side") or "").capitalize() or "&mdash;")}</td>'
@@ -6421,7 +6470,11 @@ def rack_audit_page(username):
         <h1>Rack Audit</h1>
         <p class="sub">Automatically targeted &mdash; there's nothing to search or pick.</p>
       </div>
-      <button class="ghost print-btn" onclick="window.print()" type="button">Generate (Print / Save as PDF)</button>
+      <button class="ghost print-btn" type="button" onclick="
+        var t=document.title; document.title={pdf_filename_js};
+        var restore=function(){{ document.title=t; window.removeEventListener('afterprint',restore); }};
+        window.addEventListener('afterprint',restore); window.print();
+      ">Generate (Print / Save as PDF)</button>
     </div>
     <style>{DASHBOARD_BASE_CSS}{RACK_AUDIT_ELEVATION_CSS}</style>
     {_msg_html()}
@@ -10859,13 +10912,40 @@ def admin_rack_audit_scope_page(username):
         </tr>"""
         for dn, sites in sorted(scope.items())
     )
+
+    racks, compliance_error = _rack_audit_compliance_list()
+    if compliance_error:
+        compliance_html = f'<div class="msg err">{_esc(compliance_error)}</div>'
+    else:
+        racks = sorted(racks, key=_rack_audit_compliance_sort_key)
+        compliance_rows = "".join(
+            f"""<tr>
+              <td>{_esc(r.get("site_path") or r.get("site") or "Unknown")}</td>
+              <td>{_esc(r.get("name") or r.get("id"))}</td>
+              <td>{_esc(r.get("audit_frequency") or "&mdash;")}</td>
+              <td>{_rack_audit_last_audit_html(r.get("last_audit"))}</td>
+              <td>{_rack_audit_compliance_badge_html(r.get("compliance"))}</td>
+            </tr>"""
+            for r in racks
+        )
+        compliance_html = f"""
+        <div class="table-scroll"><table><tr><th>Site</th><th>Rack</th><th>Audit Frequency</th><th>Last Audited</th><th>Compliance</th></tr>
+          {compliance_rows or '<tr><td colspan="5" class="empty">No racks found.</td></tr>'}
+        </table></div>"""
+
     body = f"""
-    <div class="page-header"><div><h1>Rack Audit - Shift Scope</h1>
-      <p class="sub">Which sites each AD group's members are responsible for auditing. A group not listed here
-      isn't restricted - its members see every site as eligible (the 1st-shift catch-all).</p></div></div>
+    <div class="page-header"><div><h1>Rack Audit Management</h1>
+      <p class="sub">Shift scope, plus every rack's compliance against its "Audit Frequency" custom property
+      (Annually/Biennially) measured from its last audit date.</p></div></div>
     {_msg_html()}
     <div class="card">
+      <h3>Compliance</h3>
+      {compliance_html}
+    </div>
+    <div class="card">
       <h3>AD group &rarr; sites</h3>
+      <p class="sub" style="margin-top:-4px;">Which sites each AD group's members are responsible for auditing. A group not listed here
+      isn't restricted - its members see every site as eligible (the 1st-shift catch-all).</p>
       <table><tr><th>Group DN</th><th>Sites</th><th></th></tr>
         {rows_html or '<tr><td colspan="3" class="empty">No groups scoped yet - everyone sees every site.</td></tr>'}
       </table>
@@ -10879,7 +10959,7 @@ def admin_rack_audit_scope_page(username):
       </form>
     </div>
     """
-    return Response(render_shell("Rack Audit - Shift Scope", body, "admin-rack-audit-scope", username), mimetype="text/html")
+    return Response(render_shell("Rack Audit Management", body, "admin-rack-audit-scope", username), mimetype="text/html")
 
 
 @app.route("/admin/rack-audit-scope", methods=["POST"])
