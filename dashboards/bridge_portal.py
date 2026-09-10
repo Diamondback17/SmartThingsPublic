@@ -1836,6 +1836,7 @@ PAGE_SHELL = """<!DOCTYPE html>
 
   .page-header {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }}
   .page-header .page-action {{ margin-top: 2px; flex-shrink: 0; white-space: nowrap; }}
+  .dashboard-clock {{ font-size: 22px; font-weight: 700; color: var(--text-dim); font-variant-numeric: tabular-nums; flex-shrink: 0; }}
   .handoff-timestamp {{ font-size: 11px; color: var(--text-faint); margin-top: 6px; }}
   a.ghost.page-action {{
     display: inline-block; border: 1.5px solid var(--border-bright); border-radius: 7px;
@@ -5402,18 +5403,31 @@ def _bridge_unreachable_html(label, base_url):
     </div>"""
 
 
-def _dashboard_page_header_html(title, videowall_href, extra_action_html=""):
+DASHBOARD_HEADER_CLOCK_SCRIPT = """<script>
+(function () {
+  function tickClock() {
+    var el = document.getElementById('dashboard-clock');
+    if (el) el.textContent = new Date().toLocaleTimeString([], { hour12: false });
+  }
+  tickClock();
+  setInterval(tickClock, 1000);
+})();
+</script>"""
+
+
+def _dashboard_page_header_html(title, extra_action_html="", subtitle=""):
     return f"""
     <div class="page-header">
       <div>
         <h1>{_esc(title)}</h1>
+        {f'<p class="sub">{_esc(subtitle)}</p>' if subtitle else ''}
       </div>
-      <div style="display:flex; gap:8px;">
+      <div style="display:flex; align-items:center; gap:16px;">
         {extra_action_html}
-        <a class="ghost page-action" href="{videowall_href}" target="_blank" rel="noopener"
-           title="No login required, for a wall display - opens in a new tab">Videowall view &rarr;</a>
+        <div class="dashboard-clock" id="dashboard-clock">--:--:--</div>
       </div>
-    </div>"""
+    </div>
+    {DASHBOARD_HEADER_CLOCK_SCRIPT}"""
 
 
 DASHBOARD_AUTO_REFRESH_SCRIPT = """<script>
@@ -5450,7 +5464,7 @@ def ipro_page(username):
     board = _ipro_board_html(data) if data else _bridge_unreachable_html("iPRO Cameras", SYSTEMS["ipro"]["base_url"])
     alert_script = _critical_alert_script(*_alert_state_from_summary(data)) if data else ""
     body = f"""
-    {_dashboard_page_header_html("iPRO Cameras", "/ipro/videowall")}
+    {_dashboard_page_header_html("iPRO Cameras")}
     <style>{DASHBOARD_BASE_CSS}</style>
     {board}
     {DASHBOARD_AUTO_REFRESH_SCRIPT}
@@ -5469,7 +5483,7 @@ def ooma_page(username):
     board = _ooma_board_html(data) if data else _bridge_unreachable_html("Ooma AirDial", SYSTEMS["ooma"]["base_url"])
     alert_script = _critical_alert_script(*_alert_state_from_summary(data)) if data else ""
     body = f"""
-    {_dashboard_page_header_html("Ooma AirDial", "/ooma/videowall")}
+    {_dashboard_page_header_html("Ooma AirDial")}
     <style>{DASHBOARD_BASE_CSS}</style>
     {board}
     {DASHBOARD_AUTO_REFRESH_SCRIPT}
@@ -5935,7 +5949,7 @@ def overview_page(username):
     sorted_cards = sorted(cards, key=_status_card_sort_key)
     cards_html = "".join(_status_card_html(c) for c in sorted_cards)
 
-    icon_link_items = ["<a href=\"/videowall\">&#9635; Videowall</a>"]
+    icon_link_items = ["<a href=\"/videowall\">&#9635; Unified Videowall</a>"]
     if _is_admin(username) or _user_has_operations(username):
         icon_link_items = ["<a href=\"/handoff\">&#8644; Shift handoff</a>"] + icon_link_items
     if accessible_full_systems(username) or "downtime" in _user_full_systems(username):
@@ -7439,7 +7453,7 @@ def hyperview_page(username):
     if "hyperview" not in _user_systems(username):
         return _error_page(username, "Your account does not have access to Hyperview")
     body = f"""
-    {_dashboard_page_header_html("Hyperview", "/hyperview/videowall")}
+    {_dashboard_page_header_html("Hyperview")}
     <style>{DASHBOARD_BASE_CSS}</style>
     {_hyperview_board_html()}
     {HYPERVIEW_SCRIPT % {'auto_refresh_ms': 30000}}
@@ -9785,12 +9799,7 @@ def downtime_page(username):
     rows = _fetch_downtime_data()
     board = _bridge_unreachable_html("Downtime Workstations", DOWNTIME_FEED_URL) if rows is None else _downtime_board_html(rows)
     body = f"""
-    <div class="page-header">
-      <div>
-        <h1>Downtime Workstations</h1>
-        <p class="sub">Live reporting status for every downtime workstation.</p>
-      </div>
-    </div>
+    {_dashboard_page_header_html("Downtime Workstations", subtitle="Live reporting status for every downtime workstation.")}
     <style>{DOWNTIME_CSS}</style>
     {board}
     {DOWNTIME_DETAIL_MODAL_HTML}
@@ -10242,13 +10251,6 @@ DASHBOARD_VIDEOWALL_SHELL = """<!DOCTYPE html>
     .sev-dot {{ animation: videowall-pulse 2.4s ease-in-out infinite; }}
   }}
   @keyframes videowall-pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.45; }} }}
-  .videowall-rotate-badge {{
-    position: fixed; bottom: 18px; right: 22px; background: var(--panel);
-    border: 1px solid var(--border); border-radius: 999px; padding: 8px 16px;
-    font-size: 13px; color: var(--text-dim); box-shadow: var(--shadow-md);
-  }}
-  .videowall-rotate-badge a {{ color: var(--teal); text-decoration: none; margin-left: 6px; }}
-  .videowall-rotate-badge a:hover {{ text-decoration: underline; }}
   .videowall-mute-btn {{
     font-family: inherit; font-size: 13px; font-weight: 600; color: var(--text-dim);
     background: var(--panel); border: 1px solid var(--border); border-radius: 999px;
@@ -10388,61 +10390,12 @@ DASHBOARD_VIDEOWALL_SHELL = """<!DOCTYPE html>
       setTimeout(scheduleFit, 1500);
     }})();
   </script>
-  {rotate}
 </body>
 </html>"""
 
-VIDEOWALL_CYCLE = ["/hyperview/videowall", "/ipro/videowall", "/ooma/videowall", "/downtime/videowall"]
-VIDEOWALL_LABELS = {
-    "/hyperview/videowall": "Hyperview",
-    "/ipro/videowall": "iPRO Cameras",
-    "/ooma/videowall": "Ooma AirDial",
-    "/downtime/videowall": "Downtime Workstations",
-}
-VIDEOWALL_ROTATE_SECONDS = 30
-
-
-def _videowall_cycle_for(username):
-    allowed = _user_systems(username)
-    return [p for p in VIDEOWALL_CYCLE if p.split("/")[1] in allowed]
-
 
 def _videowall_exit_html():
-    if request.args.get("grid") == "1":
-        return ""
     return '<a href="/overview" class="videowall-exit-btn">&larr; Exit to Overview</a>'
-
-
-def _videowall_rotate_html(current_path, cycle):
-    if request.args.get("grid") == "1":
-        return ""
-    if len(cycle) < 2:
-        return ""
-    idx = cycle.index(current_path)
-    next_path = cycle[(idx + 1) % len(cycle)]
-    if request.args.get("rotate") != "1":
-        return (f'<div class="videowall-rotate-badge">'
-                 f'<a href="{current_path}?rotate=1">&#9654; Start rotating</a></div>')
-    next_url = f"{next_path}?rotate=1"
-    return f"""
-    <div class="videowall-rotate-badge">
-      <span id="videowall-rotate-countdown">{VIDEOWALL_ROTATE_SECONDS}</span>s &middot;
-      next: {_esc(VIDEOWALL_LABELS[next_path])}
-      &middot; <a href="{current_path}">Pause</a>
-    </div>
-    <script>
-      (function () {{
-        var remaining = {VIDEOWALL_ROTATE_SECONDS};
-        var el = document.getElementById('videowall-rotate-countdown');
-        var timer = setInterval(function () {{
-          remaining -= 1;
-          if (remaining <= 0) {{ clearInterval(timer); return; }}
-          if (el) el.textContent = remaining;
-        }}, 1000);
-        setTimeout(function () {{ location.href = {json.dumps(next_url)}; }}, {VIDEOWALL_ROTATE_SECONDS * 1000});
-      }})();
-    </script>
-    """
 
 
 VIDEOWALL_CLOCK_SCRIPT = """
@@ -10454,9 +10407,7 @@ VIDEOWALL_CLOCK_SCRIPT = """
   }
   tickClock();
   setInterval(tickClock, 1000);
-  if (!location.search.includes('rotate=1')) {
-    setTimeout(function () { location.reload(); }, 30000);
-  }
+  setTimeout(function () { location.reload(); }, 30000);
 
   // Keep an unattended, wall-mounted display from letting the screen sleep.
   // Wake locks are released whenever the tab goes hidden, so re-request one
@@ -10484,168 +10435,6 @@ def _videowall_critical_script(has_unacked, has_acked_only, tone="danger"):
         f"window.videowallCriticalCue({'true' if has_unacked else 'false'}, "
         f"{'true' if has_acked_only else 'false'}, {json.dumps(tone)});</script>"
     )
-
-
-@app.route("/hyperview/videowall")
-@require_login
-def hyperview_videowall(username):
-    if "hyperview" not in _user_systems(username):
-        return Response("Your account does not have access to Hyperview", 403)
-    path = "/hyperview/videowall"
-    return Response(
-        DASHBOARD_VIDEOWALL_SHELL.format(
-            title="Hyperview",
-            favicon_b64=FAVICON_PNG_B64,
-            component_css=HYPERVIEW_COMPONENT_CSS + DASHBOARD_EXTRA_CSS,
-            board=_hyperview_board_html(),
-            script=HYPERVIEW_SCRIPT % {'auto_refresh_ms': 30000},
-            rotate=_videowall_rotate_html(path, _videowall_cycle_for(username)),
-            exit_link=_videowall_exit_html(),
-        ),
-        mimetype="text/html",
-    )
-
-
-@app.route("/ipro/videowall")
-@require_login
-def ipro_videowall(username):
-    denied = _forbidden_or_unknown(username, "ipro")
-    if denied:
-        return denied
-    path = "/ipro/videowall"
-    data = _fetch_ipro_dashboard()
-    if data is None:
-        board = _bridge_unreachable_html("iPRO Cameras", SYSTEMS["ipro"]["base_url"])
-        has_unacked, has_acked_only, tone = False, False, "danger"
-    else:
-        board = _ipro_board_html(data)
-        has_unacked, has_acked_only, tone = _alert_state_from_summary(data)
-    return Response(
-        DASHBOARD_VIDEOWALL_SHELL.format(
-            title="iPRO Cameras",
-            favicon_b64=FAVICON_PNG_B64,
-            component_css=HYPERVIEW_COMPONENT_CSS + DASHBOARD_EXTRA_CSS,
-            board=board,
-            script=VIDEOWALL_CLOCK_SCRIPT + _videowall_critical_script(has_unacked, has_acked_only, tone),
-            rotate=_videowall_rotate_html(path, _videowall_cycle_for(username)),
-            exit_link=_videowall_exit_html(),
-        ),
-        mimetype="text/html",
-    )
-
-
-@app.route("/ooma/videowall")
-@require_login
-def ooma_videowall(username):
-    denied = _forbidden_or_unknown(username, "ooma")
-    if denied:
-        return denied
-    path = "/ooma/videowall"
-    data = _fetch_ooma_dashboard()
-    if data is None:
-        board = _bridge_unreachable_html("Ooma AirDial", SYSTEMS["ooma"]["base_url"])
-        has_unacked, has_acked_only, tone = False, False, "danger"
-    else:
-        board = _ooma_board_html(data)
-        has_unacked, has_acked_only, tone = _alert_state_from_summary(data)
-    return Response(
-        DASHBOARD_VIDEOWALL_SHELL.format(
-            title="Ooma AirDial",
-            favicon_b64=FAVICON_PNG_B64,
-            component_css=HYPERVIEW_COMPONENT_CSS + DASHBOARD_EXTRA_CSS,
-            board=board,
-            script=VIDEOWALL_CLOCK_SCRIPT + _videowall_critical_script(has_unacked, has_acked_only, tone),
-            rotate=_videowall_rotate_html(path, _videowall_cycle_for(username)),
-            exit_link=_videowall_exit_html(),
-        ),
-        mimetype="text/html",
-    )
-
-
-@app.route("/downtime/videowall")
-@require_login
-def downtime_videowall(username):
-    if "downtime" not in _user_systems(username):
-        return Response("Your account does not have access to Downtime Workstations", 403)
-    path = "/downtime/videowall"
-    rows = _fetch_downtime_data()
-    if rows is None:
-        board = _bridge_unreachable_html("Downtime Workstations", DOWNTIME_FEED_URL)
-        has_unacked, has_acked_only = False, False
-    else:
-        board = _downtime_board_html(rows)
-        has_unacked, has_acked_only = _downtime_alert_state(rows)
-    return Response(
-        DASHBOARD_VIDEOWALL_SHELL.format(
-            title="Downtime Workstations",
-            favicon_b64=FAVICON_PNG_B64,
-            component_css=DOWNTIME_CSS,
-            board=board,
-            script=(
-                VIDEOWALL_CLOCK_SCRIPT + _videowall_critical_script(has_unacked, has_acked_only, "danger")
-                + DOWNTIME_DETAIL_MODAL_HTML + DOWNTIME_SCRIPT
-            ),
-            rotate=_videowall_rotate_html(path, _videowall_cycle_for(username)),
-            exit_link=_videowall_exit_html(),
-        ),
-        mimetype="text/html",
-    )
-
-
-@app.route("/videowall")
-@require_login
-def videowall_menu(username):
-    my_cycle = _videowall_cycle_for(username)
-    if not my_cycle:
-        return Response("Your account has no systems assigned - nothing to show on the videowall.", 403)
-    items_html = "".join(
-        f'<a class="videowall-menu-item" href="{path}">{_esc(VIDEOWALL_LABELS[path])}</a>'
-        for path in my_cycle
-    )
-    return Response(f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link rel="icon" type="image/png" href="data:image/png;base64,{FAVICON_PNG_B64}">
-<title>Videowall</title>
-<style>
-  :root {{
-    --bg: #060b0d; --panel: #0e181b; --border: #223338;
-    --text: #f2f6f6; --text-dim: #a9bcbc; --teal: #6cb2ef; --teal-dark: #8fc0ef;
-  }}
-  * {{ box-sizing: border-box; }}
-
-  html {{ font-size: 107.5%; }}
-  body {{
-    margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
-    font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, Arial, sans-serif;
-    display: flex; align-items: center; justify-content: center; padding: 2rem;
-  }}
-  .videowall-menu {{ width: 100%; max-width: 420px; display: flex; flex-direction: column; gap: 0.7rem; text-align: center; }}
-  .videowall-menu h1 {{ margin: 0 0 0.3rem; font-size: 1.6rem; }}
-  .videowall-menu .sub {{ margin: 0 0 1rem; color: var(--text-dim); font-size: 0.9rem; }}
-  .videowall-menu-item, .videowall-menu-rotate {{
-    display: block; padding: 0.9rem; border-radius: 10px; border: 1px solid var(--border);
-    background: var(--panel); color: var(--text); text-decoration: none; font-weight: 600;
-    transition: border-color 0.15s ease;
-  }}
-  .videowall-menu-item:hover {{ border-color: var(--teal); }}
-  .videowall-menu-rotate {{ background: var(--teal-dark); color: #06121c; border-color: var(--teal-dark); margin-top: 0.5rem; }}
-  .videowall-menu-rotate:hover {{ opacity: 0.92; }}
-</style>
-</head>
-<body>
-  <div class="videowall-menu">
-    <div>
-      <h1>Covenant Health &middot; Facility Systems</h1>
-    </div>
-    {items_html}
-    {f'<a class="videowall-menu-rotate" href="{my_cycle[0]}?rotate=1">&#9654; Start rotating (every {VIDEOWALL_ROTATE_SECONDS}s)</a>' if len(my_cycle) > 1 else ''}
-    {f'<a class="videowall-menu-item" href="/videowall/unified">&#9638; Unified view (all {len(my_cycle)} systems, one board)</a>' if len(my_cycle) > 1 else ''}
-  </div>
-</body>
-</html>""", mimetype="text/html")
 
 
 def _unified_videowall_board_html(username):
@@ -10776,11 +10565,10 @@ UNIFIED_VIDEOWALL_CSS = """
 """
 
 
-@app.route("/videowall/unified")
+@app.route("/videowall")
 @require_login
 def videowall_unified(username):
-    my_cycle = _videowall_cycle_for(username)
-    if not my_cycle:
+    if not any(key in _user_systems(username) for key in ("hyperview", "ipro", "ooma", "downtime")):
         return Response("Your account has no systems assigned - nothing to show on the videowall.", 403)
     board, has_unacked, has_acked_only, tone = _unified_videowall_board_html(username)
     return Response(
@@ -10790,7 +10578,6 @@ def videowall_unified(username):
             component_css=HYPERVIEW_COMPONENT_CSS + DASHBOARD_EXTRA_CSS + UNIFIED_VIDEOWALL_CSS,
             board=board,
             script=VIDEOWALL_CLOCK_SCRIPT + _videowall_critical_script(has_unacked, has_acked_only, tone),
-            rotate="",
             exit_link=_videowall_exit_html(),
         ),
         mimetype="text/html",
@@ -10809,7 +10596,7 @@ def videowall_redirect():
 
 @app.route("/<system>/kiosk")
 def system_videowall_redirect(system):
-    return _redirect_preserving_query(f"/{system}/videowall")
+    return _redirect_preserving_query(f"/{system}")
 
 
 LDAP_MODULE_LABELS = {
