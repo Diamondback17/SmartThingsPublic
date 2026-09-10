@@ -4876,7 +4876,15 @@ HYPERVIEW_COMPONENT_CSS = """
      ("Morristown-Hamblen Healthcare System") and force-wrapped
      (.site-cell's white-space: nowrap), so column 2 needs real room too
      or its own headers clip. */
-  .board-viewport-wrap.alarms-right-split { display: grid;
+  /* height (not min-height) here overrides .board-viewport-wrap's own
+     definite height below - a grid row inside a container with a hard
+     height can't actually grow past it even when column 1 opts out of
+     stretch below, so a tall Site Status list was overflowing the box
+     visually without the page's own scrollable height ever accounting
+     for it (i.e. genuinely unreachable, not just "needs a scroll").
+     min-height keeps the row viewport-sized in the common case while
+     still letting it grow for a long site list. */
+  .board-viewport-wrap.alarms-right-split { display: grid; height: auto; min-height: calc(100vh - 320px);
     grid-template-columns: minmax(380px, 460px) minmax(260px, 340px) 1fr; gap: 14px; align-items: stretch; }
   .board-viewport-wrap.alarms-right-split .board-fill-panel { min-height: 0; margin-bottom: 0; }
   /* Column 1 (Site Status) opts out of the row's stretch/clip - the whole
@@ -4906,7 +4914,7 @@ HYPERVIEW_COMPONENT_CSS = """
      height - the active-alarm list was technically rendering, just inside
      a couple pixels of visible space. A real floor keeps it usable even
      when that means the page itself scrolls a bit past the viewport. */
-  .board-fill-panel .matrix-wrap { flex: 1 1 auto; overflow-y: auto; min-height: 280px; }
+  .board-fill-panel .matrix-wrap { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; min-height: 280px; }
   .board-fill-panel .matrix-wrap table thead th { position: sticky; top: 0; z-index: 1; }
   /* Device Detail / Active Alarms tables: fixed per-column widths so the
      wide Detail/Alarm column actually gets most of the panel's width
