@@ -2448,19 +2448,6 @@ def _maintenance_log_db():
             sites TEXT NOT NULL
         )
     """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS device_removal_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            rack_id TEXT NOT NULL,
-            rack_name TEXT NOT NULL,
-            site TEXT,
-            device_name TEXT NOT NULL,
-            requested_by TEXT NOT NULL,
-            requested_ts INTEGER NOT NULL,
-            resolved_by TEXT,
-            resolved_ts INTEGER
-        )
-    """)
     # One-time: fold the old single "admin group" setting into a per-group flag.
     if conn.execute("SELECT 1 FROM app_settings WHERE key = 'ldap_admin_group_migrated'").fetchone() is None:
         legacy_row = conn.execute("SELECT value FROM app_settings WHERE key = 'ldap_admin_group'").fetchone()
@@ -3426,54 +3413,24 @@ def _rack_audit_mark_complete(rack_id):
     return None
 
 
-def _create_device_removal_requests(rack_id, rack_name, site, device_names, username):
-    """One open request per selected device - flags it for someone (1st
-    shift's unscoped access covers every site, so they're the ones who'll
-    generally pick these up) to actually delete from Hyperview. This tool
-    never deletes an asset itself, same as it never does anything to
-    Hyperview beyond stamping the audit date - the removal is deliberately
-    left to a person to verify and do by hand. Also logs a matching
-    maintenance action per device so it shows up in Recent Activity like
-    any other human action."""
-    if not device_names:
-        return
-    conn = _maintenance_log_db()
+def _rack_audit_delete_devices(device_ids):
+    """Deletes the given asset ids from Hyperview outright, via matrix.py's
+    own bridge - the rack audit page's device-removal flag actually
+    removes them now, it doesn't just leave a note for someone else to do
+    it later. (device_ids_deleted, device_ids_failed, error) - error is
+    set only if the bridge itself couldn't be reached at all; a per-device
+    failure still comes back in device_ids_failed with the request
+    otherwise succeeding."""
     try:
-        now = int(time.time())
-        conn.executemany(
-            "INSERT INTO device_removal_requests (rack_id, rack_name, site, device_name, requested_by, requested_ts) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            [(rack_id, rack_name, site, name, username, now) for name in device_names],
+        resp = requests.post(
+            f"{HYPERVIEW_BASE_URL}/rack-audit/delete-devices", json={"device_ids": device_ids},
+            timeout=RACK_AUDIT_REQUEST_TIMEOUT,
         )
-        conn.commit()
-    finally:
-        conn.close()
-    for name in device_names:
-        _log_maintenance_action("hyperview", "device_removal_requested", name, "device", f"Rack {rack_name}", username)
-
-
-def _pending_device_removal_requests():
-    conn = _maintenance_log_db()
-    try:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT * FROM device_removal_requests WHERE resolved_ts IS NULL ORDER BY requested_ts ASC"
-        ).fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
-
-
-def _resolve_device_removal_request(request_id, username):
-    conn = _maintenance_log_db()
-    try:
-        conn.execute(
-            "UPDATE device_removal_requests SET resolved_by = ?, resolved_ts = ? WHERE id = ? AND resolved_ts IS NULL",
-            (username, int(time.time()), request_id),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        return [], device_ids, f"Could not reach Hyperview: {e}"
+    data = resp.json()
+    return data.get("deleted", []), [f["id"] for f in data.get("failed", [])], None
 
 
 MTTA_LOOKBACK_SECONDS = 24 * 3600
@@ -6538,42 +6495,19 @@ def rack_audit_page(username):
     remove_devices_html = ""
     if assets:
         remove_options = "".join(
-            f'<option value="{_esc(a["name"])}">{_esc(a["name"])} ({_esc(_humanize_asset_type(a.get("type")) or "Unknown")})</option>'
-            for a in assets
+            f'<option value="{_esc(a["id"])}\x1f{_esc(a["name"])}">{_esc(a["name"])} ({_esc(_humanize_asset_type(a.get("type")) or "Unknown")})</option>'
+            for a in assets if a.get("id")
         )
         remove_devices_html = f"""
           <div style="margin-top:14px; padding-top:14px; border-top:1px solid var(--border);">
             <label for="remove-devices-select" style="font-size:12.5px; color:var(--text-dim); font-weight:600; display:block; margin-bottom:6px;">
-              Flag device(s) to remove from inventory
-              <span style="font-weight:400; color:var(--text-faint);">&mdash; not present, decommissioned, etc. Selecting any and submitting notifies 1st shift to delete them from Hyperview.</span>
+              Remove device(s) from inventory
+              <span style="font-weight:400; color:var(--text-faint);">&mdash; not present, decommissioned, etc. Selecting any and submitting deletes them from Hyperview along with marking the audit complete.</span>
             </label>
-            <select id="remove-devices-select" name="remove_devices" multiple style="width:100%; min-height:88px;">
+            <select id="remove-devices-select" name="remove_device_ids" multiple style="width:100%; min-height:88px;">
               {remove_options}
             </select>
           </div>"""
-
-    pending_removals = _pending_device_removal_requests()
-    pending_removals_html = ""
-    if pending_removals:
-        pending_rows = "".join(
-            f"""<tr>
-              <td>{_esc(r["device_name"])}</td>
-              <td>{_esc(r["rack_name"])}</td>
-              <td>{_esc(r["site"]) or "&mdash;"}</td>
-              <td>{_esc(r["requested_by"])}</td>
-              <td class="time">{_esc(datetime.fromtimestamp(r["requested_ts"]).strftime("%b %-d, %Y"))}</td>
-              <td><form method="POST" action="/tools/rack-audit/device-removal/resolve" style="margin:0;">
-                <input type="hidden" name="request_id" value="{r['id']}">
-                <button class="ghost" type="submit">Mark Removed</button>
-              </form></td>
-            </tr>"""
-            for r in pending_removals
-        )
-        pending_removals_html = f"""
-        <div class="panel ra-context-panel" style="max-width:1100px; margin:16px auto 0;">
-          <div class="panel-head"><h2>Pending Device Removals</h2><span class="count-note">{len(pending_removals)} outstanding</span></div>
-          <div class="table-scroll"><table><tr><th>Device</th><th>Rack</th><th>Site</th><th>Requested By</th><th>Requested</th><th></th></tr>{pending_rows}</table></div>
-        </div>"""
 
     body = f"""
     <div class="page-header">
@@ -6620,19 +6554,22 @@ def rack_audit_page(username):
 
     <div class="panel ra-context-panel" style="max-width:1100px; margin:16px auto 0;">
       <div style="padding:16px 24px;">
-        <form method="POST" action="/tools/rack-audit/complete">
+        <form method="POST" action="/tools/rack-audit/complete" onsubmit="
+          var sel = document.getElementById('remove-devices-select');
+          var n = sel ? sel.selectedOptions.length : 0;
+          if (n === 0) {{ return true; }}
+          return confirm('Delete ' + n + ' selected device(s) from Hyperview? This cannot be undone.');
+        ">
           <input type="hidden" name="rack_id" value="{_esc(rack['id'])}">
           <input type="hidden" name="rack_name" value="{_esc(rack['name'] or rack['id'])}">
-          <input type="hidden" name="rack_site" value="{_esc(rack.get('site_path') or rack['site'])}">
           <div style="display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap;">
-            <div style="font-size:13px; color:var(--text-dim);">Walked the rack? Mark it done &mdash; this is the only step that touches Hyperview.</div>
+            <div style="font-size:13px; color:var(--text-dim);">Walked the rack? Mark it done.</div>
             <button class="btn" style="background:var(--ok); color:#fff; border:none; padding:11px 22px; border-radius:8px; font-weight:700; cursor:pointer;" type="submit">&#10003; Mark Audit Complete</button>
           </div>
           {remove_devices_html}
         </form>
       </div>
     </div>
-    {pending_removals_html}
     """
     return Response(render_shell("Rack Audit", body, "rack-audit", username), mimetype="text/html")
 
@@ -6644,8 +6581,11 @@ def rack_audit_complete_action(username):
         return Response("Your account does not have access to Hyperview", 403)
     rack_id = request.form.get("rack_id", "")
     rack_name = request.form.get("rack_name", rack_id)
-    rack_site = request.form.get("rack_site", "")
-    remove_devices = [d for d in request.form.getlist("remove_devices") if d.strip()]
+    remove_devices = []  # (device_id, device_name) pairs selected for deletion
+    for raw in request.form.getlist("remove_device_ids"):
+        device_id, _sep, device_name = raw.partition("\x1f")
+        if device_id:
+            remove_devices.append((device_id, device_name or device_id))
     if not rack_id:
         return _redirect_msg("/tools/rack-audit", error="No rack selected")
     error = _rack_audit_mark_complete(rack_id)
@@ -6655,27 +6595,25 @@ def rack_audit_complete_action(username):
         _log_maintenance_action("hyperview", "rack_audited", rack_name, "rack", None, username)
     except Exception:
         pass
-    if remove_devices:
-        try:
-            _create_device_removal_requests(rack_id, rack_name, rack_site, remove_devices, username)
-        except Exception:
-            pass
+
     message = f"Marked {rack_name} audited"
+    delete_problem = None
     if remove_devices:
-        message += f" — flagged {len(remove_devices)} device(s) for 1st shift to remove from Hyperview"
-    return _redirect_msg("/tools/rack-audit", message=message)
-
-
-@app.route("/tools/rack-audit/device-removal/resolve", methods=["POST"])
-@require_login
-def rack_audit_device_removal_resolve(username):
-    if "hyperview" not in _user_systems(username):
-        return Response("Your account does not have access to Hyperview", 403)
-    request_id = request.form.get("request_id", "")
-    if not request_id.isdigit():
-        return _redirect_msg("/tools/rack-audit", error="Invalid removal request")
-    _resolve_device_removal_request(int(request_id), username)
-    return _redirect_msg("/tools/rack-audit", message="Marked the device removed")
+        deleted_ids, failed_ids, delete_error = _rack_audit_delete_devices([d[0] for d in remove_devices])
+        by_id = dict(remove_devices)
+        for device_id in deleted_ids:
+            try:
+                _log_maintenance_action("hyperview", "device_deleted", by_id.get(device_id, device_id), "device", f"Rack {rack_name}", username)
+            except Exception:
+                pass
+        if deleted_ids:
+            message += f" — deleted {len(deleted_ids)} device(s) from Hyperview"
+        if delete_error:
+            delete_problem = f"Could not delete the flagged device(s): {delete_error}"
+        elif failed_ids:
+            failed_names = ", ".join(by_id.get(i, i) for i in failed_ids)
+            delete_problem = f"Failed to delete: {failed_names}"
+    return _redirect_msg("/tools/rack-audit", message=message, error=delete_problem)
 
 
 @app.route("/handoff")
@@ -11341,7 +11279,7 @@ DEVICE_HISTORY_ACTION_META = {
     "alarm": ("New alarm", "var(--danger)"),
     "changed": ("Changed", "var(--warn)"),
     "rack_audited": ("Rack Audited", "var(--ok)"),
-    "device_removal_requested": ("Removal Requested", "var(--danger)"),
+    "device_deleted": ("Device Deleted", "var(--danger)"),
 }
 
 

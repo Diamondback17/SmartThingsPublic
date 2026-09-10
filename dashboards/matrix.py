@@ -386,6 +386,25 @@ def hv_put(path, json_body):
     return response
 
 
+def hv_delete(path):
+    token = get_token()
+    response = requests.delete(
+        f"{TENANT_URL}/api/{path.lstrip('/')}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response
+
+
+def delete_asset(asset_id):
+    """Permanently removes an asset from Hyperview - used by the rack
+    audit workflow when an auditor flags a device to come out of
+    inventory. No undo on this end once it's sent; Hyperview's own trash/
+    recovery (if any) is the only safety net past this point."""
+    hv_delete(f"asset/assets/{asset_id}")
+
+
 def get_asset_cache():
     global asset_cache, asset_cache_time
     if asset_cache and (time.time() - asset_cache_time) < ASSET_CACHE_SECONDS:
@@ -1248,6 +1267,24 @@ def rack_audit_complete(rack_id):
     global rack_audit_cache
     rack_audit_cache = None  # force a fresh fetch next time rather than serving a stale date
     return jsonify({"ok": True})
+
+
+@app.route("/rack-audit/delete-devices", methods=["POST"])
+def rack_audit_delete_devices():
+    """Deletes one or more assets from Hyperview outright - the rack audit
+    page's device-removal flag. Best-effort per device: one failure
+    doesn't block the rest, and the caller gets back exactly which ones
+    went through."""
+    body = request.get_json(silent=True) or {}
+    device_ids = body.get("device_ids") or []
+    deleted, failed = [], []
+    for device_id in device_ids:
+        try:
+            delete_asset(device_id)
+            deleted.append(device_id)
+        except requests.exceptions.RequestException as e:
+            failed.append({"id": device_id, "error": str(e)})
+    return jsonify({"deleted": deleted, "failed": failed})
 
 
 @app.route("/diagnostics/application-event-logs")
