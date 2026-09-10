@@ -4860,9 +4860,9 @@ HYPERVIEW_COMPONENT_CSS = """
     border: 1px solid var(--danger); color: var(--danger-dark); border-radius: 8px; padding: 9px 18px;
     font-size: 14px; margin-bottom: 12px; }
   .board { display: grid; grid-template-columns: 1fr minmax(280px, 380px) 1fr; gap: 14px; align-items: start; margin-bottom: 14px; }
-  /* Shared by Ooma and Hyperview: the location/status panel(s) stack in
-     column 1, System Health stacked on top of Alarm Summary in column 2,
-     and the active-alarms table fills the rest of the row at full column
+  /* Shared by Ooma and Hyperview: the Site Status panel in column 1,
+     System Health stacked on top of Alarm Summary in column 2, and the
+     active-alarms table filling the rest of the row at full column
      height (via .board-viewport-wrap's own viewport-fit sizing below) -
      instead of being squeezed into a short strip below a tall top row,
      which is what was clipping it off before. Column 1 gets the widest
@@ -4873,7 +4873,6 @@ HYPERVIEW_COMPONENT_CSS = """
   .board-viewport-wrap.alarms-right-split { display: grid;
     grid-template-columns: minmax(380px, 460px) minmax(260px, 340px) 1fr; gap: 14px; align-items: stretch; }
   .board-viewport-wrap.alarms-right-split .board-fill-panel { min-height: 0; margin-bottom: 0; }
-  .board-viewport-wrap.alarms-right-split .stacked-col { display: flex; flex-direction: column; gap: 14px; }
 
   /* iPRO/Ooma/Hyperview's own dashboards: the whole board plus its
      trailing alarm/device-detail panel is sized to the viewport instead
@@ -7310,13 +7309,11 @@ async function refreshAll() {
     const gaugeDetail = allRow ? (allRow.open + ' open issue(s) · ' + allRow.ack + ' acknowledged') : '';
     renderGauge(health, gaugeDetail);
     renderSummary(summary);
-    renderMatrixTable('hospitals-body', hospitals);
-    renderMatrixTable('clinics-body', clinics);
+    const sites = hospitals.concat(clinics);
+    renderMatrixTable('sites-body', sites);
     renderAlarmLog(alarms, runbookHints);
-    document.getElementById('hosp-note').textContent =
-      hospitals.filter(r => r.site).length + ' of ' + hospitals.length + ' affected';
-    document.getElementById('clinic-note').textContent =
-      clinics.filter(r => r.site).length + ' of ' + clinics.length + ' affected';
+    document.getElementById('sites-note').textContent =
+      sites.filter(r => r.site).length + ' of ' + sites.length + ' affected';
     document.getElementById('alarm-note').textContent =
       alarms.length + ' device' + (alarms.length === 1 ? '' : 's');
     const lastUpdatedEl = document.getElementById('hv-last-updated');
@@ -7368,26 +7365,14 @@ def _hyperview_board_html():
     </div>
     <div id="hv-content">
     <div class="board-viewport-wrap alarms-right-split">
-      <div class="stacked-col">
-        <div class="panel">
-          <div class="panel-head"><h2>Datacenters / Hospitals</h2><span class="count-note" id="hosp-note"></span></div>
-          <div class="matrix-wrap">
-            <table class="matrix">
-              <thead><tr><th>Site</th><th title="Power">&#9889;</th><th title="Cooling">&#10052;</th>
-                <th title="Server">&#128421;</th><th title="Network">&#127760;</th></tr></thead>
-              <tbody id="hospitals-body"></tbody>
-            </table>
-          </div>
-        </div>
-        <div class="panel">
-          <div class="panel-head"><h2>Primary Care / Clinics</h2><span class="count-note" id="clinic-note"></span></div>
-          <div class="matrix-wrap">
-            <table class="matrix">
-              <thead><tr><th>Site</th><th title="Power">&#9889;</th><th title="Cooling">&#10052;</th>
-                <th title="Server">&#128421;</th><th title="Network">&#127760;</th></tr></thead>
-              <tbody id="clinics-body"></tbody>
-            </table>
-          </div>
+      <div class="panel">
+        <div class="panel-head"><h2>Site Status</h2><span class="count-note" id="sites-note"></span></div>
+        <div class="matrix-wrap">
+          <table class="matrix">
+            <thead><tr><th>Site</th><th title="Power">&#9889;</th><th title="Cooling">&#10052;</th>
+              <th title="Server">&#128421;</th><th title="Network">&#127760;</th></tr></thead>
+            <tbody id="sites-body"></tbody>
+          </table>
         </div>
       </div>
       <div class="center-col">
