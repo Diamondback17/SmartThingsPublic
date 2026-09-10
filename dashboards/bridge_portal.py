@@ -5202,6 +5202,27 @@ RESPONSIVE_DASHBOARD_CSS = """
 
 DASHBOARD_BASE_CSS = HYPERVIEW_COMPONENT_CSS + DASHBOARD_EXTRA_CSS + RESPONSIVE_DASHBOARD_CSS
 
+# The old standalone videowall shell's font/size bumps over the normal
+# (shared, un-scoped) component classes above - reused here verbatim, but
+# scoped under .dashboard-wall so they only apply on the four system
+# dashboards themselves rather than leaking into every other page that
+# shares .panel-head/table.matrix/.health-medallion (Overview, Trends,
+# Handoff, Acknowledge, Rack Audit, admin pages, ...). Respects whichever
+# light/dark theme the user has chosen - this only touches size, not color.
+DASHBOARD_WALL_CSS = """
+  .dashboard-wall h1 { font-size: 26px; }
+  .dashboard-wall .dashboard-clock { font-size: 22px; }
+  .dashboard-wall .panel-head h2 { font-size: 18px; }
+  .dashboard-wall table.matrix, .dashboard-wall table.summary, .dashboard-wall table.alarmlog { font-size: 15px; }
+  .dashboard-wall table.matrix thead th, .dashboard-wall table.summary thead th, .dashboard-wall table.alarmlog thead th { font-size: 12px; }
+  .dashboard-wall .clear-mark { font-size: 17px; }
+  .dashboard-wall .health-medallion { width: 76px; height: 76px; }
+  .dashboard-wall .health-medallion svg { width: 38px; height: 38px; }
+  .dashboard-wall .health-state { font-size: 22px; }
+  .dashboard-wall .health-detail { font-size: 15px; }
+  .dashboard-wall .status-banner { font-size: 17px; }
+"""
+
 
 HEALTH_ICONS = {
     "ok": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" '
@@ -5506,9 +5527,11 @@ def ipro_page(username):
     board = _ipro_board_html(data) if data else _bridge_unreachable_html("iPRO Cameras", SYSTEMS["ipro"]["base_url"])
     alert_script = _critical_alert_script(*_alert_state_from_summary(data)) if data else ""
     body = f"""
+    <style>{DASHBOARD_BASE_CSS}{DASHBOARD_WALL_CSS}</style>
+    <div class="dashboard-wall">
     {_dashboard_page_header_html("iPRO Cameras")}
-    <style>{DASHBOARD_BASE_CSS}</style>
     {board}
+    </div>
     {DASHBOARD_AUTO_REFRESH_SCRIPT}
     {alert_script}
     """
@@ -5525,9 +5548,11 @@ def ooma_page(username):
     board = _ooma_board_html(data) if data else _bridge_unreachable_html("Ooma AirDial", SYSTEMS["ooma"]["base_url"])
     alert_script = _critical_alert_script(*_alert_state_from_summary(data)) if data else ""
     body = f"""
+    <style>{DASHBOARD_BASE_CSS}{DASHBOARD_WALL_CSS}</style>
+    <div class="dashboard-wall">
     {_dashboard_page_header_html("Ooma AirDial")}
-    <style>{DASHBOARD_BASE_CSS}</style>
     {board}
+    </div>
     {DASHBOARD_AUTO_REFRESH_SCRIPT}
     {alert_script}
     """
@@ -7500,9 +7525,11 @@ def hyperview_page(username):
     if "hyperview" not in _user_systems(username):
         return _error_page(username, "Your account does not have access to Hyperview")
     body = f"""
+    <style>{DASHBOARD_BASE_CSS}{DASHBOARD_WALL_CSS}</style>
+    <div class="dashboard-wall">
     {_dashboard_page_header_html("Hyperview")}
-    <style>{DASHBOARD_BASE_CSS}</style>
     {_hyperview_board_html()}
+    </div>
     {HYPERVIEW_SCRIPT % {'auto_refresh_ms': 30000}}
     """
     return Response(render_shell("Hyperview", body, "hyperview", username), mimetype="text/html")
@@ -9846,9 +9873,11 @@ def downtime_page(username):
     rows = _fetch_downtime_data()
     board = _bridge_unreachable_html("Downtime Workstations", DOWNTIME_FEED_URL) if rows is None else _downtime_board_html(rows)
     body = f"""
+    <style>{DOWNTIME_CSS}{DASHBOARD_WALL_CSS}</style>
+    <div class="dashboard-wall">
     {_dashboard_page_header_html("Downtime Workstations", subtitle="Live reporting status for every downtime workstation.")}
-    <style>{DOWNTIME_CSS}</style>
     {board}
+    </div>
     {DOWNTIME_DETAIL_MODAL_HTML}
     {DOWNTIME_SCRIPT}
     {DASHBOARD_AUTO_REFRESH_SCRIPT}
