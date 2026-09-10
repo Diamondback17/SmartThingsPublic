@@ -2097,14 +2097,24 @@ PAGE_SHELL = """<!DOCTYPE html>
     document.getElementById('ack-panel-backdrop').classList.remove('open');
     document.getElementById('ack-panel').classList.remove('open');
   }}
-  // Shared by every page's auto-refresh timer so an open flyout (the
-  // Acknowledge panel) or an open nav dropdown (Tools/Admin/account menu)
-  // never gets yanked out from under someone mid-interaction by a
-  // periodic reload/re-render.
+  // Shared by every page's auto-refresh timer so nothing the user is
+  // actively doing - the Acknowledge panel or a nav dropdown open, a
+  // downtime modal open, text selected for copying, or simply typing/
+  // focused in a field - ever gets yanked out from under them mid-
+  // interaction by a periodic reload/re-render.
   window.isFlyoutOpen = function () {{
     var panel = document.getElementById('ack-panel');
     if (panel && panel.classList.contains('open')) return true;
-    return !!document.querySelector('nav.top details.nav-dropdown[open]');
+    if (document.querySelector('nav.top details.nav-dropdown[open]')) return true;
+    var modals = document.querySelectorAll('.downtime-modal');
+    for (var i = 0; i < modals.length; i++) {{
+      if (getComputedStyle(modals[i]).display !== 'none') return true;
+    }}
+    var sel = window.getSelection ? window.getSelection() : null;
+    if (sel && String(sel).trim()) return true;
+    var active = document.activeElement;
+    if (active && /^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName)) return true;
+    return false;
   }};
   document.getElementById('ack-panel-body').addEventListener('submit', function (e) {{
     var form = e.target;
@@ -2893,6 +2903,30 @@ def _query_maintenance_actions(system, since_ts=None, until_ts=None):
         return [dict(r) for r in conn.execute(query, params).fetchall()]
     finally:
         conn.close()
+
+
+def _latest_ack_log_entry(system, target):
+    """Best-effort (system, target) lookup against the shared maintenance
+    action log for who most recently acknowledged it and why - for a
+    system whose own "is this acknowledged" signal (Hyperview's alarm
+    API) doesn't carry reason/set_by back with it, unlike ipro/ooma/
+    downtime's own maintenance-window endpoints. Returns None unless the
+    MOST RECENT logged action for this exact target is itself an
+    'acknowledged' entry - a later 'un-acknowledged' (or nothing logged
+    at all) means there's nothing current to report."""
+    conn = _maintenance_log_db()
+    try:
+        row = conn.execute(
+            "SELECT action, reason, set_by FROM maintenance_actions "
+            "WHERE system = ? AND target = ? AND action IN ('acknowledged', 'un-acknowledged') "
+            "ORDER BY ts DESC LIMIT 1",
+            (system, target),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row or row[0] != "acknowledged":
+        return None
+    return {"reason": row[1], "set_by": row[2]}
 
 
 def _parse_local_datetime(value):
@@ -5497,13 +5531,39 @@ DASHBOARD_AUTO_REFRESH_SCRIPT = """<script>
 (function () {
   var REFRESH_MS = 30000;
   var due = Date.now() + REFRESH_MS;
+  // Keyed by path so switching dashboards mid-session (or a stale tab
+  // reopened later) never restores the wrong page's scroll position.
+  var scrollKey = 'dashboardScroll:' + location.pathname;
+
   function maybeReload() {
     if (window.isFlyoutOpen && window.isFlyoutOpen()) { return; }
-    if (Date.now() >= due) { location.reload(); }
+    if (Date.now() >= due) {
+      // A blind location.reload() used to always snap back to the top
+      // of the page, losing your place if you were reading through a
+      // long device list when the timer fired - save where you were and
+      // restore it once the refreshed page has actually rendered.
+      try { sessionStorage.setItem(scrollKey, String(window.scrollY)); } catch (e) {}
+      location.reload();
+    }
   }
   setInterval(maybeReload, 5000);
   document.addEventListener('visibilitychange', function () {
     if (document.visibilityState === 'visible') { maybeReload(); }
+  });
+
+  document.addEventListener('DOMContentLoaded', function () {
+    var saved;
+    try { saved = sessionStorage.getItem(scrollKey); } catch (e) { return; }
+    if (saved === null) return;
+    try { sessionStorage.removeItem(scrollKey); } catch (e) {}
+    var y = parseInt(saved, 10);
+    if (!isFinite(y)) return;
+    // Two frames, not one - the refreshed data can be a different
+    // length than before (more/fewer rows), so this waits for layout to
+    // actually settle rather than restoring against stale geometry.
+    requestAnimationFrame(function () {
+      requestAnimationFrame(function () { window.scrollTo(0, y); });
+    });
   });
 })();
 </script>"""
@@ -6359,6 +6419,67 @@ _HANDOFF_SECTION_BUILDERS = {
 }
 
 
+def _handoff_ack_summary_html(username):
+    """Who's currently acknowledged what, across every system this user
+    has Full Control on - the thing a handoff previously had no visible
+    record of at all. An incoming operator otherwise has no way to tell
+    "known issue someone's already on, silenced on purpose" from "just
+    hasn't alerted yet" without separately checking every system's own
+    Acknowledge page - this pulls the exact same live data those pages
+    show (nothing new tracked, no separate source of truth to drift out
+    of sync) into the one report generated at shift change. Hyperview is
+    the one case that needs a fallback: its own alarm API says WHETHER a
+    device's alarm is acknowledged but not who did it or why, so that
+    piece is filled in via _latest_ack_log_entry against this bridge's
+    own maintenance action log instead."""
+    full_systems = accessible_full_systems(username)
+    rows = []
+    for key, cfg in full_systems.items():
+        for w in (_fetch_windows(key) or []):
+            rows.append({
+                "system": cfg["label"], "target": w["target"],
+                "reason": w.get("reason"), "set_by": w.get("set_by"), "remaining": w.get("remaining"),
+            })
+    if "downtime" in _user_full_systems(username):
+        for s in _pending_downtime_acks():
+            rows.append({
+                "system": "Downtime Workstations", "target": s["target"],
+                "reason": s.get("reason"), "set_by": s.get("set_by"), "remaining": s.get("remaining"),
+            })
+    if "hyperview" in _user_full_systems(username):
+        for a in (_hyperview_active_alarms() or []):
+            if not a.get("acknowledged"):
+                continue
+            device = a.get("device") or ""
+            logged = _latest_ack_log_entry("hyperview", device)
+            target = f"{_strip_emoji(a.get('location') or '')} - {device}".strip(" -") or device
+            rows.append({
+                "system": "Hyperview", "target": target,
+                "reason": (logged or {}).get("reason") or a.get("alarm"),
+                "set_by": (logged or {}).get("set_by"), "remaining": None,
+            })
+
+    if not rows:
+        table_html = '<p class="empty">Nothing currently acknowledged across your systems.</p>'
+    else:
+        rows.sort(key=lambda r: (r["system"], r["target"] or ""))
+        row_html = "".join(
+            f"<tr><td>{_esc(r['system'])}</td><td>{_esc(r['target'])}</td>"
+            f"<td>{_esc(r['reason']) or '-'}</td><td>{_esc(r['set_by']) or '-'}</td>"
+            f"<td>{_esc(r['remaining']) if r['remaining'] else '-'}</td></tr>"
+            for r in rows
+        )
+        table_html = (
+            '<div class="table-scroll"><table><tr><th>System</th><th>Target</th><th>Reason</th>'
+            f'<th>Acknowledged by</th><th>Expires in</th></tr>{row_html}</table></div>'
+        )
+    return f"""
+    <div class="panel">
+      <div class="panel-head"><h2>Currently Acknowledged</h2><span class="count-note">{len(rows)} active acknowledgment(s)</span></div>
+      {table_html}
+    </div>"""
+
+
 def _handoff_workflow_panel_html(username):
     """A pending handoff to accept (full notes), or the close-out form when
     nothing's pending, plus recent history."""
@@ -6889,6 +7010,7 @@ def handoff_page(username):
     <style>{DASHBOARD_BASE_CSS}</style>
     {_msg_html()}
     {_handoff_workflow_panel_html(username)}
+    {_handoff_ack_summary_html(username)}
     {''.join(sections) or '<p class="empty">Your account has no systems assigned.</p>'}
     {search_form}
     {''.join(search_sections)}
