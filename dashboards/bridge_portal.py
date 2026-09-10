@@ -4838,6 +4838,17 @@ HYPERVIEW_COMPONENT_CSS = """
     border: 1px solid var(--danger); color: var(--danger-dark); border-radius: 8px; padding: 9px 18px;
     font-size: 14px; margin-bottom: 12px; }
   .board { display: grid; grid-template-columns: 1fr minmax(280px, 380px) 1fr; gap: 14px; align-items: start; margin-bottom: 14px; }
+  /* Ooma's own layout: Site Status, then System Health stacked on top of
+     Alarm Summary, then the active-alarms table filling the rest of the
+     row at full column height (via .board-viewport-wrap's own
+     viewport-fit sizing below). Site Status gets the widest fixed column
+     of the three - facility names here are long ("Morristown-Hamblen
+     Healthcare System") and force-wrapped (.site-cell's white-space:
+     nowrap), so the other two columns (Connectivity/Battery) need real
+     room too or their headers clip. */
+  .board-viewport-wrap.ooma-split { display: grid;
+    grid-template-columns: minmax(380px, 460px) minmax(260px, 340px) 1fr; gap: 14px; align-items: stretch; }
+  .board-viewport-wrap.ooma-split .board-fill-panel { min-height: 0; margin-bottom: 0; }
 
   /* iPRO/Ooma/Hyperview's own dashboards: the whole board plus its
      trailing alarm/device-detail panel is sized to the viewport instead
@@ -4860,6 +4871,7 @@ HYPERVIEW_COMPONENT_CSS = """
     .board-viewport-wrap { height: auto; min-height: 0; }
     .board-viewport-wrap > .board-fill-panel { flex: none; }
     .board-fill-panel .matrix-wrap { overflow-y: visible; }
+    .board-viewport-wrap.ooma-split { display: flex !important; flex-direction: column; }
   }
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius, 10px);
     box-shadow: var(--shadow-sm, 0 1px 3px rgba(0,0,0,0.04)); overflow: hidden; margin-bottom: 14px;
@@ -4938,8 +4950,6 @@ DASHBOARD_EXTRA_CSS = """
 
   .device-scroll { max-height: 280px; overflow-y: auto; }
   .device-scroll table.alarmlog thead th { position: sticky; top: 0; z-index: 1; }
-
-  .board-2col { grid-template-columns: 1fr minmax(300px, 400px); }
 
 
   .status-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
@@ -5074,7 +5084,7 @@ RESPONSIVE_DASHBOARD_CSS = """
   @media (max-width: 720px) {
     .wrap { width: 100%; padding: 16px 12px 40px; }
     nav.top a { margin-left: 12px; font-size: 12px; }
-    .board, .board-2col { display: flex !important; flex-direction: column; }
+    .board { display: flex !important; flex-direction: column; }
     .center-col { flex-direction: column !important; }
     table.matrix thead, table.summary thead, table.alarmlog thead { display: none; }
     table.matrix tbody tr, table.summary tbody tr, table.alarmlog tbody tr {
@@ -5328,23 +5338,21 @@ def _ooma_board_html(data):
     affected = sum(1 for a in data["accounts"] if a.get("site"))
     gauge_detail = f"{total_open} open issue(s) &middot; {affected} of {len(data['accounts'])} sites affected"
     return f"""
-    <div class="board-viewport-wrap">
-    <div class="board board-2col">
+    <div class="board-viewport-wrap ooma-split">
       {_ooma_matrix_html(data["accounts"])}
       <div class="center-col">
         {_gauge_html(data["gauge"]["state"], data["gauge"]["tone"], gauge_detail)}
         {_summary_table_html(data["summary"], data["last_updated"])}
       </div>
-    </div>
-    <div class="panel board-fill-panel">
-      <div class="panel-head"><h2>Ooma AirDial &mdash; Emergency Red Phone System</h2></div>
-      <div class="matrix-wrap">
-        <table class="alarmlog">
-          <thead><tr><th>Location</th><th>Device</th><th>Severity</th><th>Detail</th><th>Category</th></tr></thead>
-          <tbody>{alarm_rows or '<tr><td colspan="5" class="empty">No open AirDial issues.</td></tr>'}</tbody>
-        </table>
+      <div class="panel board-fill-panel">
+        <div class="panel-head"><h2>Ooma AirDial &mdash; Emergency Red Phone System</h2></div>
+        <div class="matrix-wrap">
+          <table class="alarmlog">
+            <thead><tr><th>Location</th><th>Device</th><th>Severity</th><th>Detail</th><th>Category</th></tr></thead>
+            <tbody>{alarm_rows or '<tr><td colspan="5" class="empty">No open AirDial issues.</td></tr>'}</tbody>
+          </table>
+        </div>
       </div>
-    </div>
     </div>"""
 
 
