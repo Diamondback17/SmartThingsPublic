@@ -6470,11 +6470,11 @@ def rack_audit_page(username):
         <h1>Rack Audit</h1>
         <p class="sub">Automatically targeted &mdash; there's nothing to search or pick.</p>
       </div>
-      <button class="ghost print-btn" type="button" onclick="
+      <button class="ghost print-btn" type="button" onclick='
         var t=document.title; document.title={pdf_filename_js};
-        var restore=function(){{ document.title=t; window.removeEventListener('afterprint',restore); }};
-        window.addEventListener('afterprint',restore); window.print();
-      ">Generate (Print / Save as PDF)</button>
+        var restore=function(){{ document.title=t; window.removeEventListener("afterprint",restore); }};
+        window.addEventListener("afterprint",restore); window.print();
+      '>Generate (Print / Save as PDF)</button>
     </div>
     <style>{DASHBOARD_BASE_CSS}{RACK_AUDIT_ELEVATION_CSS}</style>
     {_msg_html()}
