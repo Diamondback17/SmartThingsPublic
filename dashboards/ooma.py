@@ -610,21 +610,6 @@ class Poller:
         # worker threads, independent of the battery bookkeeping above.
         self._lte_lock = threading.Lock()
         self._lte_flap_trackers: dict[str, dict] = {}
-        # Chronic flapper episode timestamps, one list per device - see
-        # _update_lte_flap_state. Separate from _lte_flap_trackers above:
-        # that dict's "transitions" list only covers a single episode
-        # (cleared once a flap resolves), so it can't tell "flapped once
-        # today" from "flapped 10 times today" on its own.
-        self._chronic_flapper_episodes: dict[str, list[float]] = {}
-
-        # Chronic connectivity instability, one entry per device - see
-        # _update_connectivity_instability. Independent of the LTE-specific
-        # tracker above: this watches the CONNECTIVITY GROUP's top issue as
-        # a whole (service/wan/lte all count), so it catches a device
-        # cycling between Critical "Out of service" and Degraded "Running
-        # on cellular backup" too, not just LTE carrier flaps.
-        self._instability_lock = threading.Lock()
-        self._instability_trackers: dict[str, dict] = {}
 
     def start(self) -> None:
         thread = threading.Thread(target=self._run, name="ooma-poller", daemon=True)
@@ -643,8 +628,8 @@ class Poller:
             last = self._battery_last_polled.get(myx_id)
         return last is None or (time.time() - last) >= self.battery_poll_interval_seconds
 
-    def _update_lte_flap_state(self, myx_id: str, connected: bool) -> tuple[str | None, bool, bool]:
-        """Returns (flap_state, sustained_outage, chronic_flapper). One call per device per
+    def _update_lte_flap_state(self, myx_id: str, connected: bool) -> tuple[str | None, bool]:
+        """Returns (flap_state, sustained_outage). One call per device per
         real poll cycle (from _poll_one_device
         only) - never from get_device_issues, which can run several times
         per cycle across different endpoints and would otherwise see the
@@ -671,15 +656,7 @@ class Poller:
         flap_state is None (not flapping, not just-recovered) AND
         currently disconnected AND that's been true continuously for at
         least LTE_SUSTAINED_OUTAGE_SECONDS - see get_device_issues for
-        what that changes about the message.
-
-        chronic_flapper is true once this device has newly ENTERED
-        "flapping" (not just continued in it) CHRONIC_FLAPPER_EPISODE_
-        THRESHOLD+ separate times within the trailing CHRONIC_FLAPPER_
-        WINDOW_SECONDS - a device that keeps flapping, resolving, and
-        flapping again all day is a hardware/carrier-swap candidate, not
-        a one-off blip, even though each individual episode still clears
-        itself normally per the state machine above."""
+        what that changes about the message."""
         now = time.time()
         with self._lte_lock:
             tracker = self._lte_flap_trackers.setdefault(myx_id, {
@@ -692,7 +669,6 @@ class Poller:
                 # not just ones that transition while being watched.
                 "transitions": [], "last_connected": None, "last_change_at": now, "flap_state": None,
             })
-            prev_state = tracker["flap_state"]
 
             if tracker["last_connected"] is not None and connected != tracker["last_connected"]:
                 tracker["transitions"].append(now)
@@ -725,48 +701,7 @@ class Poller:
                 and (now - tracker["last_change_at"]) >= LTE_SUSTAINED_OUTAGE_SECONDS
             )
 
-            # Episode start = newly entering "flapping" this call, not
-            # merely continuing in it - so a single ongoing flap only
-            # counts once, no matter how many polls it stays flapping for.
-            if tracker["flap_state"] == "flapping" and prev_state != "flapping":
-                episodes = self._chronic_flapper_episodes.setdefault(myx_id, [])
-                episodes.append(now)
-                self._chronic_flapper_episodes[myx_id] = [
-                    t for t in episodes if now - t <= CHRONIC_FLAPPER_WINDOW_SECONDS
-                ]
-            episode_count = len(self._chronic_flapper_episodes.get(myx_id, []))
-            chronic_flapper = episode_count >= CHRONIC_FLAPPER_EPISODE_THRESHOLD
-
-            return tracker["flap_state"], sustained_outage, chronic_flapper
-
-    def _update_connectivity_instability(self, myx_id: str, current_top: dict | None) -> bool:
-        """One call per device per real poll cycle, same discipline as
-        _update_lte_flap_state - and deliberately independent of it. This
-        tracks the CONNECTIVITY GROUP's top issue as a whole (whichever
-        of service/wan/lte is currently worst), not carrier state
-        specifically - a device cycling between Critical "Out of
-        service" and Degraded "Running on cellular backup" is a
-        status/activeWAN flip, never an LTE carrierStatus change, so
-        _update_lte_flap_state never sees it at all.
-
-        current_top is {"category","severity","message"} or None (no
-        connectivity issue right now) - compared by (severity, message)
-        so a message-only change (e.g. one LTE wording to another) still
-        counts as a change, same as a severity flip. CHRONIC_INSTABILITY_
-        THRESHOLD+ changes within CHRONIC_INSTABILITY_WINDOW_SECONDS
-        marks it unstable; ages out naturally as old changes fall out of
-        the window, no separate "recovering" step like the LTE tracker
-        has - this is a slower-moving signal, not one that needs its own
-        confirmation delay."""
-        now = time.time()
-        current_key = (current_top["severity"], current_top["message"]) if current_top else None
-        with self._instability_lock:
-            tracker = self._instability_trackers.setdefault(myx_id, {"changes": [], "last_key": None})
-            if tracker["last_key"] is not None and current_key != tracker["last_key"]:
-                tracker["changes"].append(now)
-            tracker["last_key"] = current_key
-            tracker["changes"] = [t for t in tracker["changes"] if now - t <= CHRONIC_INSTABILITY_WINDOW_SECONDS]
-            return len(tracker["changes"]) >= CHRONIC_INSTABILITY_THRESHOLD
+            return tracker["flap_state"], sustained_outage
 
     def _poll_one_device(self, entry: dict) -> dict:
         myx_id = entry["myx_id"]
@@ -792,30 +727,14 @@ class Poller:
 
         if record.get("has_lte"):
             connected = record.get("lte_modem_count", 0) > 0 and record.get("lte_carrier_status") == "UP"
-            record["lte_flap_status"], record["lte_sustained_outage"], record["lte_chronic_flapper"] = (
-                self._update_lte_flap_state(myx_id, connected)
-            )
+            record["lte_flap_status"], record["lte_sustained_outage"] = self._update_lte_flap_state(myx_id, connected)
         else:
             record["lte_flap_status"] = None
             record["lte_sustained_outage"] = False
-            record["lte_chronic_flapper"] = False
 
-        # connectivity_unstable needs a provisional read of the
-        # connectivity group's top issue BEFORE it's known - it's not set
-        # on the record yet at this point, so this first pass reads as
-        # "not unstable" by default. That's fine: the marker it adds only
-        # touches the message text, never severity or category, so it
-        # can't change which issue pick_top_issues_by_group would pick as
-        # top in the first place.
-        provisional_by_group = {
-            CATEGORY_GROUP[i["category"]]: i for i in pick_top_issues_by_group(get_device_issues(record))
-        }
-        connectivity_top = provisional_by_group.get("connectivity")
-        record["connectivity_unstable"] = self._update_connectivity_instability(myx_id, connectivity_top)
-
-        # Recomputed now that lte_flap_status/battery_charging_streak/
-        # connectivity_unstable are actually set - the passes above ran
-        # before any of them existed on the record, so they under-reported.
+        # Recomputed now that lte_flap_status/battery_charging_streak are
+        # actually set - poll_device's own effective_status ran before
+        # either existed on the record, so it under-reported.
         issues = get_device_issues(record)
         record["effective_status"] = compute_effective_status(issues)
 
@@ -1054,15 +973,6 @@ LTE_FLAP_RECOVERY_STABLE_SECONDS = 900
 # reading.
 LTE_SUSTAINED_OUTAGE_SECONDS = 3600
 
-# Chronic flapper escalation (see Poller._update_lte_flap_state): counts
-# distinct flap EPISODES (entries into "flapping", not raw transitions)
-# per device over a rolling day - a device that's flapped this many
-# separate times in the window is a hardware/carrier-swap candidate, not
-# a one-off blip, even though each individual episode still clears itself
-# after LTE_FLAP_RECOVERY_STABLE_SECONDS of stability like normal.
-CHRONIC_FLAPPER_WINDOW_SECONDS = 86400
-CHRONIC_FLAPPER_EPISODE_THRESHOLD = 3
-
 # Battery is considered "confirmed charging" (see Poller._poll_one_device)
 # once battery_state has read CHARGING for this many consecutive REAL
 # battery polls (not every poll_interval_seconds cycle - battery is only
@@ -1071,23 +981,6 @@ CHRONIC_FLAPPER_EPISODE_THRESHOLD = 3
 # BATTERY_DEGRADED_PERCENT - needs no special handling: it already stops
 # being flagged at all once that happens.
 BATTERY_CHARGING_STREAK_REQUIRED = 2
-
-# Chronic connectivity instability (see Poller._update_connectivity_instability):
-# distinct from LTE_FLAP_* above, which only watches the LTE carrier
-# specifically over a 30-minute window. This tracks the CONNECTIVITY
-# GROUP's top issue as a whole - service/wan/lte all count, so a device
-# cycling between Critical "Out of service" and Degraded "Running on
-# cellular backup" (never actually an LTE flap, since that's driven by
-# activeWAN/status, not carrierStatus) still gets caught. A device whose
-# top connectivity issue has changed this many times within the window
-# gets a fixed "[recently unstable]" marker appended to whatever its
-# current message is - visibility that this is a repeat offender, not a
-# one-off. Deliberately NOT a live-updating count in the message (same
-# reasoning as LTE_SUSTAINED_OUTAGE_SECONDS above) and deliberately NOT a
-# severity override - a chronically unstable device that's genuinely
-# Critical right now still shows Critical, this only adds context.
-CHRONIC_INSTABILITY_WINDOW_SECONDS = 14400
-CHRONIC_INSTABILITY_THRESHOLD = 5
 
 
 def get_device_issues(d: dict) -> list[dict]:
@@ -1162,14 +1055,6 @@ def get_device_issues(d: dict) -> list[dict]:
         flap_status = d.get("lte_flap_status")
         if flap_status == "flapping":
             message = f"LTE unstable - flapping ({LTE_FLAP_TRANSITION_THRESHOLD}+ changes in the last 30 min)"
-            # lte_chronic_flapper (also set once per real poll by
-            # Poller._update_lte_flap_state) flags a device that's
-            # entered flapping this many separate times today, not just
-            # one prolonged episode - repeat-offender visibility, same
-            # spirit as connectivity_unstable's "[recently unstable]"
-            # marker below.
-            if d.get("lte_chronic_flapper"):
-                message += " [chronic flapper]"
             issues.append({"category": "lte", "severity": "Degraded", "message": message})
         elif flap_status == "recovering":
             issues.append({
@@ -1252,16 +1137,6 @@ def get_device_issues(d: dict) -> list[dict]:
                     "category": "battery", "severity": "Degraded",
                     "message": f'Battery at {battery_level}%{detail}',
                 })
-
-    # connectivity_unstable is set once per real poll by
-    # Poller._update_connectivity_instability - flags EVERY connectivity
-    # issue (whichever category it is) rather than trying to pick "the"
-    # one, since pick_top_issues_by_group (downstream of this function)
-    # is what actually decides which one surfaces.
-    if d.get("connectivity_unstable"):
-        for issue in issues:
-            if CATEGORY_GROUP[issue["category"]] == "connectivity":
-                issue["message"] += " [recently unstable]"
 
     return issues
 
