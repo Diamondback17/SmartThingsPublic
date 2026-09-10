@@ -613,16 +613,30 @@ def get_rack_audit_cache():
 
 
 def get_device_power_sources(asset_id):
-    """Names of the PDU(s) powering this asset (a dual-corded device has
-    two) - just the PDU name is wanted here, not outlet numbers or
-    upstream panel/circuit detail, so providingSourceAssetDisplayName is
-    already everything this needs with no further lookup."""
+    """Which PDU + outlet is powering this asset (a dual-corded device has
+    two), e.g. "PDU-A2 Outlet 18". providingSourceAssetDisplayName on the
+    association is the outlet's own name ("Outlet 18") - it doesn't say
+    which PDU that outlet belongs to. The outlet is itself an asset in the
+    general asset directory though, and its parentName there is the PDU
+    that owns it, so look that up and lead with it. Falls back to just the
+    outlet name if the outlet isn't resolvable in the asset cache (no
+    providingSourceAssetId on the association, or it's not in the
+    directory) rather than dropping the power info entirely."""
     try:
         assocs = _unwrap_list(hv_get(f"asset/powerSourceAssociations?consumingDestinationAssetId={asset_id}"))
     except requests.exceptions.RequestException:
         logger.exception("rack audit: could not read power sources for asset %s", asset_id)
         return []
-    return [a["providingSourceAssetDisplayName"] for a in assocs if a.get("providingSourceAssetDisplayName")]
+    cache = get_asset_cache()
+    out = []
+    for a in assocs:
+        outlet_name = a.get("providingSourceAssetDisplayName")
+        if not outlet_name:
+            continue
+        outlet = cache.get(a.get("providingSourceAssetId"))
+        pdu_name = outlet.get("parentName") if outlet else None
+        out.append(f"{pdu_name} {outlet_name}" if pdu_name else outlet_name)
+    return out
 
 
 def get_rack_contained_assets(rack_id):
