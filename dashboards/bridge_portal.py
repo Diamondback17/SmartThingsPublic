@@ -1486,6 +1486,22 @@ def _is_admin(username):
     return bool(session.get("is_admin", False))
 
 
+_SYSTEM_DASHBOARD_PATHS = {"hyperview": "/hyperview", "ipro": "/ipro", "ooma": "/ooma", "downtime": "/downtime"}
+
+
+def _single_view_only_dashboard_path(username):
+    """If this account's entire grant is View Only access to exactly one
+    system - no admin, no Operations, nothing at Full Control - they
+    shouldn't see or reach any page but that one dashboard. Returns that
+    dashboard's path, or None if the account has any broader access."""
+    if _is_admin(username) or _user_has_operations(username):
+        return None
+    allowed = _user_systems(username)
+    if len(allowed) != 1 or _user_full_systems(username):
+        return None
+    return _SYSTEM_DASHBOARD_PATHS.get(next(iter(allowed)))
+
+
 PBKDF2_ITERATIONS = 200_000
 
 USERS_DEFAULT = {
@@ -1580,6 +1596,9 @@ def _authenticate(username, password):
     return None
 
 
+_VIEW_ONLY_ALWAYS_ALLOWED_PATHS = {"/logout", "/theme"}
+
+
 def require_login(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -1587,6 +1606,14 @@ def require_login(f):
         if username is None or not session.get("systems"):
             session.clear()
             return redirect(f"/login?next={quote(request.path, safe='')}")
+        dashboard_path = _single_view_only_dashboard_path(username)
+        if (
+            dashboard_path
+            and request.path != dashboard_path
+            and not request.path.startswith(dashboard_path + "/")
+            and request.path not in _VIEW_ONLY_ALWAYS_ALLOWED_PATHS
+        ):
+            return redirect(dashboard_path)
         return f(username, *args, **kwargs)
     return wrapper
 
@@ -1858,12 +1885,12 @@ PAGE_SHELL = """<!DOCTYPE html>
   button:hover {{ background: var(--teal-dark); border-color: var(--teal-dark); box-shadow: var(--shadow-md); }}
   button:active {{ transform: translateY(1px); }}
   button.cancel-btn {{
-    border-color: var(--danger); background: #fff; color: var(--danger);
+    border-color: var(--danger); background: var(--panel); color: var(--danger);
     font-size: 12px; padding: 5px 10px; margin: 0; font-weight: 600; box-shadow: none;
   }}
   button.cancel-btn:hover {{ background: var(--danger-tint); box-shadow: none; }}
-  button.ghost {{ border-color: var(--border-bright); background: #fff; color: var(--text-dim); font-size: 12px; padding: 8px 14px; box-shadow: none; }}
-  button.ghost:hover {{ border-color: var(--teal); color: var(--teal); background: #fff; box-shadow: none; }}
+  button.ghost {{ border-color: var(--border-bright); background: var(--panel); color: var(--text-dim); font-size: 12px; padding: 8px 14px; box-shadow: none; }}
+  button.ghost:hover {{ border-color: var(--teal); color: var(--teal); background: var(--panel); box-shadow: none; }}
   table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
   th {{ text-align: left; color: var(--text-dim); font-weight: 700; text-transform: uppercase;
     font-size: 11px; letter-spacing: 0.05em; padding: 8px 10px; border-bottom: 1.5px solid var(--border-bright);
@@ -1931,7 +1958,7 @@ PAGE_SHELL = """<!DOCTYPE html>
 </header>
 <nav class="top">
   <div class="nav-primary">
-    <a href="/overview" class="{overview_active}">Overview</a>
+    {overview_nav}
     {hyperview_nav}
     {ipro_nav}
     {ooma_nav}
@@ -2196,6 +2223,7 @@ def render_shell(title, body, active, username=""):
     has_full_control_system = bool(accessible_full_systems(username) or ("downtime" in full_allowed)) if username else False
     is_admin = _is_admin(username) if username else False
     has_operations = _user_has_operations(username) if username else False
+    restricted_dashboard_path = _single_view_only_dashboard_path(username) if username else None
     theme_attr = ' data-theme="dark"' if username and _get_user_theme(username) == "dark" else ""
 
     def nav_link(href, active_flag, label, badge=""):
@@ -2237,13 +2265,14 @@ def render_shell(title, body, active, username=""):
         title=title, body=body, username=_esc(username), admin_menu=admin_menu, operations_menu=operations_menu,
         pending_handoff_banner=_pending_handoff_banner_html(username) if username else "",
         logo_b64=COVENANT_LOGO_PNG_B64, favicon_b64=FAVICON_PNG_B64, theme_attr=theme_attr,
-        overview_active="active" if active == "overview" else "",
+        overview_nav="" if restricted_dashboard_path else nav_link("/overview", "overview", "Overview"),
         tools_has_active="nav-has-active" if active in ("acknowledge", "events", "trends") else "",
         acknowledge_nav=_acknowledge_nav_html(active, has_full_control_system),
         events_nav=nav_link("/events-search", "events", "Event search") if has_full_control_system else "",
         trends_nav=nav_link("/trends", "trends", "Trends") if full_allowed else "",
         search_box=('<form class="nav-search" action="/search" method="GET">'
-                     '<input type="text" name="q" id="nav-search-input" placeholder="Search... ( / )" autocomplete="off"></form>') if allowed else "",
+                     '<input type="text" name="q" id="nav-search-input" placeholder="Search... ( / )" autocomplete="off"></form>'
+                     ) if allowed and not restricted_dashboard_path else "",
         hyperview_nav=nav_link("/hyperview", "hyperview", "Hyperview", _nav_badge_html("hyperview")) if "hyperview" in allowed else "",
         ipro_nav=nav_link("/ipro", "ipro", "iPRO Cameras", _nav_badge_html("ipro")) if "ipro" in allowed else "",
         ooma_nav=nav_link("/ooma", "ooma", "Ooma AirDial", _nav_badge_html("ooma")) if "ooma" in allowed else "",
@@ -4816,10 +4845,16 @@ HYPERVIEW_COMPONENT_CSS = """
      their natural height, and only the trailing panel scrolls internally
      to fill whatever room is left. Falls back to normal page flow on
      short or narrow viewports where this can't work. */
-  .board-viewport-wrap { display: flex; flex-direction: column; height: calc(100vh - 380px); min-height: 460px; }
+  .board-viewport-wrap { display: flex; flex-direction: column; height: calc(100vh - 320px); min-height: 560px; }
   .board-viewport-wrap > .board { flex: 0 0 auto; }
   .board-viewport-wrap > .board-fill-panel { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; margin-bottom: 0; }
-  .board-fill-panel .matrix-wrap { flex: 1 1 auto; overflow-y: auto; min-height: 0; }
+  /* The scroll panel's min-height used to be 0, which let flexbox crush it
+     down to almost nothing whenever the board grid above it (matrix/
+     summary panels) was tall enough to eat most of the viewport-fit
+     height - the active-alarm list was technically rendering, just inside
+     a couple pixels of visible space. A real floor keeps it usable even
+     when that means the page itself scrolls a bit past the viewport. */
+  .board-fill-panel .matrix-wrap { flex: 1 1 auto; overflow-y: auto; min-height: 280px; }
   .board-fill-panel .matrix-wrap table thead th { position: sticky; top: 0; z-index: 1; }
   @media (max-width: 1080px), (max-height: 700px) {
     .board-viewport-wrap { height: auto; min-height: 0; }
@@ -9279,7 +9314,7 @@ DOWNTIME_CSS = """
   .downtime-detail-history-link {
     display: inline-flex; align-items: center; justify-content: center;
     font-family: inherit; font-weight: 600; font-size: 12px; padding: 8px 14px;
-    border-radius: 8px; border: 1.5px solid var(--border-bright); background: #fff;
+    border-radius: 8px; border: 1.5px solid var(--border-bright); background: var(--panel);
     color: var(--text-dim); text-decoration: none; cursor: pointer;
   }
   .downtime-detail-history-link:hover { border-color: var(--teal); color: var(--teal); }
@@ -12021,7 +12056,11 @@ def login_page():
                     session["cred_token"] = _stash_ldap_credential(password)
                     if "downtime" in systems:
                         _record_ldap_downtime_operator(username, session["cred_token"])
-                return redirect(next_url)
+                # A View Only, single-system account always lands on its
+                # one dashboard, regardless of what ?next= asked for -
+                # require_login would just bounce them back there anyway.
+                dashboard_path = _single_view_only_dashboard_path(username)
+                return redirect(dashboard_path or next_url)
 
     return Response(_login_page_html(error, next_url), mimetype="text/html")
 
