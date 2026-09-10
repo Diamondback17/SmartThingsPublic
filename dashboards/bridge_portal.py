@@ -1489,17 +1489,34 @@ def _is_admin(username):
 _SYSTEM_DASHBOARD_PATHS = {"hyperview": "/hyperview", "ipro": "/ipro", "ooma": "/ooma", "downtime": "/downtime"}
 
 
-def _single_view_only_dashboard_path(username):
-    """If this account's entire grant is View Only access to exactly one
-    system - no admin, no Operations, nothing at Full Control - they
-    shouldn't see or reach any page but that one dashboard. Returns that
-    dashboard's path, or None if the account has any broader access."""
+def _single_system_dashboard_path(username):
+    """The one dashboard this account's access boils down to, when it's
+    exactly one system and nothing broader (no admin, no Operations) -
+    regardless of View Only vs Full Control tier. Overview never means
+    anything to an account like this (there's nothing else to overview),
+    so it's off limits either way. A Full Control account here still
+    keeps whatever that tier unlocks on its own system (Trends,
+    Acknowledge, Event Search) - only Overview itself is blocked; see
+    _single_view_only_dashboard_path for the stricter View Only case.
+    Returns None for anyone with real cross-system, admin, or Operations
+    access."""
     if _is_admin(username) or _user_has_operations(username):
         return None
     allowed = _user_systems(username)
-    if len(allowed) != 1 or _user_full_systems(username):
+    if len(allowed) != 1:
         return None
     return _SYSTEM_DASHBOARD_PATHS.get(next(iter(allowed)))
+
+
+def _single_view_only_dashboard_path(username):
+    """If this account's entire grant is View Only access to exactly one
+    system - nothing at Full Control either - they shouldn't see or reach
+    any page but that one dashboard, not just Overview. Returns that
+    dashboard's path, or None if the account has any broader or Full
+    Control access."""
+    if _user_full_systems(username):
+        return None
+    return _single_system_dashboard_path(username)
 
 
 PBKDF2_ITERATIONS = 200_000
@@ -1614,6 +1631,10 @@ def require_login(f):
             and request.path not in _VIEW_ONLY_ALWAYS_ALLOWED_PATHS
         ):
             return redirect(dashboard_path)
+        if request.path == "/overview":
+            single_system_path = _single_system_dashboard_path(username)
+            if single_system_path:
+                return redirect(single_system_path)
         return f(username, *args, **kwargs)
     return wrapper
 
@@ -2224,6 +2245,7 @@ def render_shell(title, body, active, username=""):
     is_admin = _is_admin(username) if username else False
     has_operations = _user_has_operations(username) if username else False
     restricted_dashboard_path = _single_view_only_dashboard_path(username) if username else None
+    single_system_path = _single_system_dashboard_path(username) if username else None
     theme_attr = ' data-theme="dark"' if username and _get_user_theme(username) == "dark" else ""
 
     def nav_link(href, active_flag, label, badge=""):
@@ -2265,7 +2287,7 @@ def render_shell(title, body, active, username=""):
         title=title, body=body, username=_esc(username), admin_menu=admin_menu, operations_menu=operations_menu,
         pending_handoff_banner=_pending_handoff_banner_html(username) if username else "",
         logo_b64=COVENANT_LOGO_PNG_B64, favicon_b64=FAVICON_PNG_B64, theme_attr=theme_attr,
-        overview_nav="" if restricted_dashboard_path else nav_link("/overview", "overview", "Overview"),
+        overview_nav="" if single_system_path else nav_link("/overview", "overview", "Overview"),
         tools_has_active="nav-has-active" if active in ("acknowledge", "events", "trends") else "",
         acknowledge_nav=_acknowledge_nav_html(active, has_full_control_system),
         events_nav=nav_link("/events-search", "events", "Event search") if has_full_control_system else "",
@@ -12064,10 +12086,12 @@ def login_page():
                     session["cred_token"] = _stash_ldap_credential(password)
                     if "downtime" in systems:
                         _record_ldap_downtime_operator(username, session["cred_token"])
-                # A View Only, single-system account always lands on its
-                # one dashboard, regardless of what ?next= asked for -
-                # require_login would just bounce them back there anyway.
-                dashboard_path = _single_view_only_dashboard_path(username)
+                # A single-system account (View Only or Full Control)
+                # always lands on its one dashboard, not Overview -
+                # regardless of what ?next= asked for. require_login
+                # would just bounce a View Only account back there anyway,
+                # and Overview never means anything to either tier here.
+                dashboard_path = _single_system_dashboard_path(username)
                 return redirect(dashboard_path or next_url)
 
     return Response(_login_page_html(error, next_url), mimetype="text/html")
