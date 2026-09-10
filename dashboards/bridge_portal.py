@@ -6325,8 +6325,9 @@ RACK_AUDIT_ELEVATION_CSS = """
     background: var(--panel-raised); font-weight: 700; }
   table.ra-table td.chk { text-align: center; width: 55px; }
   table.ra-table .box { display: inline-block; width: 13px; height: 13px; border: 1.5px solid var(--text-dim); border-radius: 2px; }
+  @page { size: letter portrait; margin: 0.5in; }
   @media print {
-    .ra-sheet { border: none; box-shadow: none; padding: 0; }
+    .ra-sheet { border: none; box-shadow: none; padding: 0; max-width: none; }
     /* Shrink the elevation for print - at the full screen row height, a
        tall rack (40U+) doesn't fit one printed page and the diagram splits
        across a page break, which defeats the point of a single audit
