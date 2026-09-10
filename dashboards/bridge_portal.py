@@ -6363,34 +6363,35 @@ RACK_AUDIT_ELEVATION_CSS = """
   .ra-target h2 { margin: 0 0 6px; font-size: 24px; }
   .ra-target .meta { font-size: 13.5px; color: var(--text-dim); }
   .ra-target .meta .overdue { color: var(--danger); font-weight: 700; }
-  .ra-sheet { max-width: 900px; margin: 20px auto 0; background: var(--panel); border: 1px solid var(--border);
-    border-radius: var(--radius); box-shadow: var(--shadow-sm); padding: 30px 36px; }
-  .ra-sheet .ra-sheet-head { display: flex; justify-content: space-between; border-bottom: 3px solid var(--teal);
-    padding-bottom: 12px; margin-bottom: 18px; }
-  .ra-sheet .ra-sheet-head h1 { margin: 0; font-size: 17px; color: var(--teal-dark); }
-  .ra-id-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
-  .ra-id-grid .f-lbl { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-faint); }
-  .ra-id-grid .f-val { font-size: 13.5px; font-weight: 700; margin-top: 2px; }
+  .ra-sheet { max-width: 1100px; margin: 20px auto 0; background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); box-shadow: var(--shadow-sm); padding: 24px 28px; }
+  .ra-sheet-title { margin: 0 0 16px; font-size: 20px; font-weight: 700; color: var(--text); }
   .ra-elevation-row { display: flex; gap: 20px; margin-bottom: 20px; flex-wrap: wrap; }
   .ra-elevation-col .ev-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 700;
     color: var(--text-dim); margin-bottom: 5px; text-align: center; }
-  .ra-elevation { width: 140px; border: 2px solid var(--text); border-radius: 4px; overflow: hidden; }
+  .ra-elevation { width: 140px; border: 1px solid var(--border-bright); border-radius: 4px; overflow: hidden; }
   .ra-elevation .u-row { display: flex; align-items: center; height: 21px; border-bottom: 1px solid var(--border); font-size: 9px; }
   .ra-elevation .u-num { width: 20px; text-align: center; color: var(--text-faint); border-right: 1px solid var(--border);
-    height: 100%; display: flex; align-items: center; justify-content: center; background: var(--panel-raised); }
+    height: 100%; display: flex; align-items: center; justify-content: center; }
   .ra-elevation .u-slot { flex: 1; padding: 0 5px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-  .ra-elevation .u-slot.filled { background: var(--teal-tint); font-weight: 600; }
+  .ra-elevation .u-slot.filled { font-weight: 600; }
   .ra-elevation .u-slot.empty { color: var(--text-faint); }
-  table.ra-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  table.ra-table th, table.ra-table td { padding: 6px 7px; border-bottom: 1px solid var(--border); text-align: left; }
-  table.ra-table th { font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-faint);
-    background: var(--panel-raised); font-weight: 700; }
-  table.ra-table td.chk { text-align: center; width: 55px; }
-  table.ra-table .box { display: inline-block; width: 13px; height: 13px; border: 1.5px solid var(--text-dim); border-radius: 2px; }
+  table.ra-table { width: 100%; border-collapse: collapse; font-size: 11.5px; table-layout: fixed; }
+  table.ra-table th, table.ra-table td { padding: 6px 6px; border-bottom: 1px solid var(--border); text-align: left;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  table.ra-table th { font-size: 9px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-faint);
+    border-bottom: 1.5px solid var(--border-bright); font-weight: 700; }
+  table.ra-table td.notes-col { white-space: normal; height: 30px; }
+  table.ra-table td.chk { text-align: center; }
+  table.ra-table .box { display: inline-block; width: 12px; height: 12px; border: 1.25px solid var(--text-dim); border-radius: 2px; }
   @media print {
     /* @page sizing and the dark-on-white text override are handled once,
        globally, in DASHBOARD_BASE_CSS - every printable page shares them. */
     .ra-sheet { border: none; box-shadow: none; padding: 0; max-width: none; }
+    /* The printout should be just the rack name, elevation, and the
+       device table - the on-screen assignment/target context card isn't
+       part of the printed sheet. */
+    .ra-context-panel { display: none !important; }
     /* Shrink the elevation for print - at the full screen row height, a
        tall rack (40U+) doesn't fit one printed page and the diagram splits
        across a page break, which defeats the point of a single audit
@@ -6400,6 +6401,7 @@ RACK_AUDIT_ELEVATION_CSS = """
     .ra-elevation { page-break-inside: avoid; break-inside: avoid; }
     .ra-elevation .u-row { height: 10px; font-size: 6px; }
     .ra-elevation .u-num { width: 14px; font-size: 6px; }
+    table.ra-table td.notes-col { height: 34px; }
   }
 """
 
@@ -6467,9 +6469,11 @@ def rack_audit_page(username):
         f'<tr><td>{a["u_location"] if a.get("u_location") is not None else "&mdash;"}</td>'
         f'<td>{_esc((a.get("side") or "").capitalize() or "&mdash;")}</td>'
         f'<td>{_esc(a["name"])}</td><td>{_esc(a.get("type") or "")}</td>'
-        f'<td>{_esc(" ".join(x for x in (a.get("manufacturer"), a.get("model")) if x))}</td>'
+        f'<td>{_esc(a.get("manufacturer") or "")}</td><td>{_esc(a.get("model") or "")}</td>'
+        f'<td>{_esc(a.get("serial") or "")}</td>'
         f'<td>{_esc(", ".join(a.get("power_sources") or [])) or "&mdash;"}</td>'
-        f'<td class="chk"><span class="box"></span></td><td class="chk"><span class="box"></span></td><td></td></tr>'
+        f'<td class="chk"><span class="box"></span></td><td class="chk"><span class="box"></span></td><td class="chk"><span class="box"></span></td>'
+        f'<td class="notes-col"></td></tr>'
         for a in assets
     )
 
@@ -6487,7 +6491,7 @@ def rack_audit_page(username):
     </div>
     <style>{DASHBOARD_BASE_CSS}{RACK_AUDIT_ELEVATION_CSS}</style>
     {_msg_html()}
-    <div class="panel">
+    <div class="panel ra-context-panel">
       <div class="assign-note" style="font-size:12.5px; color:var(--text-faint); padding:10px 20px; background:var(--panel-raised); border-bottom:1px solid var(--border);">
         <strong style="color:var(--text-dim);">Your assignment:</strong> {assignment_html}
       </div>
@@ -6501,31 +6505,26 @@ def rack_audit_page(username):
     </div>
 
     <div class="ra-sheet">
-      <div class="ra-sheet-head">
-        <h1>Rack Audit Sheet</h1>
-        <div style="font-size:11.5px; color:var(--text-faint);">Generated {_esc(datetime.now().strftime("%b %-d, %Y"))} &middot; {_esc(datetime.now().strftime("%-I:%M %p"))}</div>
-      </div>
-      <div class="ra-id-grid">
-        <div><div class="f-lbl">Site</div><div class="f-val">{_esc(rack.get("site_path") or rack["site"])}</div></div>
-        <div><div class="f-lbl">Rack</div><div class="f-val">{_esc(rack["name"] or rack["id"])}</div></div>
-        <div><div class="f-lbl">Assets</div><div class="f-val">{len(assets)}</div></div>
-        <div><div class="f-lbl">Auditor</div><div class="f-val">{_esc(username)}</div></div>
-      </div>
+      <h2 class="ra-sheet-title">{_esc(rack["name"] or rack["id"])}</h2>
       <div class="ra-elevation-row">
         <div class="ra-elevation-col"><div class="ev-label">Front</div>{_rack_audit_elevation_html(assets, "front", rack.get("total_u"))}</div>
         <div class="ra-elevation-col"><div class="ev-label">Rear</div>{_rack_audit_elevation_html(assets, "rear", rack.get("total_u"))}</div>
       </div>
       <table class="ra-table">
-        <thead><tr><th>U</th><th>Side</th><th>Device</th><th>Type</th><th>Model</th><th>Power</th><th class="chk">Present</th><th class="chk">Labeled</th><th>Notes</th></tr></thead>
-        <tbody>{asset_rows or '<tr><td colspan="9" class="empty">No assets.</td></tr>'}</tbody>
+        <colgroup>
+          <col style="width:4%"><col style="width:6%"><col style="width:13%"><col style="width:8%">
+          <col style="width:8%"><col style="width:9%"><col style="width:9%"><col style="width:10%">
+          <col style="width:5%"><col style="width:5%"><col style="width:5%"><col style="width:18%">
+        </colgroup>
+        <thead><tr>
+          <th>U</th><th>Side</th><th>Device</th><th>Type</th><th>Make</th><th>Model</th><th>Serial</th><th>Power</th>
+          <th class="chk">Present</th><th class="chk">Labeled</th><th class="chk">Serial</th><th>Notes</th>
+        </tr></thead>
+        <tbody>{asset_rows or '<tr><td colspan="12" class="empty">No assets.</td></tr>'}</tbody>
       </table>
-      <div style="margin-top:20px; display:flex; justify-content:space-between; font-size:11.5px; color:var(--text-faint);">
-        <div style="border-top:1px solid var(--text-dim); width:220px; padding-top:4px;">Auditor signature &amp; date</div>
-        <div>InfraWatch &middot; Covenant Health IT</div>
-      </div>
     </div>
 
-    <div class="panel" style="max-width:900px; margin:16px auto 0;">
+    <div class="panel ra-context-panel" style="max-width:1100px; margin:16px auto 0;">
       <div style="padding:16px 24px; display:flex; align-items:center; justify-content:space-between; gap:16px;">
         <div style="font-size:13px; color:var(--text-dim);">Walked the rack? Mark it done &mdash; this is the only step that touches Hyperview.</div>
         <form method="POST" action="/tools/rack-audit/complete" style="margin:0;">

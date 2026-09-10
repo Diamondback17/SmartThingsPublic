@@ -662,6 +662,7 @@ def get_rack_contained_assets(rack_id):
             "type": asset.get("assetTypeId"),
             "manufacturer": asset.get("manufacturerName"),
             "model": asset.get("productName"),
+            "serial": asset.get("serialNumber"),
             "u_location": loc.get("rackULocation"),
             "side": loc.get("rackSide"),
             "power_sources": get_device_power_sources(asset_id) if asset_id else [],
