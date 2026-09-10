@@ -193,9 +193,14 @@ CONFIG = {
     # Request timeout in seconds.
     "request_timeout_seconds": 15,
 
-    # Address/port the bridge's own JSON HTTP server listens on.
-    # Grafana's JSON API datasource points at this.
-    "listen_host": "0.0.0.0",
+    # Address/port the bridge's own JSON HTTP server listens on. Bound to
+    # localhost only, same as the Hyperview (5001) and iPRO (5002) bridges -
+    # nothing outside this host should be able to reach it directly; the
+    # Bridge Portal (bridge_portal.py) is the only intended caller, and it
+    # already talks to OOMA_BASE_URL over localhost by default. If Grafana's
+    # JSON API datasource needs to reach this directly, point it at a
+    # reverse proxy on this host rather than reopening this to 0.0.0.0.
+    "listen_host": "127.0.0.1",
     "listen_port": 5003,
 
     # --- Maintenance windows -----------------------------------------

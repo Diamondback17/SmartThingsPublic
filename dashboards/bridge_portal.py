@@ -1,39 +1,19 @@
 #!/usr/bin/env python3
 """
-Bridge Portal - the one human-facing login for Covenant Health's facility
-systems. Today that's the iPRO camera bridge (ipro2.py, port 5002), the
-Ooma AirDial bridge (ooma.py, port 5003), and the Hyperview facility-health
-dashboard (matrix.py, port 5001); SYSTEMS below is where a future system's
-maintenance/events wiring gets added, and /overview, /ipro-, /ooma- and
-/hyperview-style dashboard routes are the pattern a new one would follow.
+InfraWatch - single human-facing login for Covenant Health's facility
+systems: iPRO cameras, Ooma AirDial, and Hyperview. SYSTEMS below is where
+a new system's maintenance/events wiring gets added.
 
-For iPRO and Ooma specifically: this replaces each bridge's own
-/maintenance and /events-search pages, which were retired (see their
-BRIDGE_PORTAL_URL / portal_url config) and now just redirect here. Their
-underlying JSON/CSV feeds and write-protected POST routes are UNCHANGED and
-still require each bridge's own maintenance_auth secret - this portal
-authenticates the HUMAN, then calls those routes server-to-server using
-that secret, same as an operator's browser used to. Hyperview never had
-its own login (its JSON feeds are unauthenticated - see HYPERVIEW_BASE_URL
-below); the portal just puts a login in front of its dashboard page,
-nothing server-to-server to forward there.
+Default account (seeded into local_users on first run): chadmin / 3Xce11@nce,
+full access + admin. Manage further access from Admin > Access Management.
 
-Four accounts, per-system scoped:
-    chadmin  - ipro, ooma, and hyperview (same password as before: 3Xce11@nce)
-    security - ipro only
-    network  - ooma only
-Passwords are salted+hashed (PBKDF2-HMAC-SHA256, 200k iterations) rather
-than compared as plaintext - see USERS below. HTTP Basic auth is still the
-transport (matches every other login on these bridges, works natively with
-both a browser prompt and curl/API callers), it's just no longer a single
-shared secret string - each request's username/password is verified
-against that user's own stored hash.
+Run: python bridge_portal.py
 
-Run:
-    python bridge_portal.py
+Config is read from real env vars, or from a .env file (KEY=VALUE per
+line, '#' comments allowed) placed next to this script - a real env var
+always wins if both are set.
 
-Config (env vars, all optional - defaults assume everything runs on one
-host):
+Config (env vars, all optional):
     IPRO_BASE_URL          default http://localhost:5002
     OOMA_BASE_URL          default http://localhost:5003
     HYPERVIEW_BASE_URL     default http://localhost:5001
@@ -43,23 +23,291 @@ host):
 """
 import base64
 import csv
+import difflib
 import hashlib
 import hmac
 import io
 import json
+import math
+import ntpath
 import os
+import re
+import secrets
+import sqlite3
+import subprocess
+import threading
 import time
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from datetime import datetime, timedelta
+from datetime import time as dt_time
 from functools import wraps
-from urllib.parse import quote, urlencode
+from urllib.parse import quote
 
 import requests
-from flask import Flask, Response, request, redirect
+from flask import Flask, Response, request, redirect, session
 from waitress import serve
+
+
+def _load_dotenv():
+    """Read KEY=VALUE lines from a .env file next to this script into
+    os.environ, without overriding anything already set in the real
+    environment. No external dependency - just enough to keep local
+    secrets (e.g. LDAP_BIND_PASSWORD) out of the process's real env
+    config while still being picked up on startup."""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            os.environ.setdefault(key, value)
+
+
+_load_dotenv()
 
 app = Flask(__name__)
 
 REQUEST_TIMEOUT = 15
+# Shared across every user/page - navigating between pages within this
+# window reuses the last fetch instead of a fresh round-trip to each
+# bridge, well under the 30s auto-refresh cadence dashboards already use.
+HTTP_CACHE_TTL_SECONDS = float(os.environ.get("HTTP_CACHE_TTL_SECONDS", "15"))
+_http_cache_lock = threading.Lock()
+_http_cache = {}
+
+
+def _cached_get(url, timeout=REQUEST_TIMEOUT):
+    now = time.time()
+    with _http_cache_lock:
+        entry = _http_cache.get(url)
+        if entry and entry[0] > now:
+            return entry[1]
+    resp = requests.get(url, timeout=timeout)
+    with _http_cache_lock:
+        _http_cache[url] = (now + HTTP_CACHE_TTL_SECONDS, resp)
+    return resp
+
+
+def _parallel_get(base, paths):
+    pool = ThreadPoolExecutor(max_workers=len(paths))
+    try:
+        futures = {path: pool.submit(_cached_get, f"{base}{path}") for path in paths}
+        result_timeout = REQUEST_TIMEOUT + 5
+        return {path: futures[path].result(timeout=result_timeout) for path in paths}
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+COVENANT_LOGO_PNG_B64 = (
+    "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"
+)
+
+
+FAVICON_PNG_B64 = (
+    "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"
+)
 
 SYSTEMS = {
     "ipro": {
@@ -67,62 +315,69 @@ SYSTEMS = {
         "base_url": os.environ.get("IPRO_BASE_URL", "http://localhost:5002"),
         "maintenance_auth": os.environ.get("IPRO_MAINTENANCE_AUTH", "Basic Y2hhZG1pbjozWGNlMTFAbmNl"),
         "target_types": [("camera", "Single camera"), ("server", "Entire server")],
-        "windows_route": "/maintenance-windows",  # one row per real window, has 'key'
-        "device_id_param": "device_id",  # /events query param this backend filters on
+        "windows_route": "/maintenance-windows",
+        "device_id_param": "device_id",
     },
     "ooma": {
         "label": "Ooma AirDial",
         "base_url": os.environ.get("OOMA_BASE_URL", "http://localhost:5003"),
         "maintenance_auth": os.environ.get("OOMA_MAINTENANCE_AUTH", "Basic Y2hhZG1pbjozWGNlMTFAbmNl"),
         "target_types": [("device", "Single device"), ("account", "Entire account")],
-        "windows_route": "/maintenance-log",  # already 1:1 per window, has 'key'
-        "device_id_param": "myx_id",  # ooma.py's /events route names it myx_id, not device_id
+        "windows_route": "/maintenance-log",
+        "device_id_param": "myx_id",
     },
 }
 
-# Hyperview (matrix.py, port 5001) isn't a SYSTEMS entry above - it has no
-# maintenance windows or device event history, just live alarm state, so
-# none of the maintenance/events machinery above applies to it. Its own
-# JSON feeds are entirely unauthenticated already (see matrix.py), so the
-# portal's /hyperview/api/* proxy stays open too, same "read-only feeds
-# don't need a login" convention the bridges themselves use - only the
-# human-facing /hyperview dashboard page requires one.
 HYPERVIEW_BASE_URL = os.environ.get("HYPERVIEW_BASE_URL", "http://localhost:5001")
 
-# Whitelisted, not a raw path passthrough - proxying an arbitrary
-# caller-supplied path to an internal service is an SSRF footgun even
-# when that service is itself unauthenticated.
+DOWNTIME_FEED_URL = os.environ.get(
+    "DOWNTIME_FEED_URL",
+    "https://covdowntime.covhlth.net/ColdFusionApplications/CovDowntimeV2_Monitor/WebService.cfc?method=fnRenderContent&intItemID=0",
+)
+DOWNTIME_SERVICE_PROCESS = os.environ.get("DOWNTIME_SERVICE_PROCESS", "DowntimeReportsUpdater.exe")
+DOWNTIME_SERVICE_EXE = os.environ.get(
+    "DOWNTIME_SERVICE_EXE", r"C:\Program Files (x86)\Downtime\DowntimeReportsUpdater.exe"
+)
+DOWNTIME_RESTART_VERIFY_DELAY_SECONDS = int(os.environ.get("DOWNTIME_RESTART_VERIFY_DELAY_SECONDS", "5"))
+
+OOMA_ACCOUNT_TO_SITE = {
+    "Fort Sanders Regional Medical Center": "Fort Sanders Regional",
+    "Parkwest Medical Center": "Parkwest",
+    "Claiborne Medical Center": "Claiborne",
+    "LeConte Medical Center": "LeConte",
+    "Centerpoint": "Centerpoint",
+    "Covenant IT": None,
+    "Methodist Medical Center": "Methodist",
+    "Peninsula Hospital": "Peninsula",
+    "Fort Loudoun Medical Center": "Fort Loudoun",
+    "Covenant Health Roane": "Roane",
+    "Morristown-Hamblen Healthcare System": "Morristown-Hamblen",
+    "Cumberland Medical Center": "Cumberland",
+}
+
+DOWNTIME_GROUP_TO_SITE = {
+    "HSP_CUMBERLAND": "Cumberland",
+    "HSP_LECONTE": "LeConte",
+    "HSP_LOUDOUN": "Fort Loudoun",
+    "HSP_METHODIST": "Methodist",
+    "HSP_MORRISTOWN": "Morristown-Hamblen",
+    "HSP_PARKWEST": "Parkwest",
+    "HSP_REGIONAL": "Fort Sanders Regional",
+    "HSP_ROANE": "Roane",
+    "HSP_CLAIBORNE": "Claiborne",
+    "HSP_PENINSULA": "Peninsula",
+    "HSP_CENTERPOINT": "Centerpoint",
+}
+
+DOWNTIME_EXCLUDED_GROUPS = {"Z_TESTING"}
+
 HYPERVIEW_ENDPOINTS = {
     "overall-health", "category-summary", "location-health-matrix",
     "clinic-health-matrix", "active-alarm-log", "sites-affected", "last-updated",
 }
 
-# --- iPRO / Ooma live dashboard data ---------------------------------------
-# Both bridges expose their own purpose-built JSON feeds for exactly this -
-# ipro2.py's /overall-health, /location-health-matrix, /clinic-health-matrix,
-# /alarm-summary, /camera-health-summary, /camera-outage-log, and ooma.py's
-# /overall-health, /accounts, /category-summary, /issues - so the two
-# fetch functions below call those directly and assemble their results
-# into the shape the HTML builders further down expect. No portal-side
-# mock data, and no client-exposed proxy route either: ipro2.py
-# deliberately restricts every one of these routes to localhost callers
-# (see its own restrict_raw_endpoints_to_localhost - camera names/
-# locations across a behavioral-health fleet are sensitive), so this
-# fetch happens server-to-server only, same trust boundary as
-# _fetch_windows/_fetch_options above, and the rendered HTML (already
-# behind this portal's own login) is the only thing that ever leaves this
-# process with that data in it.
-#
-# Both bridges also share the same 0 / 1-999 / 1000+ cell encoding
-# matrix.py invented for Hyperview (0 = clear, 1-999 = that many OPEN
-# issues, 1000+ = fully acknowledged, subtract 1000 for the real count) -
-# see _score_cell_html() below for the shared decoder.
 
 def _score_cell_html(value, tone="open"):
-    """Renders one matrix/rollup cell from the shared 0 / 1-999 / 1000+
-    encoding: None = no data for this row (ipro2.py: no server configured
-    for that site yet), 0 = clear, 1-999 = that many OPEN issues, 1000+ =
-    every issue already acknowledged (subtract 1000 for the real count)."""
     if value is None:
         return '<span class="dash-mark">&mdash;</span>'
     if value == 0:
@@ -132,89 +387,76 @@ def _score_cell_html(value, tone="open"):
     return f'<span class="badge {tone}">{value}</span>'
 
 
+def _row_issue_total(row, fields):
+    total = 0
+    for f in fields:
+        v = row.get(f) or 0
+        total += (v - 1000) if v >= 1000 else v
+    return total
+
+
 def _health_tone(score):
-    """The same three-bucket ok/warn/danger split Hyperview's own client
-    JS uses (renderGauge in HYPERVIEW_SCRIPT) - kept identical across all
-    three dashboards so the same CSS var(--{tone}) tokens (and the
-    Overview status dots) mean the same thing everywhere."""
     return "ok" if score == 100 else "warn" if score >= 70 else "danger"
 
 
 def _fetch_ipro_dashboard():
-    """Assembles /ipro's data dict from ipro2.py's real endpoints. Returns
-    None if the bridge can't be reached or any response isn't the JSON
-    shape expected - callers show an honest "could not reach" notice in
-    that case rather than ever falling back to invented numbers.
-
-    Deliberately does NOT use ipro2.py's own /overall-health for the
-    gauge score - that route computes it from is_offline()/is_degraded(),
-    which are maintenance-aware (see _open_alarm_counts's docstring in
-    ipro2.py): acknowledging a camera removes it from that count
-    entirely, so the score visibly IMPROVED the moment something was
-    acknowledged, before the underlying problem was actually fixed. The
-    score below is built from /alarm-summary's own open+acknowledged
-    total per category instead - the TRUE count regardless of
-    acknowledgment, by that route's own design (see its docstring: "open"
-    + "acknowledged" on any row is the true total) - using the same
-    weighting /overall-health itself uses (offline full weight, degraded
-    half weight, infrastructure issues weighted 25 each), so the number
-    only moves when a camera/server actually recovers or a new one
-    actually breaks, never on an acknowledgment alone."""
     base = SYSTEMS["ipro"]["base_url"]
     try:
-        hospitals = requests.get(f"{base}/location-health-matrix", timeout=REQUEST_TIMEOUT).json()
-        clinics = requests.get(f"{base}/clinic-health-matrix", timeout=REQUEST_TIMEOUT).json()
-        alarm_rows = requests.get(f"{base}/alarm-summary", timeout=REQUEST_TIMEOUT).json()
-        totals = requests.get(f"{base}/camera-health-summary", timeout=REQUEST_TIMEOUT).json()[0]
-        devices = requests.get(f"{base}/camera-outage-log", timeout=REQUEST_TIMEOUT).json()
-        last_updated = requests.get(f"{base}/last-updated", timeout=REQUEST_TIMEOUT).json()[0]["updated"]
-    except (requests.RequestException, ValueError, IndexError, KeyError):
+        resp = _parallel_get(base, [
+            "/location-health-matrix", "/clinic-health-matrix", "/alarm-summary",
+            "/camera-health-summary", "/camera-issue-log", "/last-updated",
+        ])
+        hospitals = resp["/location-health-matrix"].json()
+        clinics = resp["/clinic-health-matrix"].json()
+        alarm_rows = resp["/alarm-summary"].json()
+        totals = resp["/camera-health-summary"].json()[0]
+        # /camera-issue-log, not /camera-outage-log: the outage log drops a
+        # camera the instant it's acknowledged, which wrongly reads as
+        # "resolved" to _open_target_names' diffing.
+        devices = resp["/camera-issue-log"].json()
+        last_updated = resp["/last-updated"].json()[0]["updated"]
+    except (requests.RequestException, ValueError, IndexError, KeyError, FuturesTimeoutError):
         return None
 
     true_counts = {r["category"]: r["open"] + r["acknowledged"] for r in alarm_rows}
-    score = round(max(0, min(100, 100
-        - true_counts.get("Offline Cams", 0)
-        - true_counts.get("Degraded Cams", 0) * 0.5
-        - true_counts.get("Infrastructure Issues", 0) * 25
-    )))
+    total_cameras = totals.get("totalCameras") or 0
+    if total_cameras:
+        # % of the fleet healthy: offline=1 camera, degraded=0.5, infra
+        # issue=25 (usually shared equipment threatening many cameras).
+        weighted_unhealthy = (
+            true_counts.get("Offline Cams", 0)
+            + true_counts.get("Degraded Cams", 0) * 0.5
+            + true_counts.get("Infrastructure Issues", 0) * 25
+        )
+        score = round(max(0, min(100, 100 * (1 - weighted_unhealthy / total_cameras))))
+    else:
+        score = 100
     return {
         "gauge": {"score": score, "tone": _health_tone(score)},
         "totals": totals,
-        # Drop the "Total Issues" row - _summary_table_html computes its
-        # own totals row from whatever categories it's given, same as it
-        # always has, so passing the backend's own precomputed total
-        # alongside would just render it twice.
         "summary": [r for r in alarm_rows if r["category"] != "Total Issues"],
         "hospitals": hospitals,
         "clinics": clinics,
         "devices": devices,
-        # ipro2.py's own last successful poll time (see last_refresh_time
-        # in ipro2.py), not this portal's render time - see
-        # _summary_table_html's docstring for why that distinction matters.
         "last_updated": _format_ipro_last_updated(last_updated),
     }
 
 
-# Mirrors ooma.py's own _EFFECTIVE_STATUS_CREDIT / build_overall_health()
-# formula, but applied to /devices' record["effective_status"] - which
-# that route's own docstring guarantees is NEVER maintenance-suppressed -
-# instead of /overall-health, whose score is built from effective_issues()
-# and therefore jumps back up the moment a still-broken device is
-# acknowledged into a maintenance window. Same fix as iPRO's score, above.
 _OOMA_STATUS_CREDIT = {"OK": 1.0, "DEGRADED": 0.5, "DOWN": 0.0}
 
 
 def _fetch_ooma_dashboard():
-    """Same idea as _fetch_ipro_dashboard(), against ooma.py's own
-    /devices, /accounts, /category-summary, /issues, /last-updated."""
     base = SYSTEMS["ooma"]["base_url"]
     try:
-        devices = requests.get(f"{base}/devices", timeout=REQUEST_TIMEOUT).json()
-        accounts = requests.get(f"{base}/accounts", timeout=REQUEST_TIMEOUT).json()
-        category_rows = requests.get(f"{base}/category-summary", timeout=REQUEST_TIMEOUT).json()
-        issues = requests.get(f"{base}/issues", timeout=REQUEST_TIMEOUT).json()
-        last_updated = requests.get(f"{base}/last-updated", timeout=REQUEST_TIMEOUT).json()[0]["timestamp"]
-    except (requests.RequestException, ValueError, IndexError, KeyError):
+        resp = _parallel_get(base, ["/devices", "/accounts", "/category-summary", "/issue-log", "/last-updated"])
+        devices = resp["/devices"].json()
+        accounts = resp["/accounts"].json()
+        category_rows = resp["/category-summary"].json()
+        # /issue-log, not /issues: same gap as iPRO's /camera-outage-log
+        # above - /issues drops a device the instant it's acknowledged.
+        issues = resp["/issue-log"].json()
+        last_updated = resp["/last-updated"].json()[0]["timestamp"]
+    except (requests.RequestException, ValueError, IndexError, KeyError, FuturesTimeoutError):
         return None
 
     total = len(devices)
@@ -223,192 +465,1407 @@ def _fetch_ooma_dashboard():
 
     return {
         "gauge": {"score": score, "state": _health_state_label(score), "tone": _health_tone(score)},
-        # "All" is ooma.py's own precomputed total row (📋 All) - same
-        # reasoning as iPRO's "Total Issues" above, drop it so
-        # _summary_table_html's own generated totals row is the only one.
         "summary": [r for r in category_rows if "All" not in r["category"]],
         "accounts": accounts,
         "issues": issues,
-        # ooma.py's own last completed poll cycle (Poller._last_poll_ts,
-        # via /last-updated), not this portal's render time - see
-        # _summary_table_html's docstring for why that distinction matters
-        # (especially post the poller-hang fix: a cycle that hit
-        # cycle_timeout still costs freshness for the devices it dropped).
         "last_updated": _format_epoch_ms(last_updated),
     }
 
 
-# --- users -------------------------------------------------------------
-# PBKDF2-HMAC-SHA256, 200k iterations, per-user random salt - generated
-# once (see the delivery notes for how) and hardcoded here the same way
-# the OLD shared MAINTENANCE_AUTH secret was hardcoded in both bridges -
-# override any of them via env vars below if you want to rotate a
-# password without editing this file.
+def _fetch_downtime_data():
+    try:
+        resp = _cached_get(DOWNTIME_FEED_URL)
+        resp.raise_for_status()
+        raw = resp.json()
+        columns = [c.lower() for c in raw["COLUMNS"]]
+        rows = [dict(zip(columns, row)) for row in raw["DATA"]]
+        return [r for r in rows if r.get("strgroupname") not in DOWNTIME_EXCLUDED_GROUPS]
+    except (requests.RequestException, ValueError, KeyError):
+        return None
+
+
+def _downtime_row_is_issue(row, alive=None):
+    """Needs attention when the service is down AND has a real queue
+    backlog (a momentary flicker with nothing queued doesn't count), or
+    when a ping fails outright regardless of queue state."""
+    if row.get("strclassname") != "cssDeviceAlert":
+        return False
+    if alive is False:
+        return True
+    return (row.get("intpackageundelivered") or 0) > 0
+
+
+def _downtime_issue_rows(rows, ping_results=None):
+    if ping_results is None:
+        return [r for r in rows if _downtime_row_is_issue(r)]
+    return [r for r in rows if _downtime_row_is_issue(r, ping_results.get(r.get("strhostname")))]
+
+
+_SCORE_HISTORY_WINDOW_SECONDS = 16 * 3600
+_SCORE_HISTORY_INTERVAL_SECONDS = 300
+_score_history_lock = threading.Lock()
+_score_history = {"hyperview": [], "ipro": [], "ooma": [], "downtime": []}
+
+
+def _system_score(name):
+    try:
+        if name == "hyperview":
+            resp = requests.get(f"{HYPERVIEW_BASE_URL}/overall-health", timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            return resp.json()[0]["health"]
+        if name == "ipro":
+            data = _fetch_ipro_dashboard()
+            return data["gauge"]["score"] if data else None
+        if name == "ooma":
+            data = _fetch_ooma_dashboard()
+            return data["gauge"]["score"] if data else None
+        if name == "downtime":
+            rows = _fetch_downtime_data()
+            if rows is None:
+                return None
+            if not rows:
+                return 100
+            candidates = [r for r in rows if r.get("strclassname") == "cssDeviceAlert"]
+            ping_results = _ping_hosts([r.get("strhostname") for r in candidates])
+            alerting = len(_downtime_issue_rows(candidates, ping_results))
+            return round(max(0, 100 - (alerting / len(rows)) * 100))
+    except (requests.RequestException, KeyError, IndexError, ValueError):
+        return None
+    return None
+
+
+def _dedup_site_targets(sites, alarming_rows):
+    """Site names flagged 'site' whose incident isn't already explained by
+    an alarming device at that same location, unioned with the device
+    names themselves - shared by hyperview/ipro's _open_target_names
+    branches below, which have identical site/device shapes. Otherwise one
+    incident (a single alarming device) double-logs as both the site and
+    the device. Returns (all_target_names, device_target_names) - the
+    second lets callers tell a device target from a site target."""
+    device_targets = {a["device"] for a in alarming_rows if a.get("device")}
+    alarming_locations = {a["location"] for a in alarming_rows if a.get("device") and a.get("location")}
+    site_targets = {
+        _strip_emoji(r.get("locationDisplay") or r["location"]) for r in sites
+        if r.get("site") and r["location"] not in alarming_locations
+    }
+    return site_targets | device_targets, device_targets
+
+
+def _open_target_names(name):
+    """Best-effort set of currently-open/alerting target names for a system -
+    host names for downtime (matches acknowledgment targets exactly), site/
+    location names for hyperview/ipro/ooma (matches the grouped acknowledgment
+    target type). Used to detect when an issue actually clears from the
+    dashboard, not just when someone clicks un-acknowledge. Returns
+    (all_target_names, device_target_names) - (None, set()) on failure -
+    so callers can log the correct target_type instead of always None."""
+    try:
+        if name == "downtime":
+            rows = _fetch_downtime_data()
+            if rows is None:
+                return None, set()
+            candidates = [r for r in rows if r.get("strclassname") == "cssDeviceAlert" and r.get("strhostname")]
+            ping_results = _ping_hosts([r.get("strhostname") for r in candidates])
+            hosts = {r["strhostname"] for r in _downtime_issue_rows(candidates, ping_results)}
+            return hosts, hosts
+        if name == "hyperview":
+            resp = _parallel_get(HYPERVIEW_BASE_URL, ["/location-health-matrix", "/clinic-health-matrix", "/active-alarm-log"])
+            resp["/location-health-matrix"].raise_for_status()
+            resp["/clinic-health-matrix"].raise_for_status()
+            resp["/active-alarm-log"].raise_for_status()
+            sites = resp["/location-health-matrix"].json() + resp["/clinic-health-matrix"].json()
+            return _dedup_site_targets(sites, resp["/active-alarm-log"].json())
+        if name == "ipro":
+            data = _fetch_ipro_dashboard()
+            if data is None:
+                return None, set()
+            sites = data["hospitals"] + data["clinics"]
+            return _dedup_site_targets(sites, data["devices"])
+        if name == "ooma":
+            data = _fetch_ooma_dashboard()
+            if data is None:
+                return None, set()
+            device_targets = {i["device"] for i in data["issues"] if i.get("device")}
+            # Compared by raw account string, NOT resolved site name (tried
+            # and reverted): two accounts can share a site via
+            # OOMA_ACCOUNT_TO_SITE, and comparing by resolved site let one
+            # account's device-level noise make the site flap in/out of
+            # current_open independently of its own state, causing spurious
+            # re-alarms. Exact-string match keeps both sides in the same
+            # poll's data, at the cost of two accounts at one physical site
+            # showing as two stable rows instead of a merged one.
+            alarming_accounts = {i["account"] for i in data["issues"] if i.get("device") and i.get("account")}
+            site_targets = {
+                site for a in data["accounts"]
+                if a.get("site") and a["account"] not in alarming_accounts
+                and (site := OOMA_ACCOUNT_TO_SITE.get(a["account"]))
+            }
+            return site_targets | device_targets, device_targets
+    except (requests.RequestException, KeyError, IndexError, ValueError, FuturesTimeoutError):
+        return None, set()
+    return None, set()
+
+
+_open_targets_lock = threading.Lock()
+_open_targets_prev = {"hyperview": None, "ipro": None, "ooma": None, "downtime": None}
+
+
+def _load_open_targets_from_db():
+    """Restores each system's last-known open-target set so a restart
+    doesn't lose the diffing baseline and miss already-open issues."""
+    try:
+        conn = _maintenance_log_db()
+        try:
+            rows = conn.execute("SELECT system, targets FROM open_targets_state").fetchall()
+        finally:
+            conn.close()
+        with _open_targets_lock:
+            for system, targets in rows:
+                if system in _open_targets_prev:
+                    _open_targets_prev[system] = {t for t in targets.split(",") if t}
+    except Exception:
+        pass
+
+
+def _save_open_targets_state(system, targets):
+    try:
+        conn = _maintenance_log_db()
+        try:
+            conn.execute(
+                "INSERT INTO open_targets_state (system, targets) VALUES (?, ?) "
+                "ON CONFLICT(system) DO UPDATE SET targets = excluded.targets",
+                (system, ",".join(sorted(targets))),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+ALARM_MONITOR_SET_BY = "system-monitor"
+
+# (single-target type, grouped/site-target type) per system, for tagging
+# auto-detected alarm/resolved rows correctly instead of always None -
+# downtime has no grouped concept, every target is a workstation.
+TARGET_TYPE_FOR_SYSTEM = {
+    "downtime": ("workstation", "workstation"),
+    "ipro": ("camera", "server"),
+    "ooma": ("device", "account"),
+    "hyperview": ("device", "site"),
+}
+
+# Remembers the last-known type (device vs site/account) of every target
+# name ever seen per system, since a target that just cleared is no longer
+# in that poll's device set and needs its type looked up from before it
+# disappeared. In-memory only - worst case after a restart is a blank
+# target_type tag until each target is seen open at least once again.
+_target_type_cache = {"hyperview": {}, "ipro": {}, "ooma": {}, "downtime": {}}
+_target_type_cache_lock = threading.Lock()
+
+# Hyperview alarms are acknowledged directly in Hyperview, not through
+# InfraWatch - there's no InfraWatch ack flow for it. But the upstream
+# /active-alarm-log response carries its own per-alarm 'acknowledged' flag,
+# which _hyperview_status_tick already reads to show the "Acknowledged" tag
+# live. This remembers which currently-alarming devices were already seen
+# acknowledged, so a poll-over-poll flip to True can be logged as a real
+# 'acknowledged' maintenance_actions row the first time it's seen - giving
+# Hyperview real (if poll-interval-grained) event history and MTTA data
+# instead of neither.
+HYPERVIEW_UPSTREAM_ACK_SET_BY = "Hyperview"
+_hyperview_acked_devices = set()
+_hyperview_acked_devices_lock = threading.Lock()
+
+
+def _check_alarm_changes(system, current_open, device_target_names=None):
+    """Diffs this poll's open-target set against the last one: a new
+    target logs an 'alarm' credited to the automated monitor; a target that
+    cleared logs 'resolved' too - credited to whoever acked/restarted it
+    during THIS incident if anyone did, otherwise to the automated monitor
+    (the same as 'alarm' already does), so a target that recovers on its
+    own is still a real, visible event - not a silent gap in Recent
+    Activity, the device's own history page, and MTTR. `prev is None` skips
+    both - nothing to diff yet."""
+    if current_open is None:
+        return
+    device_target_names = device_target_names or set()
+    single_type, grouped_type = TARGET_TYPE_FOR_SYSTEM.get(system, (None, None))
+    with _target_type_cache_lock:
+        cache = _target_type_cache.setdefault(system, {})
+        for target in current_open:
+            cache[target] = single_type if target in device_target_names else grouped_type
+
+    with _open_targets_lock:
+        prev = _open_targets_prev[system]
+        _open_targets_prev[system] = current_open
+    _save_open_targets_state(system, current_open)
+    if prev is None:
+        return
+
+    for target in current_open - prev:
+        try:
+            _log_maintenance_action(system, "alarm", target, cache.get(target), None, ALARM_MONITOR_SET_BY)
+        except Exception:
+            pass
+
+    cleared = prev - current_open
+    if not cleared:
+        return
+    recent = _query_maintenance_actions(system, since_ts=time.time() - 7 * 86400)
+    # An ack/restart only counts toward THIS clearing if it happened after
+    # the target's most recent alarm onset - otherwise a stale ack from an
+    # earlier incident (days ago, already resolved once) gets credited
+    # again when the target goes down and recovers on its own a second
+    # time with nobody touching it.
+    last_alarm_ts = {}
+    for a in recent:
+        if a["action"] != "alarm":
+            continue
+        prior_ts = last_alarm_ts.get(a["target"])
+        if prior_ts is None or a["ts"] > prior_ts:
+            last_alarm_ts[a["target"]] = a["ts"]
+    last_responder = {}
+    for a in recent:
+        if a["action"] not in ("acknowledged", "restarted"):
+            continue
+        onset = last_alarm_ts.get(a["target"])
+        if onset is not None and a["ts"] < onset:
+            continue
+        prior = last_responder.get(a["target"])
+        if prior is None or a["ts"] > prior["ts"]:
+            last_responder[a["target"]] = a
+    for target in cleared:
+        set_by = last_responder[target]["set_by"] if target in last_responder else ALARM_MONITOR_SET_BY
+        try:
+            _log_maintenance_action(system, "resolved", target, cache.get(target), None, set_by)
+        except Exception:
+            pass
+
+
+def _load_score_history_from_db():
+    try:
+        conn = _maintenance_log_db()
+        try:
+            cutoff = int(time.time()) - _SCORE_HISTORY_WINDOW_SECONDS
+            with _score_history_lock:
+                for name in _score_history:
+                    rows = conn.execute(
+                        "SELECT ts, score FROM score_history WHERE system = ? AND ts >= ? ORDER BY ts ASC",
+                        (name, cutoff),
+                    ).fetchall()
+                    _score_history[name] = [(float(ts), score) for ts, score in rows]
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def _record_score_history():
+    _load_score_history_from_db()
+    _load_open_targets_from_db()
+    while True:
+        now = time.time()
+        for name in _score_history:
+            score = _system_score(name)
+            if score is not None:
+                with _score_history_lock:
+                    points = _score_history[name]
+                    points.append((now, score))
+                    cutoff = now - _SCORE_HISTORY_WINDOW_SECONDS
+                    while points and points[0][0] < cutoff:
+                        points.pop(0)
+                try:
+                    conn = _maintenance_log_db()
+                    try:
+                        conn.execute(
+                            "INSERT INTO score_history (system, ts, score) VALUES (?, ?, ?)",
+                            (name, int(now), score),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                except Exception:
+                    pass
+            if name == "hyperview":
+                # Handled by _hyperview_status_tick at its own, faster
+                # cadence - see the comment there.
+                continue
+            try:
+                current_open, device_target_names = _open_target_names(name)
+                _check_alarm_changes(name, current_open, device_target_names)
+            except Exception:
+                pass
+        time.sleep(_SCORE_HISTORY_INTERVAL_SECONDS)
+
+
+def _sparkline_svg(name, width=120, height=28):
+    with _score_history_lock:
+        points = list(_score_history.get(name, ()))
+    if len(points) < 2:
+        return '<span class="sparkline-empty">Collecting trend data&hellip;</span>'
+
+    scores = [s for _, s in points]
+    lo, hi = min(scores), max(scores)
+    n = len(points)
+    if hi == lo:
+        coords = [f"{(i / (n - 1)) * width:.1f},{height / 2:.1f}" for i in range(n)]
+    else:
+        span = hi - lo
+        coords = [
+            f"{(i / (n - 1)) * width:.1f},{height - ((s - lo) / span) * height:.1f}"
+            for i, s in enumerate(scores)
+        ]
+    tone = _health_tone(scores[-1])
+    return (
+        f'<svg class="sparkline" viewBox="0 0 {width} {height}" preserveAspectRatio="none">'
+        f'<polyline points="{" ".join(coords)}" fill="none" stroke="var(--{tone})" '
+        f'stroke-width="2" stroke-linejoin="round" stroke-linecap="round" /></svg>'
+    )
+
+
+TRENDS_RANGE_HOURS = {"24h": 24, "7d": 7 * 24, "30d": 30 * 24, "90d": 90 * 24}
+TRENDS_DEFAULT_RANGE = "7d"
+
+
+def _history_points(name, since_ts, until_ts, max_points=400):
+    conn = _maintenance_log_db()
+    try:
+        rows = conn.execute(
+            "SELECT ts, score FROM score_history WHERE system = ? AND ts >= ? AND ts <= ? ORDER BY ts ASC",
+            (name, since_ts, until_ts),
+        ).fetchall()
+    finally:
+        conn.close()
+    points = [(float(ts), score) for ts, score in rows]
+    if len(points) > max_points:
+        stride = math.ceil(len(points) / max_points)
+        points = points[::stride]
+    return points
+
+
+def _combined_history_points(keys, since_ts, until_ts, max_points=400):
+    """Synthetic 'Combined' series - averages each system's score per
+    shared timestamp; a system missing at a given poll (fetch failure) is
+    excluded from that point's average rather than dragging it down."""
+    if not keys:
+        return []
+    conn = _maintenance_log_db()
+    try:
+        placeholders = ",".join("?" for _ in keys)
+        rows = conn.execute(
+            f"SELECT ts, score FROM score_history WHERE system IN ({placeholders}) AND ts >= ? AND ts <= ? "
+            f"ORDER BY ts ASC",
+            (*keys, since_ts, until_ts),
+        ).fetchall()
+    finally:
+        conn.close()
+    by_ts = {}
+    for ts, score in rows:
+        by_ts.setdefault(ts, []).append(score)
+    points = [(float(ts), round(sum(scores) / len(scores))) for ts, scores in sorted(by_ts.items())]
+    if len(points) > max_points:
+        stride = math.ceil(len(points) / max_points)
+        points = points[::stride]
+    return points
+
+
+def _trend_points_for_key(key, wanted, since_ts, until_ts):
+    if key == "combined":
+        return _combined_history_points(wanted, since_ts, until_ts)
+    return _history_points(key, since_ts, until_ts)
+
+
+def _trend_grid_labels_html(values, y_of, height):
+    """Grid labels as an HTML overlay, not inline SVG <text> - the chart
+    SVG scales non-uniformly, which would stretch inline text."""
+    lo, hi = min(values), max(values)
+    items = []
+    for v in values:
+        y = y_of(v)
+        if v == hi:
+            transform = ""
+        elif v == lo:
+            transform = "transform: translateY(-100%);"
+        else:
+            transform = "transform: translateY(-50%);"
+        items.append(f'<span style="top:{y:.1f}px; {transform}">{v}</span>')
+    return f'<div class="trend-grid-labels" style="height:{height}px;">{"".join(items)}</div>'
+
+
+def _score_range(scores, pad_frac=0.08):
+    """Y-axis (lo, hi) zoomed to the actual score spread, with padding -
+    used by the 'zoom to data' toggle so small fluctuations stay visible."""
+    lo, hi = min(scores), max(scores)
+    if lo == hi:
+        lo, hi = lo - 5, hi + 5
+    pad = (hi - lo) * pad_frac
+    return max(0, round(lo - pad)), min(100, round(hi + pad))
+
+
+def _trend_time_labels_html(since_ts, until_ts, bucket_seconds, width, height, count=6):
+    """X-axis time labels positioned by timestamp, not point index, so
+    differently-sampled series can share one axis."""
+    if until_ts <= since_ts:
+        return ""
+    items = []
+    for i in range(count + 1):
+        frac = i / count
+        ts = since_ts + frac * (until_ts - since_ts)
+        items.append((frac * width, _bucket_label(ts, bucket_seconds)))
+    return _trend_x_labels_html(items, width, height)
+
+
+def _trend_chart_svg(points, width=760, height=170, y_range=None, since_ts=None, until_ts=None, bucket_seconds=86400):
+    if len(points) < 2:
+        return '<p class="empty">Not enough history yet for this range.</p>'
+    scores = [s for _, s in points]
+    n = len(points)
+    xs = [(i / (n - 1)) * width for i in range(n)]
+    pad_top, pad_bottom = 14, 24
+    y_lo, y_hi = y_range if y_range else (0, 100)
+    if y_hi <= y_lo:
+        y_hi = y_lo + 1
+
+    def y_of(score):
+        usable = height - pad_top - pad_bottom
+        clamped = max(y_lo, min(y_hi, score))
+        return pad_top + usable - ((clamped - y_lo) / (y_hi - y_lo)) * usable
+
+    coords = [f"{x:.1f},{y_of(s):.1f}" for x, s in zip(xs, scores)]
+    area_coords = f"0,{height} " + " ".join(coords) + f" {width},{height}"
+    tone = _health_tone(scores[-1])
+    grid_values = (y_lo, round((y_lo + y_hi) / 2), y_hi)
+    grid = "".join(
+        f'<line x1="0" y1="{y_of(v):.1f}" x2="{width}" y2="{y_of(v):.1f}" class="trend-grid-line" />'
+        for v in grid_values
+    )
+    svg = (
+        f'<svg class="trend-chart" style="height:{height}px;" viewBox="0 0 {width} {height}" preserveAspectRatio="none">'
+        f'{grid}'
+        f'<polygon points="{area_coords}" class="trend-area" fill="var(--{tone})" />'
+        f'<polyline points="{" ".join(coords)}" fill="none" stroke="var(--{tone})" '
+        f'stroke-width="2" stroke-linejoin="round" stroke-linecap="round" /></svg>'
+    )
+    labels = _trend_grid_labels_html(grid_values, y_of, height)
+    x_labels = (
+        _trend_time_labels_html(since_ts, until_ts, bucket_seconds, width, height)
+        if since_ts is not None and until_ts is not None else ""
+    )
+    hover_points = [
+        {"x": round(100 * i / (n - 1), 3), "y": round(y_of(s), 1), "t": int(ts), "v": s}
+        for i, (ts, s) in enumerate(points)
+    ]
+    hover_html = '<div class="trend-hover-dot" hidden></div><div class="trend-hover-tip" hidden></div>'
+    return (
+        f'<div class="trend-chart-wrap trend-hoverable" data-points="{_esc(json.dumps(hover_points))}">'
+        f'{svg}{labels}{x_labels}{hover_html}</div>'
+    )
+
+
+def _uptime_pct(points):
+    if not points:
+        return None
+    healthy = sum(1 for _, s in points if s >= 100)
+    return round(100 * healthy / len(points))
+
+
+OVERLAY_COLORS = ["#3b82f6", "#f59e0b", "#10b981", "#ef4444", "#a855f7"]
+
+
+def _trend_overlay_chart_svg(series_by_key, width=760, height=200, y_range=None,
+                              since_ts=None, until_ts=None, bucket_seconds=86400):
+    plottable = [(key, pts) for key, pts in series_by_key if len(pts) >= 2]
+    if not plottable:
+        return '<p class="empty">Not enough history yet for this range.</p>'
+    pad_top, pad_bottom = 14, 24
+    usable = height - pad_top - pad_bottom
+    y_lo, y_hi = y_range if y_range else (0, 100)
+    if y_hi <= y_lo:
+        y_hi = y_lo + 1
+
+    def y_of(score):
+        clamped = max(y_lo, min(y_hi, score))
+        return pad_top + usable - ((clamped - y_lo) / (y_hi - y_lo)) * usable
+
+    grid_values = (y_lo, round((y_lo + y_hi) / 2), y_hi)
+    grid = "".join(
+        f'<line x1="0" y1="{y_of(v):.1f}" x2="{width}" y2="{y_of(v):.1f}" class="trend-grid-line" />'
+        for v in grid_values
+    )
+    lines = []
+    for i, (key, pts) in enumerate(series_by_key):
+        if len(pts) < 2:
+            continue
+        color = OVERLAY_COLORS[i % len(OVERLAY_COLORS)]
+        n = len(pts)
+        coords = " ".join(f"{(j / (n - 1)) * width:.1f},{y_of(s):.1f}" for j, (_, s) in enumerate(pts))
+        lines.append(
+            f'<polyline points="{coords}" fill="none" stroke="{color}" '
+            f'stroke-width="2" stroke-linejoin="round" stroke-linecap="round" />'
+        )
+    svg = f'<svg class="trend-chart" style="height:{height}px;" viewBox="0 0 {width} {height}" preserveAspectRatio="none">{grid}{"".join(lines)}</svg>'
+    labels = _trend_grid_labels_html(grid_values, y_of, height)
+    x_labels = (
+        _trend_time_labels_html(since_ts, until_ts, bucket_seconds, width, height)
+        if since_ts is not None and until_ts is not None else ""
+    )
+    return f'<div class="trend-chart-wrap">{svg}{labels}{x_labels}</div>'
+
+
+def _trend_overlay_legend_html(series_by_key):
+    items = "".join(
+        f'<span class="trend-legend-item"><span class="trend-legend-dot" '
+        f'style="background:{OVERLAY_COLORS[i % len(OVERLAY_COLORS)]}"></span>{_esc(TRENDS_SYSTEM_LABELS[key])}</span>'
+        for i, (key, _) in enumerate(series_by_key)
+    )
+    return f'<div class="trend-legend">{items}</div>'
+
+
+def _bucket_label(ts, bucket_seconds):
+    dt = datetime.fromtimestamp(ts)
+    return dt.strftime("%H:%M") if bucket_seconds < 86400 else dt.strftime("%b %d")
+
+
+def _activity_series(system, since_ts, until_ts, bucket_seconds):
+    conn = _maintenance_log_db()
+    try:
+        rows = conn.execute(
+            "SELECT ts, action, incident_number FROM maintenance_actions "
+            "WHERE system = ? AND ts >= ? AND ts <= ? ORDER BY ts ASC",
+            (system, since_ts, until_ts),
+        ).fetchall()
+    finally:
+        conn.close()
+    buckets = {}
+    for ts, action, incident_number in rows:
+        b = int(ts // bucket_seconds) * bucket_seconds
+        counts = buckets.setdefault(b, {"ack": 0, "incident": 0, "restart": 0, "resolved": 0})
+        if action == "acknowledged":
+            counts["ack"] += 1
+            if incident_number:
+                counts["incident"] += 1
+        elif action == "restarted":
+            counts["restart"] += 1
+        elif action == "resolved":
+            counts["resolved"] += 1
+    start = int(since_ts // bucket_seconds) * bucket_seconds
+    end = int(until_ts // bucket_seconds) * bucket_seconds
+    out = []
+    b = start
+    while b <= end:
+        out.append((b, buckets.get(b, {"ack": 0, "incident": 0, "restart": 0, "resolved": 0})))
+        b += bucket_seconds
+    return out
+
+
+ACTIVITY_SERIES_META = {
+    "ack": ("Acknowledgments", "var(--teal)"),
+    "incident": ("Incidents logged", "var(--danger)"),
+    "restart": ("Service restarts", "var(--warn)"),
+    "resolved": ("Issues cleared", "var(--ok)"),
+}
+
+
+def _trend_x_labels_html(label_items, width, height):
+    """Bucket/date labels along the x-axis, rendered as an HTML overlay for
+    the same reason as _trend_grid_labels_html - text drawn inside the
+    chart's non-uniformly-scaled SVG (preserveAspectRatio="none") stretches
+    horizontally along with everything else; positioning as % of width here
+    keeps each label lined up with its bar while staying undistorted."""
+    items = "".join(
+        f'<span style="left:{(x / width) * 100:.3f}%;">{_esc(text)}</span>'
+        for x, text in label_items
+    )
+    return f'<div class="trend-x-labels" style="top:{height - 16}px;">{items}</div>'
+
+
+def _activity_chart_svg(buckets, bucket_seconds, series_keys, width=760, height=150):
+    if not buckets or not any(any(counts[k] for k in series_keys) for _, counts in buckets):
+        return '<p class="empty">No activity in this range.</p>'
+    pad_top, pad_bottom = 10, 24
+    usable_h = height - pad_top - pad_bottom
+    max_val = max((counts[k] for _, counts in buckets for k in series_keys), default=0)
+    max_val = max(max_val, 1)
+    n = len(buckets)
+    slot_w = width / n
+    group_w = slot_w * 0.7
+    bar_w = group_w / len(series_keys)
+    bars = []
+    label_items = []
+    label_stride = max(1, n // 10)
+    for i, (b, counts) in enumerate(buckets):
+        slot_x = i * slot_w
+        group_x = slot_x + (slot_w - group_w) / 2
+        for j, key in enumerate(series_keys):
+            val = counts[key]
+            bar_h = (val / max_val) * usable_h
+            x = group_x + j * bar_w
+            y = pad_top + usable_h - bar_h
+            color = ACTIVITY_SERIES_META[key][1]
+            bars.append(
+                f'<rect x="{x:.1f}" y="{y:.1f}" width="{max(bar_w - 1, 0.5):.1f}" height="{bar_h:.1f}" '
+                f'fill="{color}"><title>{ACTIVITY_SERIES_META[key][0]}: {val}</title></rect>'
+            )
+        if i % label_stride == 0 or i == n - 1:
+            label_items.append((slot_x + slot_w / 2, _bucket_label(b, bucket_seconds)))
+    baseline_y = pad_top + usable_h
+    svg = (
+        f'<svg class="trend-chart" style="height:{height}px;" viewBox="0 0 {width} {height}" preserveAspectRatio="none">'
+        f'<line x1="0" y1="{baseline_y:.1f}" x2="{width}" y2="{baseline_y:.1f}" class="trend-grid-line" />'
+        f'{"".join(bars)}</svg>'
+    )
+    labels = _trend_x_labels_html(label_items, width, height)
+    return f'<div class="trend-chart-wrap">{svg}{labels}</div>'
+
+
+def _activity_legend_html(series_keys):
+    items = "".join(
+        f'<span class="trend-legend-item"><span class="trend-legend-dot" '
+        f'style="background:{ACTIVITY_SERIES_META[k][1]}"></span>{ACTIVITY_SERIES_META[k][0]}</span>'
+        for k in series_keys
+    )
+    return f'<div class="trend-legend">{items}</div>'
+
+
+def _nav_badge_html(name):
+    with _score_history_lock:
+        points = _score_history.get(name, ())
+        latest = points[-1][1] if points else None
+    if latest is None or latest == 100:
+        return ""
+    tone = _health_tone(latest)
+    return f'<span class="nav-badge nav-badge-{tone}" title="Needs attention"></span>'
+
+
+AUTH_BACKEND = os.environ.get("AUTH_BACKEND", "ldap").strip().lower()
+
+LDAP_SERVER_URI = os.environ.get("LDAP_SERVER_URI", "ldaps://covhlth.net")
+LDAP_BASE_DN = os.environ.get("LDAP_BASE_DN", "DC=covhlth,DC=net")
+LDAP_BIND_DN = os.environ.get("LDAP_BIND_DN", "svc_alber")
+LDAP_BIND_PASSWORD = os.environ.get("LDAP_BIND_PASSWORD")
+LDAP_USER_SEARCH_FILTER = os.environ.get("LDAP_USER_SEARCH_FILTER", "(sAMAccountName={username})")
+LDAP_GROUP_ATTR = os.environ.get("LDAP_GROUP_ATTR", "memberOf")
+LDAP_TIMEOUT_SECONDS = int(os.environ.get("LDAP_TIMEOUT_SECONDS", "10"))
+
+LDAP_GROUP_SYSTEM_MAP_DEFAULT = {
+    dn.strip().lower(): {s.strip() for s in systems.split(",") if s.strip()}
+    for dn, systems in (
+        pair.partition("::")[0::2]
+        for pair in os.environ.get(
+            "LDAP_GROUP_SYSTEM_MAP",
+            "CN=Operations,OU=Distribution,OU=Groups,OU=Enterprise,DC=covhlth,DC=net::hyperview,ipro,ooma,downtime",
+        ).split(";")
+        if "::" in pair
+    )
+}
+
+LDAP_ADMIN_GROUP_DEFAULT = os.environ.get(
+    "LDAP_ADMIN_GROUP",
+    "CN=Operations - 1st Shift,OU=Distribution,OU=Groups,OU=Enterprise,DC=covhlth,DC=net",
+).strip().lower()
+
+SYSTEM_KEYS = ("hyperview", "ipro", "ooma", "downtime")
+
+LDAP_MODULES = (
+    "hyperview", "hyperview_full", "ipro", "ipro_full", "ooma", "ooma_full",
+    "downtime", "downtime_full", "operations",
+)
+
+
+def _ldap_group_access():
+    conn = _maintenance_log_db()
+    try:
+        rows = conn.execute("SELECT group_dn, systems, is_admin FROM ldap_group_access").fetchall()
+        return {
+            dn: {"systems": {s for s in systems.split(",") if s}, "is_admin": bool(is_admin)}
+            for dn, systems, is_admin in rows
+        }
+    finally:
+        conn.close()
+
+
+def _set_ldap_group_access(group_dn, systems, is_admin=False):
+    group_dn = group_dn.strip().lower()
+    conn = _maintenance_log_db()
+    try:
+        conn.execute(
+            "INSERT INTO ldap_group_access (group_dn, systems, is_admin) VALUES (?, ?, ?) "
+            "ON CONFLICT(group_dn) DO UPDATE SET systems = excluded.systems, is_admin = excluded.is_admin",
+            (group_dn, ",".join(sorted(s for s in systems if s in LDAP_MODULES)), 1 if is_admin else 0),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _delete_ldap_group_access(group_dn):
+    conn = _maintenance_log_db()
+    try:
+        conn.execute("DELETE FROM ldap_group_access WHERE group_dn = ?", (group_dn.strip().lower(),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _rack_audit_group_scope():
+    """Which sites each AD group's members are responsible for auditing
+    racks at - e.g. a 2nd/3rd shift group mapped to {"Centerpoint", "Fort
+    Hill"}. A group not listed here isn't restricted - see
+    _rack_audit_eligible_sites()'s catch-all behavior below."""
+    conn = _maintenance_log_db()
+    try:
+        rows = conn.execute("SELECT group_dn, sites FROM rack_audit_group_scope").fetchall()
+        return {dn: {s for s in sites.split(",") if s} for dn, sites in rows}
+    finally:
+        conn.close()
+
+
+def _set_rack_audit_group_scope(group_dn, sites):
+    group_dn = group_dn.strip().lower()
+    sites = sorted({s.strip() for s in sites if s.strip()})
+    conn = _maintenance_log_db()
+    try:
+        conn.execute(
+            "INSERT INTO rack_audit_group_scope (group_dn, sites) VALUES (?, ?) "
+            "ON CONFLICT(group_dn) DO UPDATE SET sites = excluded.sites",
+            (group_dn, ",".join(sites)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _delete_rack_audit_group_scope(group_dn):
+    conn = _maintenance_log_db()
+    try:
+        conn.execute("DELETE FROM rack_audit_group_scope WHERE group_dn = ?", (group_dn.strip().lower(),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _rack_audit_eligible_sites(username):
+    """None means every site is eligible - the 1st-shift catch-all, for
+    anyone whose AD groups don't match an explicit mapping below. A set
+    means exactly the union of sites from every matching group (2nd/3rd
+    shift's own groups, for instance)."""
+    groups = session.get("ldap_groups") or []
+    scope = _rack_audit_group_scope()
+    sites = set()
+    matched = False
+    seen_lower = set()
+    for g in groups:
+        entry = scope.get(g)
+        if not entry:
+            continue
+        matched = True
+        for site in entry:
+            key = site.strip().lower()
+            if key not in seen_lower:
+                seen_lower.add(key)
+                sites.add(site)
+    return sites if matched else None
+
+
+def _ldap_user_access():
+    """Per-individual AD user grants - additive on top of whatever their AD
+    group memberships already grant, for the case where someone needs
+    access but changing their AD group membership isn't practical (wrong
+    team's group, or no control over AD group membership at all)."""
+    conn = _maintenance_log_db()
+    try:
+        rows = conn.execute("SELECT username, systems, is_admin FROM ldap_user_access").fetchall()
+        return {
+            uname: {"systems": {s for s in systems.split(",") if s}, "is_admin": bool(is_admin)}
+            for uname, systems, is_admin in rows
+        }
+    finally:
+        conn.close()
+
+
+def _set_ldap_user_access(target_username, systems, is_admin=False):
+    target_username = target_username.strip().lower()
+    conn = _maintenance_log_db()
+    try:
+        conn.execute(
+            "INSERT INTO ldap_user_access (username, systems, is_admin) VALUES (?, ?, ?) "
+            "ON CONFLICT(username) DO UPDATE SET systems = excluded.systems, is_admin = excluded.is_admin",
+            (target_username, ",".join(sorted(s for s in systems if s in LDAP_MODULES)), 1 if is_admin else 0),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _delete_ldap_user_access(target_username):
+    conn = _maintenance_log_db()
+    try:
+        conn.execute("DELETE FROM ldap_user_access WHERE username = ?", (target_username.strip().lower(),))
+        conn.commit()
+    finally:
+        conn.close()
+
+SESSION_TIMEOUT_SECONDS = int(os.environ.get("SESSION_TIMEOUT_SECONDS", str(7 * 24 * 3600)))
+app.permanent_session_lifetime = timedelta(seconds=SESSION_TIMEOUT_SECONDS)
+app.secret_key = os.environ.get("SESSION_SECRET_KEY") or secrets.token_hex(32)
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = os.environ.get("SESSION_COOKIE_SECURE", "false").strip().lower() == "true"
+
+
+_ldap_cred_lock = threading.Lock()
+_ldap_cred_store = {}
+
+
+def _stash_ldap_credential(password):
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    with _ldap_cred_lock:
+        for tok in [t for t, (_, exp) in _ldap_cred_store.items() if exp < now]:
+            del _ldap_cred_store[tok]
+        _ldap_cred_store[token] = (password, now + SESSION_TIMEOUT_SECONDS)
+    return token
+
+
+def _get_ldap_credential(token):
+    if not token:
+        return None
+    with _ldap_cred_lock:
+        entry = _ldap_cred_store.get(token)
+        if not entry:
+            return None
+        password, expires_at = entry
+        if time.time() > expires_at:
+            del _ldap_cred_store[token]
+            return None
+        return password
+
+
+def _clear_ldap_credential(token):
+    if not token:
+        return
+    with _ldap_cred_lock:
+        _ldap_cred_store.pop(token, None)
+
+
+_last_ldap_downtime_operator_lock = threading.Lock()
+_last_ldap_downtime_operator = {"username": None, "token": None}
+
+
+def _record_ldap_downtime_operator(username, token):
+    """Remembers the most recent LDAP user with 'downtime' access, so
+    unattended auto-restart has a valid credential to run as."""
+    with _last_ldap_downtime_operator_lock:
+        _last_ldap_downtime_operator["username"] = username
+        _last_ldap_downtime_operator["token"] = token
+
+
+def _clear_ldap_downtime_operator(token):
+    with _last_ldap_downtime_operator_lock:
+        if token and _last_ldap_downtime_operator["token"] == token:
+            _last_ldap_downtime_operator["username"] = None
+            _last_ldap_downtime_operator["token"] = None
+
+
+def _auto_restart_credential():
+    """(username, password) unattended auto-restart should run as, or None -
+    access was already confirmed when this operator was recorded, so only
+    presence/expiry needs rechecking here."""
+    with _last_ldap_downtime_operator_lock:
+        username = _last_ldap_downtime_operator["username"]
+        token = _last_ldap_downtime_operator["token"]
+    if not username or not token:
+        return None
+    password = _get_ldap_credential(token)
+    if not password:
+        return None
+    return username, password
+
+
+def _ldap_domain():
+    return ".".join(p.split("=", 1)[1] for p in LDAP_BASE_DN.split(",") if p.strip().upper().startswith("DC="))
+
+
+class _LdapNotConfigured(Exception):
+    pass
+
+
+def _ldap_authenticate(username, password):
+    try:
+        import ldap3
+    except ImportError:
+        raise _LdapNotConfigured(
+            "AUTH_BACKEND=ldap is set but the 'ldap3' package isn't installed in this "
+            "Python environment. Install it with: pip install ldap3"
+        )
+
+    try:
+        server = ldap3.Server(LDAP_SERVER_URI, get_info=ldap3.NONE, connect_timeout=LDAP_TIMEOUT_SECONDS)
+        search_conn = ldap3.Connection(
+            server, user=LDAP_BIND_DN, password=LDAP_BIND_PASSWORD,
+            auto_bind=True, receive_timeout=LDAP_TIMEOUT_SECONDS,
+        )
+        try:
+            search_filter = LDAP_USER_SEARCH_FILTER.format(
+                username=ldap3.utils.conv.escape_filter_chars(username)
+            )
+            search_conn.search(LDAP_BASE_DN, search_filter, attributes=[LDAP_GROUP_ATTR])
+            if not search_conn.entries:
+                return None
+            user_entry = search_conn.entries[0]
+            user_dn = user_entry.entry_dn
+            groups = (
+                [str(g).strip().lower() for g in user_entry[LDAP_GROUP_ATTR].values]
+                if LDAP_GROUP_ATTR in user_entry else []
+            )
+        finally:
+            search_conn.unbind()
+
+        auth_conn = ldap3.Connection(
+            server, user=user_dn, password=password, receive_timeout=LDAP_TIMEOUT_SECONDS,
+        )
+        try:
+            if not auth_conn.bind():
+                return None
+        finally:
+            auth_conn.unbind()
+    except ldap3.core.exceptions.LDAPException:
+        return None
+
+    group_access = _ldap_group_access()
+    granted = set()
+    is_admin = False
+    for g in groups:
+        entry = group_access.get(g)
+        if entry:
+            granted |= entry["systems"]
+            is_admin = is_admin or entry["is_admin"]
+
+    # Individual grants are additive on top of whatever their AD groups
+    # already give them - never a way to grant less than their groups do.
+    user_entry = _ldap_user_access().get(username.strip().lower())
+    if user_entry:
+        granted |= user_entry["systems"]
+        is_admin = is_admin or user_entry["is_admin"]
+
+    return granted, is_admin, groups
+
+
+def _split_grant_token(token):
+    """A raw grant token is either a bare system key (view-tier access), a
+    '<system>_full' token (full control, which implies view-tier too), or
+    'operations'. Returns (base_system_or_None, is_full)."""
+    if token.endswith("_full") and token[:-5] in SYSTEM_KEYS:
+        return token[:-5], True
+    if token in SYSTEM_KEYS:
+        return token, False
+    return None, False
+
+
+def _user_systems(username):
+    """Every system this account can at least view - a View Only grant and a
+    Full Control grant both count, since Full Control always implies view."""
+    out = set()
+    for token in session.get("systems", []):
+        base, _ = _split_grant_token(token)
+        if base:
+            out.add(base)
+    return out
+
+
+def _user_full_systems(username):
+    """Systems this account has Full Control over - the tier that unlocks
+    Trends, Acknowledge, and Event Search for that system."""
+    out = set()
+    for token in session.get("systems", []):
+        base, is_full = _split_grant_token(token)
+        if base and is_full:
+            out.add(base)
+    return out
+
+
+def _user_has_operations(username):
+    return "operations" in session.get("systems", [])
+
+
+def _is_admin(username):
+    return bool(session.get("is_admin", False))
+
+
 PBKDF2_ITERATIONS = 200_000
 
-USERS = {
+USERS_DEFAULT = {
     "chadmin": {
         "salt": bytes.fromhex("475fd83c0a46bd511ff1868ce520f356"),
         "hash": bytes.fromhex("27ae64ae94bb51e859791a08826769ecec0c1f4612f3109f55d5b5af3c559fc9"),
-        # "hyperview" isn't a SYSTEMS key (see HYPERVIEW_BASE_URL above) -
-        # it's just a membership check against this same set, gating the
-        # /hyperview dashboard page instead of a maintenance/events system.
-        "systems": {"ipro", "ooma", "hyperview"},
-    },
-    "security": {
-        "salt": bytes.fromhex("97ee6f4495209254060d21bfb84b3420"),
-        "hash": bytes.fromhex("115d5cef28e66142631ed1df71a5fdc67dbb51474621145b180c56bb388d3cd5"),
-        "systems": {"ipro"},
-    },
-    "network": {
-        "salt": bytes.fromhex("7a75fa1147c7adf2d614e17d746affc2"),
-        "hash": bytes.fromhex("dee5a6f2f453ae67417dadb7a88db04ab1a40c2fa826b303d6494c339c4bf5ba"),
-        "systems": {"ooma"},
+        "systems": {"ipro_full", "ooma_full", "hyperview_full", "downtime_full", "operations"},
+        "is_admin": True,
     },
 }
 
 
+def _local_users():
+    conn = _maintenance_log_db()
+    try:
+        rows = conn.execute("SELECT username, salt, hash, systems, is_admin FROM local_users").fetchall()
+        return {
+            username: {
+                "salt": bytes(salt), "hash": bytes(hash_), "is_admin": bool(is_admin),
+                "systems": {s for s in systems.split(",") if s},
+            }
+            for username, salt, hash_, systems, is_admin in rows
+        }
+    finally:
+        conn.close()
+
+
+def _set_local_user(username, systems, is_admin, password=None):
+    username = username.strip()
+    systems = {s for s in systems if s in LDAP_MODULES}
+    conn = _maintenance_log_db()
+    try:
+        if password:
+            salt = os.urandom(16)
+            pwd_hash = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PBKDF2_ITERATIONS)
+            conn.execute(
+                "INSERT INTO local_users (username, salt, hash, systems, is_admin) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(username) DO UPDATE SET salt = excluded.salt, hash = excluded.hash, "
+                "systems = excluded.systems, is_admin = excluded.is_admin",
+                (username, salt, pwd_hash, ",".join(sorted(systems)), 1 if is_admin else 0),
+            )
+        else:
+            existing = conn.execute("SELECT 1 FROM local_users WHERE username = ?", (username,)).fetchone()
+            if not existing:
+                raise ValueError("A password is required for a new user")
+            conn.execute(
+                "UPDATE local_users SET systems = ?, is_admin = ? WHERE username = ?",
+                (",".join(sorted(systems)), 1 if is_admin else 0, username),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _delete_local_user(username):
+    conn = _maintenance_log_db()
+    try:
+        conn.execute("DELETE FROM local_users WHERE username = ?", (username.strip(),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _verify_password(username, password):
-    user = USERS.get(username)
+    user = _local_users().get(username)
     if not user:
-        # Still run a PBKDF2 round even for an unknown username, against a
-        # fixed dummy salt/hash - otherwise "unknown user" returns
-        # immediately while "known user, wrong password" takes ~200k
-        # rounds, and that timing difference is enough to enumerate valid
-        # usernames from response latency alone.
         hashlib.pbkdf2_hmac("sha256", password.encode(), b"\x00" * 16, PBKDF2_ITERATIONS)
         return False
     computed = hashlib.pbkdf2_hmac("sha256", password.encode(), user["salt"], PBKDF2_ITERATIONS)
     return hmac.compare_digest(computed, user["hash"])
 
 
-def _current_user():
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Basic "):
+def _authenticate(username, password):
+    """Tries LDAP first, then falls back to local_users - covers both a
+    directory outage and an account never in AD. Returns (systems,
+    is_admin, source, ldap_groups) or None. ldap_groups is [] for a local
+    account - it only has meaning for the ldap source."""
+    if not username or not password:
         return None
-    try:
-        decoded = base64.b64decode(auth[6:]).decode("utf-8")
-        username, _, password = decoded.partition(":")
-    except Exception:
-        return None
-    return username if _verify_password(username, password) else None
+    if AUTH_BACKEND == "ldap":
+        try:
+            result = _ldap_authenticate(username, password)
+        except _LdapNotConfigured:
+            result = None
+        if result is not None:
+            systems, is_admin, groups = result
+            if systems:
+                return systems, is_admin, "ldap", groups
+    user = _local_users().get(username)
+    if user and _verify_password(username, password):
+        return user["systems"], user["is_admin"], "local", []
+    return None
 
 
 def require_login(f):
-    """Applies to every route below - this portal has no public routes at
-    all, unlike the bridges themselves (which keep their read-only JSON
-    feeds open). Sends 401 + WWW-Authenticate, triggering a browser's
-    native login prompt, same UX as the pages this replaces."""
     @wraps(f)
     def wrapper(*args, **kwargs):
-        username = _current_user()
-        if username is None:
-            return Response(
-                "Authentication required", 401,
-                {"WWW-Authenticate": 'Basic realm="bridge portal"'},
-            )
+        username = session.get("username")
+        if username is None or not session.get("systems"):
+            session.clear()
+            return redirect(f"/login?next={quote(request.path, safe='')}")
         return f(username, *args, **kwargs)
     return wrapper
 
 
+def require_admin(f):
+    @wraps(f)
+    def wrapper(username, *args, **kwargs):
+        if not _is_admin(username):
+            return _error_page(username, "Your account doesn't have admin access to this portal.", 403)
+        return f(username, *args, **kwargs)
+    return wrapper
+
+
+def _error_page(username, message, status=403):
+    """Blocked/not-found page rendered inside the normal nav shell, not a
+    bare response, so the user can navigate back out."""
+    body = f'<div class="msg err" style="margin-top:16px;">{_esc(message)}</div>'
+    return Response(render_shell("InfraWatch", body, "", username), status, mimetype="text/html")
+
+
 def accessible_systems(username):
-    allowed = USERS[username]["systems"]
+    allowed = _user_systems(username)
+    return {k: v for k, v in SYSTEMS.items() if k in allowed}
+
+
+def accessible_full_systems(username):
+    allowed = _user_full_systems(username)
     return {k: v for k, v in SYSTEMS.items() if k in allowed}
 
 
 def _forbidden_or_unknown(username, system):
     if system not in SYSTEMS:
         return Response(f"Unknown system: {system}", 404)
-    if system not in USERS[username]["systems"]:
+    if system not in _user_systems(username):
         return Response(f"Your account does not have access to '{system}'", 403)
     return None
 
 
-# --- HTML ----------------------------------------------------------------
-# Light, teal-and-white palette approximating Covenant Health's own site
-# (covenanthealth.com): white/light-gray backgrounds, a teal brand color
-# carried through headers/links/primary actions, a red reserved for
-# destructive actions (un-acknowledge) and errors - not just a retint of
-# the bridges' old dark admin theme, since the real site itself is a
-# clean, clinical white/teal look, not a dark one.
+def _forbidden_or_unknown_full(username, system):
+    if system not in SYSTEMS:
+        return Response(f"Unknown system: {system}", 404)
+    if system not in _user_full_systems(username):
+        return Response(f"Your account does not have Full Control access to '{system}'", 403)
+    return None
+
 
 PAGE_SHELL = """<!DOCTYPE html>
-<html lang="en">
+<html lang="en"{theme_attr}>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{title} - Bridge Portal</title>
+<link rel="icon" type="image/png" href="data:image/png;base64,{favicon_b64}">
+<title>{title} - InfraWatch</title>
 <style>
   :root {{
-    --bg: #f4f7f7; --panel: #ffffff; --panel-raised: #f7fafa;
-    --border: #dbe6e6; --border-bright: #c3d4d4;
-    --text: #1f2b2b; --text-dim: #5b6c6c; --text-faint: #8a9797;
-    /* Actual Covenant Health brand colors */
-    --teal: #005898; --teal-dark: #083880; --teal-tint: #d9e6f0;
-    --danger: #a80030; --danger-dark: #a00018; --danger-tint: #f5e0e6;
-    --warn: #b9770e; --ok: #1f7a4d;
+    --bg: #eef2f5; --panel: #ffffff; --panel-raised: #f6f9fb;
+    --border: #dee6ec; --border-bright: #c5d2da;
+    --text: #16212b; --text-dim: #55636e; --text-faint: #8996a1;
+
+    --teal: #005a9c; --teal-dark: #06315e; --teal-tint: #e4edf5;
+    --danger: #ae0031; --danger-dark: #8c0026; --danger-tint: #faeaee;
+    --warn: #a2650a; --ok: #146a44;
+    --header-bg: var(--panel);
+    --shadow-sm: 0 1px 2px rgba(15, 35, 55, 0.06);
+    --shadow-md: 0 4px 16px rgba(15, 35, 55, 0.08);
+    --radius: 10px;
+  }}
+
+  :root[data-theme="dark"] {{
+    --bg: #070c10; --panel: #101a20; --panel-raised: #142129; --border: #22323c; --border-bright: #2c404c;
+    --text: #f2f6f8; --text-dim: #a9bcc4; --text-faint: #7c919a;
+    --teal: #6cb2ef; --teal-dark: #8fc0ef; --teal-tint: #16324d;
+    --danger: #ff5d80; --danger-dark: #ff5d80; --danger-tint: #401323;
+    --warn: #f2b447; --ok: #57d999;
+
+    --header-bg: linear-gradient(135deg, #0e2b45 0%, #071a29 100%);
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+    --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.35);
   }}
   * {{ box-sizing: border-box; }}
   body {{
     margin: 0; background: var(--bg); color: var(--text);
     font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, Arial, sans-serif;
-    padding: 0 0 60px;
+    padding: 0 0 24px; -webkit-font-smoothing: antialiased;
+
+    zoom: 1.08;
   }}
+  a {{ color: var(--teal); transition: color 0.12s ease; }}
+  a:visited {{ color: var(--teal); }}
+  a:hover {{ color: var(--teal-dark); }}
+
   header.brand {{
-    background: var(--teal); color: #fff; padding: 16px 20px;
+    background: var(--header-bg); padding: 10px 22px;
     display: flex; align-items: center; justify-content: space-between;
+    box-shadow: var(--shadow-sm); position: relative; z-index: 5;
   }}
-  header.brand .brand-name {{ font-size: 17px; font-weight: 700; letter-spacing: 0.01em; }}
-  header.brand .brand-sub {{ font-size: 12px; color: rgba(255,255,255,0.8); font-weight: 400; margin-top: 2px; }}
-  .wrap {{ max-width: 1300px; width: 95%; margin: 0 auto; padding-top: 28px; }}
-  h1 {{ font-size: 20px; margin: 0 0 4px; color: var(--teal-dark); }}
-  h2.system-heading {{ font-size: 15px; margin: 28px 0 10px; color: var(--teal); border-bottom: 2px solid var(--teal-tint); padding-bottom: 6px; }}
-  .sub {{ color: var(--text-dim); font-size: 13px; margin: 0 0 20px; }}
-  nav.top {{ display: flex; flex-wrap: wrap; row-gap: 8px; justify-content: space-between; align-items: center; padding: 10px 20px; background: var(--panel); border-bottom: 1px solid var(--border); }}
-  nav.top a {{ color: var(--text-dim); font-size: 13px; text-decoration: none; margin-left: 18px; padding-bottom: 2px; border-bottom: 2px solid transparent; }}
-  nav.top a.active {{ color: var(--teal); border-bottom-color: var(--teal); font-weight: 600; }}
-  nav.top a:hover {{ color: var(--teal); }}
+  .brand-logo-plate {{
+    display: inline-flex; align-items: center; background: #fff;
+    border-radius: 8px; padding: 5px 12px; box-shadow: var(--shadow-sm);
+  }}
+  header.brand .brand-logo {{ height: 30px; width: auto; display: block; }}
+  header.brand .brand-sub {{ font-size: 11px; color: var(--text-dim); font-weight: 600;
+    margin-top: 5px; letter-spacing: 0.02em; text-transform: uppercase; }}
+  .wrap {{ max-width: 2200px; width: 97%; margin: 0 auto; padding-top: 18px; }}
+  .site-footer {{ margin-top: 32px; padding: 16px 0 24px; text-align: center;
+    font-size: 11px; color: var(--text-faint); border-top: 1px solid var(--border); }}
+  h1 {{ font-size: 19px; margin: 0 0 14px; color: var(--teal-dark); font-weight: 700; letter-spacing: -0.01em; }}
+  h2.system-heading {{ font-size: 15px; margin: 16px 0 8px; color: var(--teal); border-bottom: 2px solid var(--teal-tint); padding-bottom: 5px; font-weight: 700; }}
+  .sub {{ color: var(--text-dim); font-size: 13px; margin: 0 0 12px; }}
+
+  nav.top {{ display: flex; flex-wrap: wrap; row-gap: 6px; justify-content: space-between; align-items: center; padding: 8px 22px; background: var(--panel); border-bottom: 1px solid var(--border); }}
+  .nav-primary, .nav-secondary {{ display: flex; align-items: center; flex-wrap: wrap; }}
+  nav.top a {{
+    color: var(--text-dim); font-size: 13px; text-decoration: none; margin-left: 6px;
+    padding: 6px 12px; border-radius: 7px; font-weight: 500; transition: background 0.12s ease, color 0.12s ease;
+  }}
+  .nav-primary a:first-child {{ margin-left: 0; }}
+  nav.top a.active {{ color: var(--teal); background: var(--teal-tint); font-weight: 700; }}
+  nav.top a:hover:not(.active) {{ color: var(--teal); background: var(--panel-raised); }}
   nav.top a.logout {{ color: var(--danger); }}
+
+  .nav-dropdown {{ position: relative; margin-left: 6px; }}
+  .nav-dropdown summary {{
+    list-style: none; cursor: pointer; color: var(--text-dim); font-size: 13px; font-weight: 500;
+    padding: 6px 12px; border-radius: 7px; user-select: none; transition: background 0.12s ease, color 0.12s ease;
+  }}
+  .nav-dropdown summary::-webkit-details-marker {{ display: none; }}
+  .nav-dropdown summary::after {{ content: "\\25BE"; margin-left: 5px; font-size: 10px; color: var(--text-faint); }}
+  .nav-dropdown summary:hover {{ color: var(--teal); background: var(--panel-raised); }}
+  .nav-dropdown[open] summary {{ color: var(--teal); background: var(--teal-tint); }}
+  .nav-dropdown.nav-has-active summary {{ color: var(--teal); font-weight: 700; background: var(--teal-tint); }}
+  .nav-search {{ margin: 0; }}
+  .nav-search input {{
+    background: var(--panel-raised); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); font-size: 0.85rem; padding: 6px 10px; width: 170px;
+    transition: width 0.15s ease, border-color 0.15s ease;
+  }}
+  .nav-search input:focus {{ width: 240px; border-color: var(--teal); outline: none; }}
+  .search-results-group {{ margin-bottom: 22px; }}
+  .search-results-group h3 {{ font-size: 0.95rem; color: var(--text-dim); margin: 0 0 8px; }}
+  .search-result-row {{
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--panel); margin-bottom: 6px; text-decoration: none; color: var(--text);
+  }}
+  .search-result-row:hover {{ border-color: var(--teal); }}
+  .search-result-row .srr-label {{ font-weight: 600; }}
+  .search-result-row .srr-sub {{ color: var(--text-dim); font-size: 0.82rem; margin-top: 2px; }}
+  .search-result-row .srr-tag {{
+    font-size: 0.72rem; padding: 3px 8px; border-radius: 999px; background: var(--panel-raised);
+    color: var(--text-dim); white-space: nowrap;
+  }}
+  .search-result-row.alert .srr-tag {{ background: var(--danger-tint); color: var(--danger); }}
+  .nav-dropdown-menu {{
+    position: absolute; top: calc(100% + 8px); right: 0; z-index: 50; min-width: 175px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    box-shadow: var(--shadow-md); padding: 6px; display: flex; flex-direction: column; gap: 2px;
+  }}
+  .nav-dropdown-menu a, .nav-dropdown-menu button {{
+    display: block; width: 100%; text-align: left; color: var(--text-dim); font-size: 13px;
+    text-decoration: none; margin: 0; padding: 8px 10px; border-radius: 6px; border: none;
+    background: none; font-family: inherit; font-weight: 400; cursor: pointer; transition: background 0.12s ease, color 0.12s ease;
+  }}
+  .nav-dropdown-menu a:hover, .nav-dropdown-menu button:hover {{ background: var(--panel-raised); color: var(--teal); }}
+  .nav-dropdown-menu a.active {{ color: var(--teal); font-weight: 600; border-bottom: none; }}
+  .nav-dropdown-menu a.logout {{ color: var(--danger); }}
+  .nav-dropdown-menu a.logout:hover {{ background: var(--danger-tint); color: var(--danger); }}
+  .nav-account summary {{ font-weight: 600; }}
+
+  .ack-panel-backdrop {{
+    position: fixed; inset: 0; background: rgba(15, 25, 35, 0.35); z-index: 60;
+    opacity: 0; pointer-events: none; transition: opacity 0.18s ease;
+  }}
+  .ack-panel-backdrop.open {{ opacity: 1; pointer-events: auto; }}
+  .ack-panel {{
+    position: fixed; top: 0; right: 0; bottom: 0; width: min(520px, 100vw); z-index: 61;
+    background: var(--bg); box-shadow: -8px 0 24px rgba(15, 25, 35, 0.18);
+    transform: translateX(100%); transition: transform 0.2s ease;
+    display: flex; flex-direction: column; overflow: hidden;
+  }}
+  .ack-panel.open {{ transform: translateX(0); }}
+  .ack-panel-head {{
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 16px 18px; background: var(--panel); border-bottom: 1px solid var(--border); flex-shrink: 0;
+  }}
+  .ack-panel-head h2 {{ margin: 0; font-size: 17px; }}
+  .ack-panel-close {{
+    font-family: inherit; font-size: 20px; line-height: 1; color: var(--text-dim);
+    background: none; border: none; cursor: pointer; padding: 4px 8px; border-radius: 6px;
+  }}
+  .ack-panel-close:hover {{ background: var(--panel-raised); color: var(--teal); }}
+  .ack-panel-body {{ overflow-y: auto; padding: 4px 18px 24px; flex: 1; }}
+  .ack-panel-body .system-heading {{ display: none; }}
+  .ack-panel-body .card {{ margin-top: 14px; }}
+
+  .nav-badge {{ display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-left: 5px; vertical-align: middle; }}
+  .nav-badge-warn {{ background: var(--warn); }}
+  .nav-badge-danger {{ background: var(--danger); }}
+
+  .page-header {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }}
+  .page-header .page-action {{ margin-top: 2px; flex-shrink: 0; white-space: nowrap; }}
+  .handoff-timestamp {{ font-size: 11px; color: var(--text-faint); margin-top: 6px; }}
+  a.ghost.page-action {{
+    display: inline-block; border: 1.5px solid var(--border-bright); border-radius: 7px;
+    padding: 8px 14px; font-size: 12px; font-weight: 600; color: var(--text-dim); text-decoration: none;
+  }}
+  a.ghost.page-action:hover {{ border-color: var(--teal); color: var(--teal); }}
+
+  @media print {{
+    header.brand, nav.top, .print-btn, .site-footer {{ display: none !important; }}
+    body {{ padding: 0; }}
+    .wrap {{ padding-top: 0; max-width: none; width: 100%; }}
+  }}
   .card {{
     background: var(--panel); border: 1px solid var(--border);
-    border-radius: 10px; padding: 20px; margin-bottom: 18px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    border-radius: var(--radius); padding: 15px 17px; margin-bottom: 12px;
+    box-shadow: var(--shadow-sm);
   }}
   .card h3 {{ font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em;
-    color: var(--teal); font-weight: 700; margin: 0 0 14px; }}
-  .msg {{ padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; font-size: 14px; }}
+    color: var(--teal); font-weight: 700; margin: 0 0 10px; }}
+  .msg {{ padding: 9px 15px; border-radius: 8px; margin-bottom: 12px; font-size: 14px; box-shadow: var(--shadow-sm);
+    display: flex; align-items: center; gap: 9px; }}
+  .msg::before {{ flex-shrink: 0; font-weight: 700; }}
   .msg.ok {{ background: var(--teal-tint); color: var(--teal-dark); border: 1px solid var(--teal); }}
+  .msg.ok::before {{ content: "\\2713"; }}
   .msg.err {{ background: var(--danger-tint); color: var(--danger); border: 1px solid var(--danger); }}
-  label {{ display: block; font-size: 12px; color: var(--text-dim); margin: 12px 0 5px; font-weight: 600; }}
+  .msg.err::before {{ content: "\\26A0"; }}
+  .msg.warn {{ background: rgba(242,180,71,.15); color: var(--warn); border: 1px solid var(--warn); }}
+  .msg.warn::before {{ content: "\\26A0"; }}
+  .handoff-banner {{ justify-content: space-between; flex-wrap: wrap; }}
+  .handoff-banner form {{ margin: 0; }}
+  .handoff-banner button.ghost {{ padding: 5px 12px; font-size: 12.5px; white-space: nowrap; }}
+  .handoff-pending-panel {{ border: 1.5px solid var(--warn); margin-bottom: 16px; }}
+  .runbook-hint {{ display: block; margin-top: 3px; font-size: 11px; color: var(--text-faint); }}
+  .runbook-hint-unconfirmed {{ color: var(--warn); font-weight: 600; }}
+  label {{ display: block; font-size: 12px; color: var(--text-dim); margin: 8px 0 4px; font-weight: 600; }}
   label:first-child {{ margin-top: 0; }}
   input[type=text], input[type=number], input[type=datetime-local], select, textarea {{
-    width: 100%; max-width: 480px; padding: 9px 11px; border-radius: 6px; border: 1.5px solid var(--border-bright);
+    width: 100%; max-width: 480px; padding: 8px 11px; border-radius: 7px; border: 1.5px solid var(--border-bright);
     background: var(--panel-raised); color: var(--text); font-size: 14px; font-family: inherit;
+    transition: border-color 0.12s ease, box-shadow 0.12s ease;
   }}
   input:focus, select:focus, textarea:focus {{ outline: none; border-color: var(--teal); box-shadow: 0 0 0 3px var(--teal-tint); }}
-  textarea {{ resize: vertical; min-height: 50px; }}
-  .radio-row {{ display: flex; gap: 18px; margin: 12px 0 5px; }}
+  textarea {{ resize: vertical; min-height: 42px; }}
+  .radio-row {{ display: flex; gap: 18px; margin: 8px 0 4px; }}
   .radio-row label {{ display: flex; align-items: center; gap: 6px; margin: 0; font-size: 13px; color: var(--text); font-weight: 400; }}
   button {{
-    font-family: inherit; font-weight: 600; font-size: 14px; padding: 10px 18px;
-    border-radius: 7px; border: 1.5px solid var(--teal); background: var(--teal);
-    color: #fff; cursor: pointer; margin-top: 16px;
+    font-family: inherit; font-weight: 600; font-size: 14px; padding: 9px 18px;
+    border-radius: 8px; border: 1.5px solid var(--teal); background: var(--teal);
+    color: #fff; cursor: pointer; margin-top: 10px; box-shadow: var(--shadow-sm);
+    transition: background 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease, transform 0.06s ease;
   }}
-  button:hover {{ background: var(--teal-dark); border-color: var(--teal-dark); }}
+  button:hover {{ background: var(--teal-dark); border-color: var(--teal-dark); box-shadow: var(--shadow-md); }}
+  button:active {{ transform: translateY(1px); }}
   button.cancel-btn {{
     border-color: var(--danger); background: #fff; color: var(--danger);
-    font-size: 12px; padding: 5px 10px; margin: 0; font-weight: 600;
+    font-size: 12px; padding: 5px 10px; margin: 0; font-weight: 600; box-shadow: none;
   }}
-  button.cancel-btn:hover {{ background: var(--danger-tint); }}
-  button.ghost {{ border-color: var(--border-bright); background: #fff; color: var(--text-dim); font-size: 12px; padding: 9px 14px; }}
-  button.ghost:hover {{ border-color: var(--teal); color: var(--teal); background: #fff; }}
+  button.cancel-btn:hover {{ background: var(--danger-tint); box-shadow: none; }}
+  button.ghost {{ border-color: var(--border-bright); background: #fff; color: var(--text-dim); font-size: 12px; padding: 8px 14px; box-shadow: none; }}
+  button.ghost:hover {{ border-color: var(--teal); color: var(--teal); background: #fff; box-shadow: none; }}
   table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
   th {{ text-align: left; color: var(--text-dim); font-weight: 700; text-transform: uppercase;
-    font-size: 11px; letter-spacing: 0.04em; padding: 8px 10px; border-bottom: 2px solid var(--teal-tint); }}
-  td {{ padding: 10px; border-bottom: 1px solid var(--border); vertical-align: top; }}
-  tbody tr:hover td {{ background: var(--panel-raised); }}
+    font-size: 11px; letter-spacing: 0.05em; padding: 8px 10px; border-bottom: 1.5px solid var(--border-bright);
+    background: var(--panel-raised); }}
+  th:first-child {{ border-top-left-radius: 8px; }}
+  th:last-child {{ border-top-right-radius: 8px; }}
+  td {{ padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }}
+  tbody tr:nth-child(even) td {{ background: var(--panel-raised); }}
+  tbody tr:hover td {{ background: var(--teal-tint); }}
   td.time {{ color: var(--text-dim); white-space: nowrap; font-variant-numeric: tabular-nums; }}
-  .empty {{ color: var(--text-faint); font-size: 13px; padding: 10px 0; }}
+  .empty {{ color: var(--text-faint); font-size: 13px; padding: 22px 10px; text-align: center; }}
+  .empty::before {{ content: "\\2014"; display: block; font-size: 16px; margin-bottom: 4px; color: var(--border-bright); }}
   .table-scroll {{ overflow-x: auto; }}
   .tag {{ font-size: 10px; text-transform: uppercase; padding: 2px 6px; border-radius: 4px;
     background: var(--teal-tint); border: 1px solid var(--border-bright); color: var(--teal-dark); font-weight: 600; }}
@@ -418,59 +1875,371 @@ PAGE_SHELL = """<!DOCTYPE html>
   .sev-critical {{ color: var(--danger); font-weight: 600; }}
   .sev-degraded {{ color: var(--warn); font-weight: 600; }}
   .sev-recovered {{ color: var(--ok); font-weight: 600; }}
+  .sev-maintenance {{ color: var(--teal); font-weight: 600; }}
   .change .was {{ display: block; color: var(--text-faint); font-size: 11px; margin-top: 2px; }}
-  /* Same red-vignette cue as the kiosk pages (see kioskCriticalCue in
-     DASHBOARD_KIOSK_SHELL) toned down for this shell's light background -
-     a page that toggles this on via _critical_alert_script() gets the
-     same "something needs attention right now" signal a logged-in
-     person would otherwise only see by opening each dashboard. No beep
-     here - unlike a kiosk, someone's already looking at this page. */
+
   body.critical-alert::after {{
     content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 9999;
     animation: critical-pulse 1.6s ease-in-out infinite;
   }}
+  body.critical-alert.tone-warn {{ --alert-color: var(--warn); }}
+  body.critical-alert.tone-danger {{ --alert-color: var(--danger); }}
   @keyframes critical-pulse {{
-    0%, 100% {{ box-shadow: inset 0 0 0 0 rgba(168, 0, 48, 0); }}
-    50% {{ box-shadow: inset 0 0 0 10px rgba(168, 0, 48, 0.45); }}
+    0%, 100% {{ box-shadow: inset 0 0 0 0 color-mix(in srgb, var(--alert-color, var(--danger)) 0%, transparent); }}
+    50% {{ box-shadow: inset 0 0 0 10px color-mix(in srgb, var(--alert-color, var(--danger)) 45%, transparent); }}
   }}
+  body.alert-solid::after {{
+    content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 9999;
+    box-shadow: inset 0 0 0 6px color-mix(in srgb, var(--alert-color, var(--warn)) 32%, transparent);
+  }}
+  body.alert-solid.tone-warn {{ --alert-color: var(--warn); }}
+  body.alert-solid.tone-danger {{ --alert-color: var(--danger); }}
+
+  a.panel.status-panel.status-alert {{
+    animation: status-panel-pulse 1.6s ease-in-out infinite;
+  }}
+  a.panel.status-panel.status-alert.tone-warn {{ --alert-color: var(--warn); }}
+  a.panel.status-panel.status-alert.tone-danger {{ --alert-color: var(--danger); }}
+  @keyframes status-panel-pulse {{
+    0%, 100% {{ box-shadow: 0 1px 3px rgba(0,0,0,0.04), inset 0 0 0 0 color-mix(in srgb, var(--alert-color, var(--danger)) 0%, transparent); border-color: var(--border); }}
+    50% {{ box-shadow: 0 1px 3px rgba(0,0,0,0.04), inset 0 0 0 5px color-mix(in srgb, var(--alert-color, var(--danger)) 35%, transparent); border-color: var(--alert-color, var(--danger)); }}
+  }}
+  a.panel.status-panel.status-solid {{
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04), inset 0 0 0 3px color-mix(in srgb, var(--alert-color, var(--warn)) 30%, transparent);
+    border-color: var(--alert-color, var(--warn));
+  }}
+  a.panel.status-panel.status-solid.tone-warn {{ --alert-color: var(--warn); }}
+  a.panel.status-panel.status-solid.tone-danger {{ --alert-color: var(--danger); }}
 </style>
 </head>
 <body>
 <header class="brand">
   <div>
-    <div class="brand-name">Covenant Health</div>
-    <div class="brand-sub">Bridge Portal &middot; Facility Systems</div>
+    <div class="brand-logo-plate"><img class="brand-logo" src="data:image/png;base64,{logo_b64}" alt="Covenant Health"></div>
+    <div class="brand-sub">InfraWatch &middot; Facility Systems</div>
   </div>
 </header>
 <nav class="top">
-  <div class="sub" style="margin:0;">Signed in as <strong>{username}</strong></div>
-  <div>
+  <div class="nav-primary">
     <a href="/overview" class="{overview_active}">Overview</a>
-    <a href="/maintenance" class="{maint_active}">Maintenance</a>
-    <a href="/events-search" class="{events_active}">Event search</a>
-    <a href="/hyperview" class="{hyperview_active}">Hyperview</a>
-    <a href="/ipro" class="{ipro_active}">iPRO Cameras</a>
-    <a href="/ooma" class="{ooma_active}">Ooma AirDial</a>
-    <a href="/logout" class="logout">Log out</a>
+    {hyperview_nav}
+    {ipro_nav}
+    {ooma_nav}
+    {downtime_nav}
+  </div>
+  <div class="nav-secondary">
+    {search_box}
+    <details class="nav-dropdown {tools_has_active}">
+      <summary>Tools</summary>
+      <div class="nav-dropdown-menu">
+        {handoff_nav}
+        {acknowledge_nav}
+        {events_nav}
+        {trends_nav}
+        {runbook_nav}
+        {rack_audit_nav}
+      </div>
+    </details>
+    {admin_menu}
+    <details class="nav-dropdown nav-account">
+      <summary>{username}</summary>
+      <div class="nav-dropdown-menu">
+        <button id="theme-toggle-btn" type="button">Dark Mode</button>
+        <a href="/logout" class="logout">Log out</a>
+      </div>
+    </details>
   </div>
 </nav>
-<div class="wrap">
-  {body}
+<div class="ack-panel-backdrop" id="ack-panel-backdrop" onclick="closeAckPanel()"></div>
+<div class="ack-panel" id="ack-panel" role="dialog" aria-label="Acknowledge">
+  <div class="ack-panel-head">
+    <h2 id="ack-panel-title">Acknowledge</h2>
+    <button type="button" class="ack-panel-close" onclick="closeAckPanel()" aria-label="Close">&times;</button>
+  </div>
+  <div class="ack-panel-body" id="ack-panel-body"></div>
 </div>
+<div class="wrap">
+  {pending_handoff_banner}
+  {body}
+  <footer class="site-footer">InfraWatch &middot; Covenant Health IT</footer>
+</div>
+<script>
+  (function () {{
+    var root = document.documentElement;
+    var btn = document.getElementById('theme-toggle-btn');
+    function render() {{
+      var dark = root.getAttribute('data-theme') === 'dark';
+      btn.textContent = dark ? 'Light Mode' : 'Dark Mode';
+    }}
+    render();
+    btn.addEventListener('click', function () {{
+      var dark = root.getAttribute('data-theme') === 'dark';
+      if (dark) {{
+        root.removeAttribute('data-theme');
+      }} else {{
+        root.setAttribute('data-theme', 'dark');
+      }}
+      try {{
+        fetch('/theme', {{
+          method: 'POST', headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+          body: 'theme=' + (dark ? 'light' : 'dark'),
+        }});
+      }} catch (e) {{}}
+      render();
+      var openDetails = btn.closest('details.nav-dropdown');
+      if (openDetails) openDetails.open = false;
+    }});
+  }})();
+  (function () {{
+    var input = document.getElementById('nav-search-input');
+    if (!input) return;
+    document.addEventListener('keydown', function (e) {{
+      if (e.key !== '/') return;
+      var tag = (document.activeElement && document.activeElement.tagName) || '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || document.activeElement.isContentEditable) return;
+      e.preventDefault();
+      input.focus();
+    }});
+  }})();
+  function toggleTarget(system, singleChosen) {{
+    var single = document.getElementById('target-single-' + system);
+    var grouped = document.getElementById('target-grouped-' + system);
+    if (!single || !grouped) return;
+    single.disabled = !singleChosen;
+    single.style.display = singleChosen ? '' : 'none';
+    grouped.disabled = singleChosen;
+    grouped.style.display = singleChosen ? 'none' : '';
+  }}
+  var ACK_PANEL_LABELS = {{ipro: 'iPRO Cameras', ooma: 'Ooma AirDial', downtime: 'Downtime Workstations', hyperview: 'Hyperview'}};
+  function openAckPanel(event, system) {{
+    if (event) event.preventDefault();
+    if (event) {{
+      var openDetails = event.target.closest('details.nav-dropdown');
+      if (openDetails) openDetails.open = false;
+    }}
+    var backdrop = document.getElementById('ack-panel-backdrop');
+    var panel = document.getElementById('ack-panel');
+    var body = document.getElementById('ack-panel-body');
+    var titleEl = document.getElementById('ack-panel-title');
+    titleEl.textContent = 'Acknowledge · ' + (ACK_PANEL_LABELS[system] || system);
+    body.innerHTML = '<p class="sub" style="padding:16px 0;">Loading&hellip;</p>';
+    backdrop.classList.add('open');
+    panel.classList.add('open');
+    fetch('/acknowledge/panel/' + encodeURIComponent(system))
+      .then(function (r) {{ return r.text(); }})
+      .then(function (html) {{ body.innerHTML = html; }})
+      .catch(function (e) {{ body.innerHTML = '<p class="msg err">Failed to load: ' + e + '</p>'; }});
+    return false;
+  }}
+  function closeAckPanel() {{
+    document.getElementById('ack-panel-backdrop').classList.remove('open');
+    document.getElementById('ack-panel').classList.remove('open');
+  }}
+  // Shared by every page's auto-refresh timer so an open flyout (the
+  // Acknowledge panel) or an open nav dropdown (Tools/Admin/account menu)
+  // never gets yanked out from under someone mid-interaction by a
+  // periodic reload/re-render.
+  window.isFlyoutOpen = function () {{
+    var panel = document.getElementById('ack-panel');
+    if (panel && panel.classList.contains('open')) return true;
+    return !!document.querySelector('nav.top details.nav-dropdown[open]');
+  }};
+  document.getElementById('ack-panel-body').addEventListener('submit', function (e) {{
+    var form = e.target;
+    if (form.tagName !== 'FORM') return;
+    e.preventDefault();
+    var submitBtn = form.querySelector('button[type="submit"]');
+    if (submitBtn) submitBtn.disabled = true;
+    fetch(form.action, {{method: (form.method || 'POST').toUpperCase(), body: new FormData(form)}})
+      .then(function (r) {{
+        var params;
+        try {{ params = new URL(r.url).searchParams; }} catch (e) {{ params = new URLSearchParams(); }}
+        var message = params.get('message');
+        var error = params.get('error');
+        var body = document.getElementById('ack-panel-body');
+        var banner = document.createElement('div');
+        banner.className = 'msg ' + (error ? 'err' : 'ok');
+        banner.textContent = error || message || (r.ok ? 'Done' : 'Request failed');
+        body.insertBefore(banner, body.firstChild);
+        setTimeout(function () {{ location.reload(); }}, 900);
+      }})
+      .catch(function (err) {{
+        if (submitBtn) submitBtn.disabled = false;
+        alert('Request failed: ' + err);
+      }});
+  }});
+  document.addEventListener('keydown', function (e) {{
+    if (e.key === 'Escape') closeAckPanel();
+  }});
+  (function () {{
+    document.addEventListener('click', function (e) {{
+      document.querySelectorAll('nav.top details.nav-dropdown[open]').forEach(function (d) {{
+        if (!d.contains(e.target)) d.open = false;
+      }});
+    }});
+  }})();
+  (function () {{
+    var audioCtx = null;
+    var nagIntervalId = null;
+
+    function playNagBeep() {{
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      var t0 = audioCtx.currentTime;
+      [0, 0.22].forEach(function (offset) {{
+        var osc = audioCtx.createOscillator();
+        var gain = audioCtx.createGain();
+        osc.type = 'square';
+        osc.frequency.value = 1046.5;
+        gain.gain.setValueAtTime(0.0001, t0 + offset);
+        gain.gain.exponentialRampToValueAtTime(0.18, t0 + offset + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t0 + offset + 0.18);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(t0 + offset);
+        osc.stop(t0 + offset + 0.2);
+      }});
+    }}
+
+    var baseTitle = document.title;
+    var faviconLink = document.querySelector('link[rel="icon"]');
+    var baseFaviconHref = faviconLink ? faviconLink.href : null;
+    var faviconImg = null;
+    if (baseFaviconHref) {{
+      faviconImg = new Image();
+      faviconImg.src = baseFaviconHref;
+    }}
+
+    function updateFaviconBadge(show, tone) {{
+      if (!faviconLink || !faviconImg) return;
+      if (!show) {{
+        faviconLink.href = baseFaviconHref;
+        return;
+      }}
+      function draw() {{
+        try {{
+          var size = 32;
+          var canvas = document.createElement('canvas');
+          canvas.width = size;
+          canvas.height = size;
+          var ctx = canvas.getContext('2d');
+          ctx.drawImage(faviconImg, 0, 0, size, size);
+          ctx.beginPath();
+          ctx.arc(size - 8, 8, 7, 0, 2 * Math.PI);
+          ctx.fillStyle = tone === 'warn' ? '#f2b447' : '#ff3355';
+          ctx.fill();
+          ctx.lineWidth = 2;
+          ctx.strokeStyle = '#ffffff';
+          ctx.stroke();
+          faviconLink.href = canvas.toDataURL('image/png');
+        }} catch (e) {{}}
+      }}
+      if (faviconImg.complete) draw(); else faviconImg.onload = draw;
+    }}
+
+    window.pageAlertCue = function (hasUnacked, hasAckedOnly, tone, count) {{
+      try {{
+        document.body.classList.toggle('critical-alert', !!hasUnacked);
+        document.body.classList.toggle('alert-solid', !hasUnacked && !!hasAckedOnly);
+        var isDanger = tone !== 'warn';
+        document.body.classList.toggle('tone-danger', (!!hasUnacked || !!hasAckedOnly) && isDanger);
+        document.body.classList.toggle('tone-warn', (!!hasUnacked || !!hasAckedOnly) && !isDanger);
+        var showBadge = !!hasUnacked || !!hasAckedOnly;
+        updateFaviconBadge(showBadge, tone);
+        if (showBadge) {{
+          var prefix = (count && count > 0) ? '(' + count + ') ' : '● ';
+          document.title = prefix + baseTitle;
+        }} else {{
+          document.title = baseTitle;
+        }}
+        if (hasUnacked) {{
+          if (!nagIntervalId) {{
+            playNagBeep();
+            nagIntervalId = setInterval(playNagBeep, 4000);
+          }}
+        }} else if (nagIntervalId) {{
+          clearInterval(nagIntervalId);
+          nagIntervalId = null;
+        }}
+      }} catch (e) {{}}
+    }};
+  }})();
+</script>
 </body>
 </html>"""
 
 
+def _acknowledge_nav_html(active, has_maintenance_system):
+    if active == "hyperview":
+        return '<a href="#" onclick="return openAckPanel(event, \'hyperview\')">Acknowledge</a>'
+    if not has_maintenance_system:
+        return ""
+    if active in ("ipro", "ooma", "downtime"):
+        return (
+            f'<a href="/acknowledge?system={active}" '
+            f'onclick="return openAckPanel(event, \'{active}\')">Acknowledge</a>'
+        )
+    cls = "active" if active == "acknowledge" else ""
+    return f'<a href="/acknowledge" class="{cls}">Acknowledge</a>'
+
+
 def render_shell(title, body, active, username=""):
+    allowed = _user_systems(username) if username else set()
+    full_allowed = _user_full_systems(username) if username else set()
+    has_full_control_system = bool(accessible_full_systems(username) or ("downtime" in full_allowed)) if username else False
+    is_admin = _is_admin(username) if username else False
+    has_operations = _user_has_operations(username) if username else False
+    theme_attr = ' data-theme="dark"' if username and _get_user_theme(username) == "dark" else ""
+
+    def nav_link(href, active_flag, label, badge=""):
+        cls = "active" if active == active_flag else ""
+        return f'<a href="{href}" class="{cls}">{label}{badge}</a>'
+
+    admin_menu = ""
+    if is_admin:
+        admin_has_active = "nav-has-active" if active in ("admin-access", "admin-config", "admin-log", "admin-activity", "admin-leadership", "admin-runbook-manage", "admin-rack-audit-scope") else ""
+        admin_menu = f"""
+        <details class="nav-dropdown {admin_has_active}">
+          <summary>Admin</summary>
+          <div class="nav-dropdown-menu">
+            <a href="/admin/leadership" class="{'active' if active == 'admin-leadership' else ''}">Leadership Dashboard</a>
+            <a href="/admin/access" class="{'active' if active == 'admin-access' else ''}">Access Management</a>
+            <a href="/admin/log" class="{'active' if active == 'admin-log' else ''}">Acknowledge Log (all systems)</a>
+            <a href="/admin/activity" class="{'active' if active == 'admin-activity' else ''}">User Activity</a>
+            <a href="/hyperview/runbook/manage" class="{'active' if active == 'admin-runbook-manage' else ''}">Runbook Management</a>
+            <a href="/admin/rack-audit-scope" class="{'active' if active == 'admin-rack-audit-scope' else ''}">Rack Audit - Shift Scope</a>
+            <a href="/admin/config" class="{'active' if active == 'admin-config' else ''}">System Config</a>
+          </div>
+        </details>"""
+
     return PAGE_SHELL.format(
-        title=title, body=body, username=_esc(username),
+        title=title, body=body, username=_esc(username), admin_menu=admin_menu,
+        pending_handoff_banner=_pending_handoff_banner_html(username) if username else "",
+        logo_b64=COVENANT_LOGO_PNG_B64, favicon_b64=FAVICON_PNG_B64, theme_attr=theme_attr,
         overview_active="active" if active == "overview" else "",
-        maint_active="active" if active == "maintenance" else "",
-        events_active="active" if active == "events" else "",
-        hyperview_active="active" if active == "hyperview" else "",
-        ipro_active="active" if active == "ipro" else "",
-        ooma_active="active" if active == "ooma" else "",
+        tools_has_active="nav-has-active" if active in ("handoff", "acknowledge", "events", "trends", "runbook-view", "rack-audit") else "",
+        handoff_nav=nav_link("/handoff", "handoff", "Handoff") if (is_admin or has_operations) else "",
+        acknowledge_nav=_acknowledge_nav_html(active, has_full_control_system),
+        events_nav=nav_link("/events-search", "events", "Event search") if has_full_control_system else "",
+        trends_nav=nav_link("/trends", "trends", "Trends") if full_allowed else "",
+        runbook_nav=nav_link("/hyperview/runbook", "runbook-view", "Runbook") if (is_admin or has_operations) else "",
+        rack_audit_nav=nav_link("/tools/rack-audit", "rack-audit", "Rack Audit") if "hyperview" in allowed else "",
+        search_box=('<form class="nav-search" action="/search" method="GET">'
+                     '<input type="text" name="q" id="nav-search-input" placeholder="Search... ( / )" autocomplete="off"></form>') if allowed else "",
+        hyperview_nav=nav_link("/hyperview", "hyperview", "Hyperview", _nav_badge_html("hyperview")) if "hyperview" in allowed else "",
+        ipro_nav=nav_link("/ipro", "ipro", "iPRO Cameras", _nav_badge_html("ipro")) if "ipro" in allowed else "",
+        ooma_nav=nav_link("/ooma", "ooma", "Ooma AirDial", _nav_badge_html("ooma")) if "ooma" in allowed else "",
+        downtime_nav=nav_link("/downtime", "downtime", "Downtime Workstations", _nav_badge_html("downtime")) if "downtime" in allowed else "",
     )
+
+
+@app.route("/theme", methods=["POST"])
+@require_login
+def set_theme(username):
+    theme = request.form.get("theme", "")
+    if theme not in ("light", "dark"):
+        return Response("Invalid theme", 400)
+    _set_user_theme(username, theme)
+    return Response("", 204)
 
 
 def _msg_html():
@@ -484,41 +2253,1367 @@ def _msg_html():
     return "".join(parts)
 
 
+def _redirect_msg(path, message=None, error=None, **extra_params):
+    """redirect() to path carrying a ?message=/?error= for _msg_html() to
+    render, plus any extra query params (e.g. system=) - handles the
+    quote()-ing so call sites can't forget it."""
+    params = []
+    if message:
+        params.append(f"message={quote(message)}")
+    if error:
+        params.append(f"error={quote(error)}")
+    for key, value in extra_params.items():
+        params.append(f"{key}={quote(str(value))}")
+    return redirect(f"{path}?{'&'.join(params)}" if params else path)
+
+
+def _delete_with_usage_check(list_path, in_use, noun, removed_message):
+    """Shared redirect logic for a delete route guarded by an in-use count
+    (runbook locations/contacts) - blocks with a friendly error naming how
+    many entries still reference it, or confirms removal."""
+    if in_use:
+        entry_word = "entry" if in_use == 1 else "entries"
+        return _redirect_msg(list_path, error=f"{in_use} runbook {entry_word} still use this {noun} - reassign them first (Bulk update)")
+    return _redirect_msg(list_path, message=removed_message)
+
+
 def _esc(s):
     from markupsafe import escape
     return escape(s or "")
 
 
+def _ack_tag_html(acknowledged):
+    """Shared 'Acknowledged' tag pill for every system's row renderer.
+    Leading space so it drops in right after a name."""
+    return ' <span class="tag">Acknowledged</span>' if acknowledged else ""
+
+
 def _json_for_script(obj):
-    """json.dumps, with '<' escaped so a value containing the literal
-    text "</script>" (a device/camera name, however unlikely) can't
-    break out of the <script> block it's embedded in."""
     return json.dumps(obj).replace("<", "\\u003c")
 
 
-def _critical_alert_script(has_critical):
-    """Toggles PAGE_SHELL's body.critical-alert flash (see its CSS
-    comment) - the logged-in-page counterpart to kioskCriticalCue, minus
-    the beep. One-shot on render, same as the iPRO/Ooma kiosk pages -
-    nothing here is polling, so it reflects whatever was true the moment
-    this page was generated."""
-    return f"<script>document.body.classList.toggle('critical-alert', {'true' if has_critical else 'false'});</script>"
+def _critical_alert_script(has_unacked, has_acked_only, tone="danger", count=None):
+    return (
+        f"<script>if (window.pageAlertCue) window.pageAlertCue("
+        f"{'true' if has_unacked else 'false'}, {'true' if has_acked_only else 'false'}, "
+        f"{json.dumps(tone)}, {json.dumps(count)});</script>"
+    )
 
 
-# --- backend calls ---------------------------------------------------
+MAINTENANCE_LOG_DB_PATH = os.environ.get(
+    "MAINTENANCE_LOG_DB_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "maintenance_log.db"),
+)
+
+
+def _add_column_if_missing(conn, table, column, coltype):
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                raise
+
+
+def _maintenance_log_db():
+    conn = sqlite3.connect(MAINTENANCE_LOG_DB_PATH, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS maintenance_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            system TEXT NOT NULL,
+            action TEXT NOT NULL,
+            target TEXT,
+            target_type TEXT,
+            reason TEXT,
+            set_by TEXT NOT NULL,
+            hours INTEGER
+        )
+    """)
+    _add_column_if_missing(conn, "maintenance_actions", "incident_number", "TEXT")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
+    # One-time: rows logged before HYPERVIEW_UPSTREAM_ACK_SET_BY was
+    # shortened from "Hyperview (acknowledged upstream)" to "Hyperview"
+    # still carry the old string in set_by - NON_HUMAN_SET_BY_VALUES only
+    # matches the constant's current value, so without this those old rows
+    # would wrongly start counting as a human responder in User Activity
+    # and Leadership Dashboard.
+    if conn.execute("SELECT 1 FROM app_settings WHERE key = 'hyperview_ack_set_by_migrated'").fetchone() is None:
+        conn.execute(
+            "UPDATE maintenance_actions SET set_by = ? WHERE set_by = 'Hyperview (acknowledged upstream)'",
+            (HYPERVIEW_UPSTREAM_ACK_SET_BY,),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO app_settings (key, value) VALUES ('hyperview_ack_set_by_migrated', '1')"
+        )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scheduled_maintenance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            system TEXT NOT NULL,
+            target_type TEXT NOT NULL,
+            target TEXT NOT NULL,
+            hours INTEGER NOT NULL,
+            reason TEXT,
+            set_by TEXT NOT NULL,
+            start_at INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            fired_at INTEGER
+        )
+    """)
+    _add_column_if_missing(conn, "scheduled_maintenance", "incident_number", "TEXT")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_prefs (
+            username TEXT PRIMARY KEY,
+            theme TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ldap_group_access (
+            group_dn TEXT PRIMARY KEY,
+            systems TEXT NOT NULL
+        )
+    """)
+    _add_column_if_missing(conn, "ldap_group_access", "is_admin", "INTEGER NOT NULL DEFAULT 0")
+    for dn, systems in LDAP_GROUP_SYSTEM_MAP_DEFAULT.items():
+        conn.execute(
+            "INSERT OR IGNORE INTO ldap_group_access (group_dn, systems) VALUES (?, ?)",
+            (dn, ",".join(sorted(systems))),
+        )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ldap_user_access (
+            username TEXT PRIMARY KEY,
+            systems TEXT NOT NULL,
+            is_admin INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS rack_audit_group_scope (
+            group_dn TEXT PRIMARY KEY,
+            sites TEXT NOT NULL
+        )
+    """)
+    # One-time: fold the old single "admin group" setting into a per-group flag.
+    if conn.execute("SELECT 1 FROM app_settings WHERE key = 'ldap_admin_group_migrated'").fetchone() is None:
+        legacy_row = conn.execute("SELECT value FROM app_settings WHERE key = 'ldap_admin_group'").fetchone()
+        legacy_admin_dn = (legacy_row[0] if legacy_row else LDAP_ADMIN_GROUP_DEFAULT).strip().lower()
+        if legacy_admin_dn:
+            conn.execute(
+                "INSERT INTO ldap_group_access (group_dn, systems, is_admin) VALUES (?, '', 1) "
+                "ON CONFLICT(group_dn) DO UPDATE SET is_admin = 1",
+                (legacy_admin_dn,),
+            )
+        conn.execute(
+            "INSERT OR IGNORE INTO app_settings (key, value) VALUES ('ldap_admin_group_migrated', '1')"
+        )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS local_users (
+            username TEXT PRIMARY KEY,
+            salt BLOB NOT NULL,
+            hash BLOB NOT NULL,
+            systems TEXT NOT NULL,
+            is_admin INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    if conn.execute("SELECT 1 FROM local_users LIMIT 1").fetchone() is None:
+        for uname, u in USERS_DEFAULT.items():
+            conn.execute(
+                "INSERT OR IGNORE INTO local_users (username, salt, hash, systems, is_admin) VALUES (?, ?, ?, ?, ?)",
+                (uname, u["salt"], u["hash"], ",".join(sorted(u["systems"])), 1 if u["is_admin"] else 0),
+            )
+    # One-time: split each flat system grant into View/Full tiers (promoting
+    # existing grants to Full), and fold Runbook into the new Operations grant.
+    if conn.execute("SELECT 1 FROM app_settings WHERE key = 'permission_tiers_migrated'").fetchone() is None:
+        def _migrate_grant_token(token):
+            if token in SYSTEM_KEYS:
+                return f"{token}_full"
+            if token == "runbook":
+                return "operations"
+            return token
+
+        for table in ("local_users", "ldap_group_access"):
+            for rowid, systems in conn.execute(f"SELECT rowid, systems FROM {table}").fetchall():
+                migrated = ",".join(sorted({_migrate_grant_token(s) for s in systems.split(",") if s}))
+                if migrated != systems:
+                    conn.execute(f"UPDATE {table} SET systems = ? WHERE rowid = ?", (migrated, rowid))
+        conn.execute(
+            "INSERT OR IGNORE INTO app_settings (key, value) VALUES ('permission_tiers_migrated', '1')"
+        )
+    existing_tables = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    )}
+    if "downtime_silences" in existing_tables and "downtime_acks" not in existing_tables:
+        conn.execute("ALTER TABLE downtime_silences RENAME TO downtime_acks")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS downtime_acks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            hostname TEXT NOT NULL,
+            reason TEXT,
+            set_by TEXT NOT NULL,
+            hours INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            cancelled_at INTEGER
+        )
+    """)
+    _add_column_if_missing(conn, "downtime_acks", "incident_number", "TEXT")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS downtime_status (
+            hostname TEXT PRIMARY KEY,
+            status TEXT,
+            group_name TEXT,
+            desc TEXT,
+            updated_at INTEGER
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS downtime_status_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            hostname TEXT NOT NULL,
+            group_name TEXT,
+            desc TEXT,
+            old_status TEXT,
+            new_status TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS hyperview_status (
+            name TEXT PRIMARY KEY,
+            status TEXT,
+            location TEXT,
+            updated_at INTEGER
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS hyperview_status_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            location TEXT,
+            old_status TEXT,
+            new_status TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS score_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            system TEXT NOT NULL,
+            ts INTEGER NOT NULL,
+            score INTEGER NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_score_history_system_ts ON score_history(system, ts)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS open_targets_state (
+            system TEXT PRIMARY KEY,
+            targets TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS shift_handoffs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at INTEGER NOT NULL,
+            created_by TEXT NOT NULL,
+            notes TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            accepted_at INTEGER,
+            accepted_by TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS process_locks (
+            name TEXT PRIMARY KEY,
+            owner TEXT NOT NULL,
+            expires_at INTEGER NOT NULL
+        )
+    """)
+    return conn
+
+
+RUNBOOK_DB_PATH = os.environ.get(
+    "RUNBOOK_DB_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "runbook.db"),
+)
+
+
+def _migrate_runbook_from_maintenance_log(dest_conn):
+    """One-time upgrade path: the runbook table used to live inside
+    maintenance_log.db. If that file still has one with rows in it and this
+    (now-separate) runbook db is otherwise empty, copy them over once."""
+    if not os.path.exists(MAINTENANCE_LOG_DB_PATH):
+        return
+    try:
+        src = sqlite3.connect(MAINTENANCE_LOG_DB_PATH, timeout=10)
+        tables = {r[0] for r in src.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "hyperview_runbook" not in tables:
+            src.close()
+            return
+        cols = [r[1] for r in src.execute("PRAGMA table_info(hyperview_runbook)")]
+        rows = src.execute(f"SELECT {', '.join(cols)} FROM hyperview_runbook").fetchall()
+        src.close()
+    except sqlite3.Error:
+        return
+    if not rows:
+        return
+    placeholders = ", ".join("?" for _ in cols)
+    for row in rows:
+        dest_conn.execute(
+            f"INSERT OR IGNORE INTO hyperview_runbook ({', '.join(cols)}) VALUES ({placeholders})", row,
+        )
+
+
+def _migrate_runbook_locations_and_contacts(conn):
+    """One-time: carves each distinct location/contact value already on file
+    into its own row (a contact used as both primary and escalation becomes
+    one shared row), then points each entry's new *_id at it. Only exact
+    matches are merged - near-duplicates are left for an admin to merge
+    later via the Locations/Contacts pages."""
+    for name, address in conn.execute(
+        "SELECT DISTINCT location, address FROM hyperview_runbook "
+        "WHERE location IS NOT NULL AND TRIM(location) != '' ORDER BY location"
+    ).fetchall():
+        conn.execute(
+            "INSERT OR IGNORE INTO runbook_locations (name, address) VALUES (?, ?)", (name, address or ""),
+        )
+    contact_pairs = set()
+    for name, phone in conn.execute(
+        "SELECT DISTINCT primary_name, primary_phone FROM hyperview_runbook "
+        "WHERE (primary_name IS NOT NULL AND TRIM(primary_name) != '') OR (primary_phone IS NOT NULL AND TRIM(primary_phone) != '')"
+    ).fetchall():
+        contact_pairs.add((name or "", phone or ""))
+    for name, phone in conn.execute(
+        "SELECT DISTINCT escalation_name, escalation_phone FROM hyperview_runbook "
+        "WHERE (escalation_name IS NOT NULL AND TRIM(escalation_name) != '') OR (escalation_phone IS NOT NULL AND TRIM(escalation_phone) != '')"
+    ).fetchall():
+        contact_pairs.add((name or "", phone or ""))
+    for name, phone in sorted(contact_pairs):
+        conn.execute("INSERT INTO runbook_contacts (name, phone) VALUES (?, ?)", (name, phone))
+
+    conn.execute("""
+        UPDATE hyperview_runbook SET location_id = (
+            SELECT id FROM runbook_locations WHERE runbook_locations.name = hyperview_runbook.location
+        ) WHERE location IS NOT NULL AND TRIM(location) != ''
+    """)
+    conn.execute("""
+        UPDATE hyperview_runbook SET primary_contact_id = (
+            SELECT id FROM runbook_contacts WHERE runbook_contacts.name = COALESCE(hyperview_runbook.primary_name, '')
+                AND runbook_contacts.phone = COALESCE(hyperview_runbook.primary_phone, '')
+        ) WHERE (primary_name IS NOT NULL AND TRIM(primary_name) != '') OR (primary_phone IS NOT NULL AND TRIM(primary_phone) != '')
+    """)
+    conn.execute("""
+        UPDATE hyperview_runbook SET escalation_contact_id = (
+            SELECT id FROM runbook_contacts WHERE runbook_contacts.name = COALESCE(hyperview_runbook.escalation_name, '')
+                AND runbook_contacts.phone = COALESCE(hyperview_runbook.escalation_phone, '')
+        ) WHERE (escalation_name IS NOT NULL AND TRIM(escalation_name) != '') OR (escalation_phone IS NOT NULL AND TRIM(escalation_phone) != '')
+    """)
+
+
+def _runbook_db():
+    conn = sqlite3.connect(RUNBOOK_DB_PATH, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS hyperview_runbook (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_name TEXT NOT NULL COLLATE NOCASE,
+            alert_type TEXT NOT NULL COLLATE NOCASE,
+            location TEXT,
+            address TEXT,
+            action TEXT,
+            primary_name TEXT,
+            primary_phone TEXT,
+            escalation_name TEXT,
+            escalation_phone TEXT,
+            updated_at INTEGER NOT NULL,
+            updated_by TEXT NOT NULL,
+            UNIQUE(device_name, alert_type)
+        )
+    """)
+    _add_column_if_missing(conn, "hyperview_runbook", "infrastructure_type", "TEXT")
+    _add_column_if_missing(conn, "hyperview_runbook", "device_type", "TEXT")
+    _add_column_if_missing(conn, "hyperview_runbook", "ignore_incomplete", "INTEGER NOT NULL DEFAULT 0")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS runbook_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
+    if conn.execute("SELECT 1 FROM runbook_settings WHERE key = 'migrated_from_maintenance_log'").fetchone() is None:
+        _migrate_runbook_from_maintenance_log(conn)
+        conn.execute("INSERT OR IGNORE INTO runbook_settings (key, value) VALUES ('migrated_from_maintenance_log', '1')")
+        conn.commit()
+
+    # Locations/contacts are managed separately and referenced by id, so an
+    # edit here propagates to every runbook entry that points at it.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS runbook_locations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            address TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS runbook_contacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL DEFAULT '',
+            phone TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    _add_column_if_missing(conn, "hyperview_runbook", "location_id", "INTEGER")
+    _add_column_if_missing(conn, "hyperview_runbook", "primary_contact_id", "INTEGER")
+    _add_column_if_missing(conn, "hyperview_runbook", "escalation_contact_id", "INTEGER")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS runbook_coverage_gaps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device TEXT NOT NULL,
+            alarm TEXT NOT NULL,
+            location TEXT NOT NULL DEFAULT '',
+            gap_type TEXT NOT NULL,
+            first_seen_ts INTEGER NOT NULL,
+            last_seen_ts INTEGER NOT NULL,
+            resolved_at INTEGER
+        )
+    """)
+    if conn.execute("SELECT 1 FROM runbook_settings WHERE key = 'migrated_locations_contacts'").fetchone() is None:
+        _migrate_runbook_locations_and_contacts(conn)
+        conn.execute("INSERT OR IGNORE INTO runbook_settings (key, value) VALUES ('migrated_locations_contacts', '1')")
+        conn.commit()
+    return conn
+
+
+threading.Thread(target=_record_score_history, daemon=True).start()
+
+
+def _get_app_setting(key, default=None):
+    conn = _maintenance_log_db()
+    try:
+        row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else default
+    finally:
+        conn.close()
+
+
+def _set_app_setting(key, value):
+    conn = _maintenance_log_db()
+    try:
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _get_user_theme(username):
+    conn = _maintenance_log_db()
+    try:
+        row = conn.execute("SELECT theme FROM user_prefs WHERE username = ?", (username,)).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def _set_user_theme(username, theme):
+    conn = _maintenance_log_db()
+    try:
+        conn.execute(
+            "INSERT INTO user_prefs (username, theme) VALUES (?, ?) "
+            "ON CONFLICT(username) DO UPDATE SET theme = excluded.theme",
+            (username, theme),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+MAINTENANCE_LOG_RETENTION_DAYS = int(os.environ.get("MAINTENANCE_LOG_RETENTION_DAYS", "90"))
+SCORE_HISTORY_RETENTION_DAYS = int(os.environ.get("SCORE_HISTORY_RETENTION_DAYS", "90"))
+_MAINTENANCE_LOG_CLEANUP_INTERVAL_SECONDS = 24 * 3600
+
+
+def _maintenance_log_cleanup_tick():
+    cutoff = int(time.time()) - MAINTENANCE_LOG_RETENTION_DAYS * 86400
+    score_cutoff = int(time.time()) - SCORE_HISTORY_RETENTION_DAYS * 86400
+    conn = _maintenance_log_db()
+    try:
+        conn.execute("DELETE FROM maintenance_actions WHERE ts < ?", (cutoff,))
+        conn.execute("DELETE FROM scheduled_maintenance WHERE fired_at IS NOT NULL AND fired_at < ?", (cutoff,))
+        conn.execute("DELETE FROM score_history WHERE ts < ?", (score_cutoff,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _run_maintenance_log_cleanup():
+    while True:
+        try:
+            _maintenance_log_cleanup_tick()
+        except Exception:
+            pass
+        time.sleep(_MAINTENANCE_LOG_CLEANUP_INTERVAL_SECONDS)
+
+
+threading.Thread(target=_run_maintenance_log_cleanup, daemon=True).start()
+
+
+def _log_maintenance_action(system, action, target, target_type, reason, set_by, hours=None, incident_number=None):
+    conn = _maintenance_log_db()
+    try:
+        conn.execute(
+            "INSERT INTO maintenance_actions (ts, system, action, target, target_type, reason, set_by, hours, incident_number) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (int(time.time()), system, action, target, target_type, reason, set_by, hours, incident_number),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _query_maintenance_actions(system, since_ts=None, until_ts=None):
+    conn = _maintenance_log_db()
+    try:
+        conn.row_factory = sqlite3.Row
+        query = "SELECT * FROM maintenance_actions WHERE system = ?"
+        params = [system]
+        if since_ts is not None:
+            query += " AND ts >= ?"
+            params.append(since_ts)
+        if until_ts is not None:
+            query += " AND ts <= ?"
+            params.append(until_ts)
+        query += " ORDER BY ts DESC"
+        return [dict(r) for r in conn.execute(query, params).fetchall()]
+    finally:
+        conn.close()
+
+
+def _parse_local_datetime(value):
+    if not value:
+        return None
+    try:
+        return int(datetime.strptime(value, "%Y-%m-%dT%H:%M").timestamp())
+    except ValueError:
+        return None
+
+
+def _maintenance_events_for(system, cfg):
+    single_type, single_label = cfg["target_types"][0]
+    grouped_type, grouped_label = cfg["target_types"][1]
+    since_ts = _parse_local_datetime(request.args.get("since"))
+    until_ts = _parse_local_datetime(request.args.get("until"))
+    device_filter = (request.args.get("device_id") or "").strip().lower()
+    account_filter = (request.args.get("account") or "").strip().lower()
+
+    events = []
+    for r in _query_maintenance_actions(system, since_ts, until_ts):
+        # This function only knows how to render the human/manual actions -
+        # auto-detected alarm/resolved rows belong to the raw upstream
+        # /events feed already merged in by the caller, and rendering them
+        # here mislabels them as "Un-acknowledged by system-monitor".
+        if r["action"] not in ("acknowledged", "un-acknowledged"):
+            continue
+        target = r["target"] or ""
+        is_single = r["target_type"] == single_type
+        if device_filter and not (is_single and device_filter in target.lower()):
+            continue
+        if account_filter and not (not is_single and account_filter in target.lower()):
+            continue
+        label = single_label if is_single else grouped_label
+        incident_txt = f" [Incident #{r['incident_number']}]" if r["incident_number"] else ""
+        if r["action"] == "acknowledged":
+            hours_txt = f" ({r['hours']}h)" if r["hours"] else ""
+            new_message = f"Acknowledged{hours_txt} by {r['set_by']}: {r['reason']}" if r["reason"] else f"Acknowledged{hours_txt} by {r['set_by']}"
+            new_message += incident_txt
+        else:
+            new_message = f"Un-acknowledged by {r['set_by']}{incident_txt}"
+        events.append({
+            "changed_at": r["ts"],
+            "device": target if is_single else "",
+            "account": target if not is_single else "",
+            "device_type": label,
+            "group_name": label,
+            "old_message": None,
+            "new_message": new_message,
+            "new_severity": "Maintenance",
+        })
+    return events
+
+
+def _downtime_default_ack_hours(now_ts=None):
+    now_ts = time.time() if now_ts is None else now_ts
+    now = datetime.fromtimestamp(now_ts)
+    weekday = now.weekday()
+    minutes_since_monday = weekday * 1440 + now.hour * 60 + now.minute
+    business_start = 7 * 60
+    business_end = 3 * 1440 + 17 * 60
+    if business_start <= minutes_since_monday <= business_end:
+        return 24
+    if weekday == 0:
+        target_date = now.date()
+    else:
+        days_ahead = (7 - weekday) % 7
+        target_date = (now + timedelta(days=days_ahead)).date()
+    target = datetime.combine(target_date, dt_time(12, 0))
+    return max(1, round((target - now).total_seconds() / 3600))
+
+
+def _downtime_acknowledge(hostname, reason, set_by, incident_number):
+    hours = _downtime_default_ack_hours()
+    conn = _maintenance_log_db()
+    try:
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO downtime_acks (hostname, reason, set_by, hours, created_at, expires_at, incident_number) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (hostname, reason, set_by, hours, now, now + hours * 3600, incident_number),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    try:
+        _log_maintenance_action("downtime", "acknowledged", hostname, "workstation", reason, set_by,
+                                 hours=hours, incident_number=incident_number)
+    except Exception:
+        pass
+    return hours
+
+
+def _downtime_unacknowledge(hostname, set_by):
+    conn = _maintenance_log_db()
+    try:
+        now = int(time.time())
+        cur = conn.execute(
+            "UPDATE downtime_acks SET cancelled_at = ? "
+            "WHERE hostname = ? AND cancelled_at IS NULL AND expires_at > ?",
+            (now, hostname, now),
+        )
+        conn.commit()
+        changed = cur.rowcount > 0
+    finally:
+        conn.close()
+    if changed:
+        try:
+            _log_maintenance_action("downtime", "un-acknowledged", hostname, "workstation", None, set_by)
+        except Exception:
+            pass
+    return changed
+
+
+def _active_downtime_acks():
+    conn = _maintenance_log_db()
+    try:
+        conn.row_factory = sqlite3.Row
+        now = int(time.time())
+        rows = conn.execute(
+            "SELECT * FROM downtime_acks WHERE cancelled_at IS NULL AND expires_at > ? ORDER BY expires_at ASC",
+            (now,),
+        ).fetchall()
+        return {r["hostname"]: dict(r) for r in rows}
+    finally:
+        conn.close()
+
+
+def _pending_downtime_acks():
+    rows = []
+    for hostname, s in sorted(_active_downtime_acks().items()):
+        remaining_s = max(0, s["expires_at"] - int(time.time()))
+        hours, rem = divmod(remaining_s, 3600)
+        minutes = rem // 60
+        remaining = f"{hours}h {minutes}m" if hours else f"{minutes}m"
+        rows.append({
+            "key": hostname, "target_type": "workstation", "target": hostname,
+            "reason": s["reason"], "set_by": s["set_by"], "remaining": remaining,
+            "incident_number": s.get("incident_number"),
+        })
+    return rows
+
+
+DOWNTIME_STATUS_POLL_SECONDS = int(os.environ.get("DOWNTIME_STATUS_POLL_SECONDS", "120"))
+
+
+def _downtime_status_tick():
+    rows = _fetch_downtime_data()
+    if rows is None:
+        return
+    conn = _maintenance_log_db()
+    try:
+        conn.row_factory = sqlite3.Row
+        prior = {r["hostname"]: r for r in conn.execute("SELECT * FROM downtime_status").fetchall()}
+        now = int(time.time())
+        for r in rows:
+            hostname = r.get("strhostname")
+            if not hostname:
+                continue
+            status = r.get("strclassname") or ""
+            group_name = r.get("strgroupname") or ""
+            desc = r.get("strhostdesc") or ""
+            prev = prior.get(hostname)
+            if prev is None:
+                conn.execute(
+                    "INSERT INTO downtime_status (hostname, status, group_name, desc, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    (hostname, status, group_name, desc, now),
+                )
+            elif prev["status"] != status:
+                conn.execute(
+                    "INSERT INTO downtime_status_events (ts, hostname, group_name, desc, old_status, new_status) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (now, hostname, group_name, desc, prev["status"], status),
+                )
+                conn.execute(
+                    "UPDATE downtime_status SET status = ?, group_name = ?, desc = ?, updated_at = ? WHERE hostname = ?",
+                    (status, group_name, desc, now, hostname),
+                )
+            else:
+                conn.execute(
+                    "UPDATE downtime_status SET group_name = ?, desc = ?, updated_at = ? WHERE hostname = ?",
+                    (group_name, desc, now, hostname),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _run_downtime_status_poll():
+    while True:
+        try:
+            _downtime_status_tick()
+        except Exception:
+            pass
+        time.sleep(DOWNTIME_STATUS_POLL_SECONDS)
+
+
+threading.Thread(target=_run_downtime_status_poll, daemon=True).start()
+
+_DOWNTIME_STATUS_LABEL = {"cssDeviceAlert": "Not reporting", "cssDeviceNormal": "Reporting normally"}
+
+
+def _downtime_status_events_for(since_ts=None, until_ts=None, device_filter="", limit=None):
+    conn = _maintenance_log_db()
+    try:
+        conn.row_factory = sqlite3.Row
+        query = "SELECT * FROM downtime_status_events WHERE 1=1"
+        params = []
+        if since_ts is not None:
+            query += " AND ts >= ?"
+            params.append(since_ts)
+        if until_ts is not None:
+            query += " AND ts <= ?"
+            params.append(until_ts)
+        query += " ORDER BY ts DESC"
+        if limit:
+            query += " LIMIT ?"
+            params.append(limit)
+        raw = [dict(r) for r in conn.execute(query, params).fetchall()]
+    finally:
+        conn.close()
+
+    device_filter = device_filter.strip().lower()
+    events = []
+    for r in raw:
+        if device_filter and device_filter not in (r["hostname"] or "").lower():
+            continue
+        old_label = _DOWNTIME_STATUS_LABEL.get(r["old_status"], r["old_status"] or "Unknown")
+        new_label = _DOWNTIME_STATUS_LABEL.get(r["new_status"], r["new_status"] or "Unknown")
+        is_alert = r["new_status"] == "cssDeviceAlert"
+        events.append({
+            "changed_at": r["ts"],
+            "device": r["hostname"],
+            # Group (site/clinic) goes in Location, not Type - matches iPRO's location.
+            "account": r["group_name"] or "",
+            "device_type": "workstation",
+            "group_name": r["group_name"],
+            "old_message": old_label,
+            "new_message": None if r["new_status"] == "cssDeviceNormal" else new_label,
+            "new_severity": "Degraded" if is_alert else None,
+        })
+    return events
+
+
+HYPERVIEW_STATUS_POLL_SECONDS = int(os.environ.get("HYPERVIEW_STATUS_POLL_SECONDS", "120"))
+
+
+def _hyperview_status_tick():
+    """Hyperview has no history API, just a live snapshot - builds real
+    history locally by diffing each poll against the last known state.
+    Tracks both alarming devices AND sites flagged 'affected' with no
+    device explaining it (via _dedup_site_targets - the same site/device
+    split _open_target_names uses), so a site-level issue with no specific
+    device attached still shows up in Event Search."""
+    try:
+        resp = _parallel_get(HYPERVIEW_BASE_URL, ["/location-health-matrix", "/clinic-health-matrix", "/active-alarm-log"])
+        sites = resp["/location-health-matrix"].json() + resp["/clinic-health-matrix"].json()
+        alarms = resp["/active-alarm-log"].json()
+    except (requests.RequestException, ValueError, KeyError, FuturesTimeoutError) as e:
+        app.logger.warning("hyperview status tick: could not fetch/parse this poll: %r", e)
+        return
+
+    try:
+        _record_runbook_coverage_gaps(_hyperview_runbook_gaps_from_alarms(alarms))
+        _sweep_resolved_runbook_gaps()
+    except Exception:
+        app.logger.exception("hyperview status tick: runbook coverage gap tracking failed")
+
+    # A device can carry more than one active alarm row (e.g. power AND
+    # temperature both alerting). Overwriting device_status[device] outright
+    # per row silently dropped every row but the last one seen - including
+    # its acknowledged state, so a device with an acknowledged alarm and a
+    # still-open one could read as entirely un-acknowledged depending on
+    # array order. A device counts as acknowledged if ANY of its current
+    # alarm rows does.
+    device_status = {}
+    for a in alarms:
+        device = a.get("device")
+        if not device:
+            continue
+        entry = device_status.setdefault(device, {
+            "status": a.get("alarm") or "Alarm", "location": a.get("location") or "",
+            "acknowledged": False,
+        })
+        if a.get("acknowledged"):
+            entry["acknowledged"] = True
+
+    acked_now = [d for d, info in device_status.items() if info["acknowledged"]]
+    # WARNING, not INFO: this app has no logging configuration anywhere, so
+    # with no handler attached, Python's default "last resort" behavior only
+    # ever surfaces WARNING+ to stderr - INFO would be silently dropped
+    # before reaching any terminal/log file, regardless of how it's watched.
+    app.logger.warning(
+        "hyperview status tick: %d alarming device(s), %d currently acknowledged: %r",
+        len(device_status), len(acked_now), acked_now,
+    )
+    newly_acked = []
+    with _hyperview_acked_devices_lock:
+        for device, info in device_status.items():
+            if info["acknowledged"]:
+                if device not in _hyperview_acked_devices:
+                    newly_acked.append(device)
+                _hyperview_acked_devices.add(device)
+            else:
+                _hyperview_acked_devices.discard(device)
+        for device in list(_hyperview_acked_devices):
+            if device not in device_status:
+                _hyperview_acked_devices.discard(device)
+    if newly_acked:
+        app.logger.warning("hyperview status tick: newly acknowledged upstream: %r", newly_acked)
+    for device in newly_acked:
+        try:
+            _log_maintenance_action("hyperview", "acknowledged", device, "device", None, HYPERVIEW_UPSTREAM_ACK_SET_BY)
+        except Exception:
+            app.logger.exception("hyperview status tick: failed to log acknowledged action for %r", device)
+
+    all_targets, device_targets = _dedup_site_targets(sites, alarms)
+    # 'alarm'/'resolved' rows for hyperview are logged from THIS tick (every
+    # HYPERVIEW_STATUS_POLL_SECONDS, ~120s) rather than the separate, slower
+    # score-history poll (every 5min) that every other system still uses -
+    # a Hyperview alarm that opened and cleared inside that 5min window
+    # never showed up in Recent Activity at all, even though it was already
+    # visible in Event Search (which this same tick's hyperview_status_events
+    # writes below already reflect at the faster cadence).
+    try:
+        _check_alarm_changes("hyperview", all_targets, device_targets)
+    except Exception:
+        app.logger.exception("hyperview status tick: alarm-change detection failed")
+
+    current = {}
+    for name in all_targets:
+        if name in device_status:
+            current[name] = device_status[name]
+        else:
+            current[name] = {"status": "Site flagged affected", "location": name}
+
+    conn = _maintenance_log_db()
+    try:
+        conn.row_factory = sqlite3.Row
+        prior = {r["name"]: r for r in conn.execute("SELECT * FROM hyperview_status").fetchall()}
+        now = int(time.time())
+        for name, info in current.items():
+            prev = prior.get(name)
+            if prev is None:
+                if info["status"]:
+                    conn.execute(
+                        "INSERT INTO hyperview_status_events (ts, name, location, old_status, new_status) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (now, name, info["location"], None, info["status"]),
+                    )
+                conn.execute(
+                    "INSERT INTO hyperview_status (name, status, location, updated_at) VALUES (?, ?, ?, ?)",
+                    (name, info["status"], info["location"], now),
+                )
+            elif prev["status"] != info["status"]:
+                conn.execute(
+                    "INSERT INTO hyperview_status_events (ts, name, location, old_status, new_status) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (now, name, info["location"], prev["status"], info["status"]),
+                )
+                conn.execute(
+                    "UPDATE hyperview_status SET status = ?, location = ?, updated_at = ? WHERE name = ?",
+                    (info["status"], info["location"], now, name),
+                )
+            else:
+                conn.execute(
+                    "UPDATE hyperview_status SET location = ?, updated_at = ? WHERE name = ?",
+                    (info["location"], now, name),
+                )
+        for name, prev in prior.items():
+            if name not in current and prev["status"] is not None:
+                conn.execute(
+                    "INSERT INTO hyperview_status_events (ts, name, location, old_status, new_status) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (now, name, prev["location"], prev["status"], None),
+                )
+                conn.execute(
+                    "UPDATE hyperview_status SET status = NULL, updated_at = ? WHERE name = ?",
+                    (now, name),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _run_hyperview_status_poll():
+    while True:
+        try:
+            _hyperview_status_tick()
+        except Exception:
+            pass
+        time.sleep(HYPERVIEW_STATUS_POLL_SECONDS)
+
+
+threading.Thread(target=_run_hyperview_status_poll, daemon=True).start()
+
+
+def _hyperview_status_events_for(since_ts=None, until_ts=None, device_filter="", limit=None):
+    conn = _maintenance_log_db()
+    try:
+        conn.row_factory = sqlite3.Row
+        query = "SELECT * FROM hyperview_status_events WHERE 1=1"
+        params = []
+        if since_ts is not None:
+            query += " AND ts >= ?"
+            params.append(since_ts)
+        if until_ts is not None:
+            query += " AND ts <= ?"
+            params.append(until_ts)
+        query += " ORDER BY ts DESC"
+        if limit:
+            query += " LIMIT ?"
+            params.append(limit)
+        raw = [dict(r) for r in conn.execute(query, params).fetchall()]
+    finally:
+        conn.close()
+
+    device_filter = device_filter.strip().lower()
+    events = []
+    for r in raw:
+        if device_filter and device_filter not in (r["name"] or "").lower():
+            continue
+        events.append({
+            "changed_at": r["ts"],
+            "device": r["name"],
+            "account": r["location"] or "",
+            "device_type": "device",
+            "group_name": "device",
+            "old_message": r["old_status"],
+            "new_message": r["new_status"],
+            "new_severity": "Critical" if r["new_status"] else None,
+        })
+    return events
+
+
+def _fetch_merged_hyperview_events():
+    since_ts = _parse_local_datetime(request.args.get("since"))
+    until_ts = _parse_local_datetime(request.args.get("until"))
+    device_filter = (request.args.get("device_id") or "").strip().lower()
+
+    action_events = []
+    for r in _query_maintenance_actions("hyperview", since_ts, until_ts):
+        if r["action"] not in ("acknowledged", "un-acknowledged"):
+            continue
+        target = r["target"] or ""
+        if device_filter and device_filter not in target.lower():
+            continue
+        incident_txt = f" [Incident #{r['incident_number']}]" if r["incident_number"] else ""
+        if r["action"] == "acknowledged":
+            hours_txt = f" ({r['hours']}h)" if r["hours"] else ""
+            new_message = f"Acknowledged{hours_txt} by {r['set_by']}: {r['reason']}" if r["reason"] else f"Acknowledged{hours_txt} by {r['set_by']}"
+            new_message += incident_txt
+        else:
+            new_message = f"Un-acknowledged by {r['set_by']}{incident_txt}"
+        action_events.append({
+            "changed_at": r["ts"], "device": target, "account": "",
+            "device_type": "device", "group_name": "device",
+            "old_message": None, "new_message": new_message, "new_severity": "Maintenance",
+        })
+
+    combined = action_events + _hyperview_status_events_for(since_ts, until_ts, device_filter)
+    combined.sort(key=lambda r: r.get("changed_at") or 0, reverse=True)
+    limit = request.args.get("limit", type=int)
+    if limit:
+        combined = combined[:limit]
+    return combined, None
+
+
+def _hyperview_search_options():
+    try:
+        resp = _parallel_get(HYPERVIEW_BASE_URL, ["/location-health-matrix", "/clinic-health-matrix", "/active-alarm-log"])
+        sites = resp["/location-health-matrix"].json() + resp["/clinic-health-matrix"].json()
+        alarms = resp["/active-alarm-log"].json()
+    except (requests.RequestException, ValueError, KeyError, FuturesTimeoutError):
+        return None
+    devices = sorted({a["device"] for a in alarms if a.get("device")})
+    accounts = sorted({s["location"] for s in sites if s.get("location")})
+    return {"single": [{"id": d, "name": d} for d in devices], "grouped": accounts}
+
+
+def _hyperview_active_alarms():
+    """Raw /active-alarm-log rows (id, location, device, severity, alarm,
+    acknowledged) for the Acknowledge page - unlike _hyperview_search_options
+    this keeps the alarm's own id, needed to ack/un-ack a specific alarm
+    through the Hyperview API rather than just naming a device."""
+    try:
+        resp = _cached_get(f"{HYPERVIEW_BASE_URL}/active-alarm-log")
+        resp.raise_for_status()
+        return resp.json()
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def _hyperview_set_ack_state(alarm_event_id, acknowledged):
+    state = "acknowledged" if acknowledged else "unacknowledged"
+    resp = requests.put(
+        f"{HYPERVIEW_BASE_URL}/alarm-event/{quote(alarm_event_id, safe='')}/acknowledgement-state/{state}",
+        timeout=REQUEST_TIMEOUT,
+    )
+    resp.raise_for_status()
+
+
+RACK_AUDIT_REQUEST_TIMEOUT = REQUEST_TIMEOUT + 45  # walks every eligible rack server-side - can run long
+
+
+def _rack_audit_next(sites):
+    """Auto-targeted next rack to audit (matrix.py already applied the
+    silent-skip-empty-racks logic) - (rack, assets) on success, or
+    (None, error_message) if unreachable or nothing was eligible."""
+    params = {"sites": ",".join(sorted(sites))} if sites else {}
+    try:
+        resp = requests.get(f"{HYPERVIEW_BASE_URL}/rack-audit/next", params=params, timeout=RACK_AUDIT_REQUEST_TIMEOUT)
+    except requests.RequestException as e:
+        return None, f"Could not reach Hyperview: {e}"
+    if resp.status_code == 404:
+        return None, (resp.json().get("error") if resp.headers.get("content-type", "").startswith("application/json")
+                       else "No eligible rack was found")
+    try:
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        return None, f"Could not reach Hyperview: {e}"
+    data = resp.json()
+    return (data["rack"], data["assets"]), None
+
+
+def _rack_audit_mark_complete(rack_id):
+    try:
+        resp = requests.post(f"{HYPERVIEW_BASE_URL}/rack-audit/complete/{quote(rack_id, safe='')}", timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        return f"Could not reach Hyperview: {e}"
+    return None
+
+
+MTTA_LOOKBACK_SECONDS = 24 * 3600
+MTTA_MAX_REASONABLE_SECONDS = 30 * 86400
+
+
+def _fetch_raw_device_events(cfg, since_ts, until_ts):
+    params = {
+        "since": datetime.fromtimestamp(since_ts).strftime("%Y-%m-%dT%H:%M"),
+        "until": datetime.fromtimestamp(until_ts).strftime("%Y-%m-%dT%H:%M"),
+    }
+    try:
+        resp = requests.get(f"{cfg['base_url']}/events", params=params, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        return resp.json()
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def _alarm_to_action_samples(system, since_ts, until_ts, end_action, lookback_seconds, max_reasonable_seconds):
+    """Pairs each locally-logged 'alarm' row for a target with the next
+    `end_action` row for that same target, and returns the deltas. Shared
+    by MTTR (alarm -> resolved, every system) and Hyperview's MTTA
+    (alarm -> acknowledged) - both are computed purely from our own
+    maintenance_actions history, not a live upstream fetch."""
+    lookback_ts = since_ts - lookback_seconds
+    actions = _query_maintenance_actions(system, since_ts=lookback_ts, until_ts=until_ts)
+    by_target = {}
+    for a in actions:
+        if a["action"] in ("alarm", end_action):
+            by_target.setdefault(a["target"], []).append(a)
+
+    samples = []
+    for target_actions in by_target.values():
+        target_actions.sort(key=lambda a: a["ts"])
+        open_ts = None
+        for a in target_actions:
+            if a["action"] == "alarm":
+                open_ts = a["ts"]
+            elif a["action"] == end_action and open_ts is not None:
+                if a["ts"] >= since_ts:
+                    delta = a["ts"] - open_ts
+                    if 0 <= delta <= max_reasonable_seconds:
+                        samples.append(delta)
+                open_ts = None
+    return samples
+
+
+def _mtta_samples_for_system(system, since_ts, until_ts):
+    """Time from a locally-detected alarm to a local acknowledgement -
+    computed entirely from our own maintenance_actions history for every
+    system. Hyperview's ack is detected from its own upstream flag (see
+    _hyperview_status_tick); iPRO/Ooma/Downtime's come from InfraWatch's
+    own /acknowledge flow. Either way this never depends on a live bridge
+    fetch at page-load time, so it can't go 'Unreachable' anymore."""
+    return _alarm_to_action_samples(
+        system, since_ts, until_ts, "acknowledged", MTTA_LOOKBACK_SECONDS, MTTA_MAX_REASONABLE_SECONDS)
+
+
+def _duration_stats(samples):
+    """Shared count/mean/median/max summary for MTTA and MTTR sample sets -
+    both are now plain lists of second-deltas from local history."""
+    if not samples:
+        return None
+    ordered = sorted(samples)
+    n = len(ordered)
+    mid = n // 2
+    median = ordered[mid] if n % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+    return {"count": n, "mean": sum(ordered) / n, "median": median, "max": ordered[-1]}
+
+
+MTTR_LOOKBACK_SECONDS = 24 * 3600
+MTTR_MAX_REASONABLE_SECONDS = 30 * 86400
+
+
+def _mttr_samples_for_system(system, since_ts, until_ts):
+    """Mean time to resolve: alarm -> resolved, computed entirely from our
+    own locally-logged maintenance_actions rows - works the same way for
+    all four systems, Hyperview included."""
+    return _alarm_to_action_samples(
+        system, since_ts, until_ts, "resolved", MTTR_LOOKBACK_SECONDS, MTTR_MAX_REASONABLE_SECONDS)
+
+
+def _device_reliability_stats(events, now_ts):
+    """Per-device incident count + total downtime, pairing each onset with
+    its next clearing for that device. An incident still open at now_ts
+    counts through now_ts rather than 0."""
+    by_device = {}
+    for e in events:
+        device = e.get("device")
+        if device:
+            by_device.setdefault(device, []).append(e)
+
+    stats = {}
+    for device, dev_events in by_device.items():
+        dev_events.sort(key=lambda e: e["changed_at"])
+        incidents = 0
+        total_seconds = 0.0
+        open_since = None
+        for e in dev_events:
+            if e.get("new_message") is not None:
+                if open_since is None:
+                    incidents += 1
+                    open_since = e["changed_at"]
+            elif open_since is not None:
+                total_seconds += max(0, e["changed_at"] - open_since)
+                open_since = None
+        if open_since is not None:
+            total_seconds += max(0, now_ts - open_since)
+        if incidents:
+            stats[device] = {"incidents": incidents, "total_seconds": total_seconds}
+    return stats
+
+
+def _cross_system_reliability_rows(username, since_ts, until_ts):
+    """Ranks devices by a combination of incident frequency and total
+    downtime across every system the account can see, in one list -
+    answers "which devices fail most/longest" instead of making someone
+    compare four separate per-system views by eye."""
+    now_ts = time.time()
+    allowed = _user_systems(username)
+    rows = []
+    for system in ("hyperview", "ipro", "ooma", "downtime"):
+        if system not in allowed:
+            continue
+        if system == "hyperview":
+            events = _hyperview_status_events_for(since_ts=since_ts, until_ts=until_ts)
+        elif system == "downtime":
+            events = _downtime_status_events_for(since_ts=since_ts, until_ts=until_ts)
+        else:
+            events = _fetch_raw_device_events(SYSTEMS[system], since_ts, until_ts) or []
+        stats = _device_reliability_stats(events, now_ts)
+        label = TRENDS_SYSTEM_LABELS.get(system, system)
+        for device, s in stats.items():
+            rows.append({
+                "system": system, "system_label": label, "device": device,
+                "incidents": s["incidents"], "total_seconds": s["total_seconds"],
+            })
+    # Incident count and total downtime live on wildly different scales (a
+    # handful of incidents vs. potentially tens of thousands of seconds),
+    # so combining the raw numbers would let downtime alone decide the
+    # order. Min-max normalize each metric to 0-1 against the rows in this
+    # result, then average the two - a device that fails constantly but
+    # recovers quickly now scores alongside one that rarely fails but
+    # stays down a long time, instead of raw downtime drowning it out.
+    if rows:
+        downtimes = [r["total_seconds"] for r in rows]
+        incident_counts = [r["incidents"] for r in rows]
+        dt_lo, dt_hi = min(downtimes), max(downtimes)
+        inc_lo, inc_hi = min(incident_counts), max(incident_counts)
+
+        def normalized(value, lo, hi):
+            return (value - lo) / (hi - lo) if hi > lo else 1.0
+
+        for r in rows:
+            r["_reliability_score"] = (
+                normalized(r["total_seconds"], dt_lo, dt_hi) + normalized(r["incidents"], inc_lo, inc_hi)
+            ) / 2
+        rows.sort(key=lambda r: (-r["_reliability_score"], -r["total_seconds"], -r["incidents"]))
+        for r in rows:
+            del r["_reliability_score"]
+    return rows
+
+
+def _format_duration(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours}h {minutes % 60}m"
+    return f"{hours // 24}d {hours % 24}h"
+
+
+def _schedule_maintenance(system, target_type, target, hours, reason, set_by, start_at_ts, incident_number=None):
+    conn = _maintenance_log_db()
+    try:
+        conn.execute(
+            "INSERT INTO scheduled_maintenance (system, target_type, target, hours, reason, set_by, start_at, created_at, incident_number) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (system, target_type, target, hours, reason, set_by, start_at_ts, int(time.time()), incident_number),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _pending_scheduled_maintenance(system):
+    conn = _maintenance_log_db()
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM scheduled_maintenance WHERE fired_at IS NULL AND system = ? ORDER BY start_at ASC",
+            (system,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def _due_scheduled_maintenance(now_ts):
+    conn = _maintenance_log_db()
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM scheduled_maintenance WHERE fired_at IS NULL AND start_at <= ?", (now_ts,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def _mark_scheduled_fired(sched_id):
+    conn = _maintenance_log_db()
+    try:
+        conn.execute("UPDATE scheduled_maintenance SET fired_at = ? WHERE id = ?", (int(time.time()), sched_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _cancel_scheduled_maintenance(system, sched_id):
+    conn = _maintenance_log_db()
+    try:
+        conn.execute(
+            "DELETE FROM scheduled_maintenance WHERE id = ? AND system = ? AND fired_at IS NULL",
+            (sched_id, system),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+_SCHEDULED_MAINTENANCE_POLL_SECONDS = 60
+
+
+def _scheduled_maintenance_tick():
+    for sched in _due_scheduled_maintenance(int(time.time())):
+        cfg = SYSTEMS.get(sched["system"])
+        if not cfg:
+            _mark_scheduled_fired(sched["id"])
+            continue
+        try:
+            resp = requests.post(
+                f"{cfg['base_url']}/maintenance",
+                data={
+                    "target_type": sched["target_type"],
+                    "target": sched["target"],
+                    "hours": sched["hours"],
+                    "reason": sched["reason"] or "",
+                    "set_by": sched["set_by"],
+                },
+                headers={"Authorization": cfg["maintenance_auth"]},
+                timeout=REQUEST_TIMEOUT, allow_redirects=False,
+            )
+        except requests.RequestException:
+            continue
+        if "error=" not in resp.headers.get("Location", ""):
+            _log_maintenance_action(
+                sched["system"], "acknowledged", sched["target"], sched["target_type"],
+                sched["reason"], sched["set_by"], hours=sched["hours"],
+                incident_number=sched["incident_number"],
+            )
+        _mark_scheduled_fired(sched["id"])
+
+
+def _run_scheduled_maintenance():
+    while True:
+        try:
+            _scheduled_maintenance_tick()
+        except Exception:
+            pass
+        time.sleep(_SCHEDULED_MAINTENANCE_POLL_SECONDS)
+
+
+threading.Thread(target=_run_scheduled_maintenance, daemon=True).start()
+
 
 def _fetch_windows(system):
-    """Returns a normalized list of {key, target_type, target, reason,
-    set_by, remaining} regardless of which bridge it came from - ipro's
-    /maintenance-windows and ooma's /maintenance-log use different field
-    names for the same concepts (target_display vs target)."""
     cfg = SYSTEMS[system]
     try:
         resp = requests.get(f"{cfg['base_url']}{cfg['windows_route']}", timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         raw = resp.json()
     except requests.RequestException:
-        return None  # bridge unreachable - caller shows a notice, not an empty table
+        return None
     rows = []
     for w in raw:
         rows.append({
@@ -533,10 +3628,6 @@ def _fetch_windows(system):
 
 
 def _fetch_options(system):
-    """{'single': [{'id','name'}, ...], 'grouped': [name, ...]} for the
-    maintenance form's dropdowns, or None if the bridge can't be reached
-    (caller falls back to a plain text input in that case, same as
-    before - creating a window still works, just without autocomplete)."""
     cfg = SYSTEMS[system]
     try:
         resp = requests.get(f"{cfg['base_url']}/maintenance-options", timeout=REQUEST_TIMEOUT)
@@ -546,162 +3637,594 @@ def _fetch_options(system):
         return None
 
 
+def _search_downtime(term, username):
+    if "downtime" not in _user_systems(username):
+        return []
+    rows = _fetch_downtime_data()
+    if not rows:
+        return []
+    term = term.lower()
+    results = []
+    for r in rows:
+        hostname = r.get("strhostname") or ""
+        desc = r.get("strhostdesc") or ""
+        group = r.get("strgroupname") or ""
+        if term in hostname.lower() or term in desc.lower() or term in group.lower():
+            is_alert = _downtime_row_is_issue(r)
+            sublabel = f"{_esc(group)} &middot; {_esc(desc)}" if desc else _esc(group)
+            results.append({
+                "label": hostname, "sublabel": sublabel,
+                "href": f"/downtime?host={quote(hostname)}",
+                "tag": "Not reporting" if is_alert else "Downtime Workstations",
+                "alert": is_alert,
+            })
+    return results
+
+
+def _search_bridge_system(system, term, username):
+    if system not in _user_full_systems(username):
+        return []
+    cfg = SYSTEMS[system]
+    options = _fetch_options(system)
+    if not options:
+        return []
+    term = term.lower()
+    results = []
+    for o in options.get("single", []):
+        if term in (o.get("name") or "").lower():
+            results.append({
+                "label": o["name"], "sublabel": cfg["target_types"][0][1],
+                "href": f"/events-search?system={system}&device_id={quote(o['name'])}",
+                "tag": cfg["label"], "alert": False,
+            })
+    for g in options.get("grouped", []):
+        if term in g.lower():
+            results.append({
+                "label": g, "sublabel": cfg["target_types"][1][1],
+                "href": f"/events-search?system={system}&account={quote(g)}",
+                "tag": cfg["label"], "alert": False,
+            })
+    return results
+
+
+def _search_hyperview(term, username):
+    if "hyperview" not in _user_systems(username):
+        return []
+    try:
+        resp = _parallel_get(HYPERVIEW_BASE_URL, ["/location-health-matrix", "/clinic-health-matrix", "/active-alarm-log"])
+        sites = resp["/location-health-matrix"].json() + resp["/clinic-health-matrix"].json()
+        alarms = resp["/active-alarm-log"].json()
+    except (requests.RequestException, ValueError, KeyError, FuturesTimeoutError):
+        return []
+    term = term.lower()
+    seen_sites = set()
+    results = []
+    for s in sites:
+        name = _strip_emoji(s.get("locationDisplay") or s.get("location") or "")
+        if term in name.lower() and s.get("location") not in seen_sites:
+            seen_sites.add(s.get("location"))
+            results.append({
+                "label": name, "sublabel": "Site",
+                "href": "/hyperview", "tag": "Hyperview",
+                "alert": bool(s.get("site")),
+            })
+    for a in alarms:
+        device = a.get("device") or ""
+        if term in device.lower() or term in (a.get("location") or "").lower():
+            results.append({
+                "label": device, "sublabel": f"{_esc(a.get('location') or '')} &middot; {_esc(a.get('alarm') or '')}",
+                "href": "/hyperview", "tag": "Hyperview", "alert": True,
+            })
+    return results
+
+
+def _search_runbook(term, username):
+    is_admin = _is_admin(username)
+    if not is_admin and not _user_has_operations(username):
+        return []
+    entries = _hyperview_runbook_entries()
+    term = term.lower()
+    base_path = "/hyperview/runbook/manage" if is_admin else "/hyperview/runbook"
+    by_device = {}
+    for e in entries:
+        haystack = " ".join((
+            e.get("device_name") or "", e.get("alert_type") or "", e.get("location") or "",
+            e.get("infrastructure_type") or "", e.get("device_type") or "",
+            e.get("primary_name") or "", e.get("escalation_name") or "",
+        )).lower()
+        if term not in haystack:
+            continue
+        device = e.get("device_name") or ""
+        group = by_device.setdefault(device, {"entries": [], "location": e.get("location") or ""})
+        group["entries"].append(e)
+    results = []
+    for device, group in by_device.items():
+        alert_types = ", ".join(sorted({e["alert_type"] for e in group["entries"] if e.get("alert_type")}))
+        issues = is_admin and sum(1 for e in group["entries"] if _runbook_entry_issues(e))
+        results.append({
+            "label": device,
+            "sublabel": f"{_esc(group['location'])} &middot; {_esc(alert_types)}" if group["location"] else _esc(alert_types),
+            "href": _runbook_url(base_path, {}, q=device),
+            "tag": "Runbook", "alert": bool(issues),
+        })
+    results.sort(key=lambda r: r["label"].lower())
+    return results
+
+
+def _global_search(term, username):
+    term = term.strip()
+    if not term:
+        return {}
+    groups = {
+        "Hyperview": _search_hyperview(term, username),
+        "iPRO Cameras": _search_bridge_system("ipro", term, username),
+        "Ooma AirDial": _search_bridge_system("ooma", term, username),
+        "Downtime Workstations": _search_downtime(term, username),
+        "Runbook": _search_runbook(term, username),
+    }
+    return {label: results for label, results in groups.items() if results}
+
+
+@app.route("/search")
+@require_login
+def search_page(username):
+    term = request.args.get("q", "")
+    groups = _global_search(term, username) if term.strip() else {}
+
+    sections = []
+    for label, results in groups.items():
+        rows = "".join(
+            f"""<a class="search-result-row{' alert' if r['alert'] else ''}" href="{_esc(r['href'])}">
+              <div>
+                <div class="srr-label">{_esc(r['label'])}</div>
+                <div class="srr-sub">{r['sublabel']}</div>
+              </div>
+              <span class="srr-tag">{_esc(r['tag'])}</span>
+            </a>"""
+            for r in results
+        )
+        sections.append(f"""
+        <div class="search-results-group">
+          <h3>{_esc(label)} ({len(results)})</h3>
+          {rows}
+        </div>""")
+
+    if not term.strip():
+        content = '<p class="empty">Type a hostname, site, camera, or account name above and press Enter.</p>'
+    elif not groups:
+        content = f'<p class="empty">No matches for &ldquo;{_esc(term)}&rdquo;.</p>'
+    else:
+        content = "".join(sections)
+
+    body = f"""
+    <div class="page-header">
+      <div>
+        <h1>Search{f' &middot; &ldquo;{_esc(term)}&rdquo;' if term.strip() else ''}</h1>
+        <p class="sub">Across every system your account can see.</p>
+      </div>
+    </div>
+    <style>{DASHBOARD_BASE_CSS}</style>
+    <form method="get" action="/search" class="filters">
+      <div class="field" style="flex:1;">
+        <label for="search-q-input">Search</label>
+        <input type="text" id="search-q-input" name="q" value="{_esc(term)}" autofocus>
+      </div>
+      <button type="submit">Search</button>
+    </form>
+    {content}
+    """
+    return Response(render_shell("Search", body, "search", username), mimetype="text/html")
+
+
 def _proxy_redirect_query(resp, fallback_system):
-    """ipro/ooma's own POST /maintenance[/*/cancel] redirect to their own
-    (now-retired) GET /maintenance with ?message=.../?error=... - pull
-    that query string off and reattach it to THIS portal's /maintenance
-    instead of following the backend's redirect into its dead page."""
     location = resp.headers.get("Location", "")
     query = location.split("?", 1)[1] if "?" in location else ""
     qs = f"?{query}" if query else f"?error={quote('No response from bridge')}"
     sep = "&" if query else ""
-    return redirect(f"/maintenance{qs}{sep}system={fallback_system}" if query else f"/maintenance{qs}")
+    return redirect(f"/acknowledge{qs}{sep}system={fallback_system}" if query else f"/acknowledge{qs}")
 
 
-# --- maintenance page --------------------------------------------------
-
-@app.route("/maintenance", methods=["GET"])
-@require_login
-def maintenance_page(username):
-    systems = accessible_systems(username)
-    sections = []
-    for key, cfg in systems.items():
-        windows = _fetch_windows(key)
-        if windows is None:
-            table_html = f'<p class="empty">Could not reach {_esc(cfg["label"])} ({_esc(cfg["base_url"])}).</p>'
-        elif not windows:
-            table_html = '<p class="empty">Nothing currently acknowledged.</p>'
-        else:
-            rows_html = "".join(
-                f"<tr><td>{_esc(w['target'])} <span class=\"tag\">{_esc(w['target_type'])}</span></td>"
-                f"<td>{_esc(w['reason']) or '-'}</td><td>{_esc(w['set_by']) or '-'}</td>"
-                f"<td>{_esc(w['remaining'])}</td>"
-                f"<td><form method=\"post\" action=\"/maintenance/{key}/{quote(w['key'], safe='')}/cancel\" style=\"margin:0;\">"
-                f"<button type=\"submit\" class=\"cancel-btn\">Un-acknowledge</button></form></td></tr>"
-                for w in windows
-            )
-            table_html = (
-                '<div class="table-scroll"><table><tr><th>Target</th><th>Reason</th>'
-                f'<th>Acknowledged by</th><th>Expires in</th><th></th></tr>{rows_html}</table></div>'
-            )
-
-        # target_types[0] = single device/camera, [1] = grouped account/server -
-        # two <select> elements sharing name="target", only one enabled at a
-        # time (a disabled <select> doesn't get submitted with the form) so
-        # picking "Entire server" swaps which dropdown - and which option
-        # list - actually supplies the value.
-        single_type, single_label = cfg["target_types"][0]
-        grouped_type, grouped_label = cfg["target_types"][1]
-        options = _fetch_options(key)
-
-        radio_html = (
-            f'<label><input type="radio" name="target_type" value="{single_type}" checked '
-            f'onchange="toggleTarget(\'{key}\', true)"> {single_label}</label>'
-            f'<label><input type="radio" name="target_type" value="{grouped_type}" '
-            f'onchange="toggleTarget(\'{key}\', false)"> {grouped_label}</label>'
+def _ack_section_html(username, key, cfg):
+    windows = _fetch_windows(key)
+    if windows is None:
+        table_html = f'<p class="empty">Could not reach {_esc(cfg["label"])} ({_esc(cfg["base_url"])}).</p>'
+    elif not windows:
+        table_html = '<p class="empty">Nothing currently acknowledged.</p>'
+    else:
+        rows_html = "".join(
+            f"<tr><td>{_esc(w['target'])} <span class=\"tag\">{_esc(w['target_type'])}</span></td>"
+            f"<td>{_esc(w['reason']) or '-'}</td><td>{_esc(w['set_by']) or '-'}</td>"
+            f"<td>{_esc(w['remaining'])}</td>"
+            f"<td><form method=\"post\" action=\"/acknowledge/{key}/{quote(w['key'], safe='')}/cancel\" style=\"margin:0;\">"
+            f"<button type=\"submit\" class=\"cancel-btn\">Un-acknowledge</button></form></td></tr>"
+            for w in windows
+        )
+        table_html = (
+            '<div class="table-scroll"><table><tr><th>Target</th><th>Reason</th>'
+            f'<th>Acknowledged by</th><th>Expires in</th><th></th></tr>{rows_html}</table></div>'
         )
 
-        if options is None:
-            # bridge unreachable right now - fall back to plain free text
-            # rather than block window creation entirely
-            target_fields = (
-                f'<label>Target (name or id) - could not load suggestions, type it manually</label>'
-                f'<input type="text" name="target" required>'
-            )
-        else:
-            # <input list=...> + <datalist> - free typing with autocomplete
-            # suggestions, not a closed picklist: matches how the original
-            # per-bridge pages worked (both backends already resolve a
-            # target by name-or-id, so a typed name that isn't in the
-            # suggestion list still works - the datalist is a convenience,
-            # not a constraint).
-            single_opts = "".join(f'<option value="{_esc(o["name"])}">' for o in options.get("single", []))
-            grouped_opts = "".join(f'<option value="{_esc(g)}">' for g in options.get("grouped", []))
-            target_fields = f"""
-            <label>{_esc(single_label)}</label>
-            <input type="text" name="target" id="target-single-{key}" list="single-list-{key}" autocomplete="off">
-            <datalist id="single-list-{key}">{single_opts}</datalist>
-            <label>{_esc(grouped_label)}</label>
-            <input type="text" name="target" id="target-grouped-{key}" list="grouped-list-{key}" autocomplete="off" disabled style="display:none;">
-            <datalist id="grouped-list-{key}">{grouped_opts}</datalist>
-            """
+    single_type, single_label = cfg["target_types"][0]
+    grouped_type, grouped_label = cfg["target_types"][1]
+    options = _fetch_options(key)
 
-        sections.append(f"""
-        <h2 class="system-heading">{_esc(cfg['label'])}</h2>
+    radio_html = (
+        f'<label><input type="radio" name="target_type" value="{single_type}" checked '
+        f'onchange="toggleTarget(\'{key}\', true)"> {single_label}</label>'
+        f'<label><input type="radio" name="target_type" value="{grouped_type}" '
+        f'onchange="toggleTarget(\'{key}\', false)"> {grouped_label}</label>'
+    )
+
+    bulk_hint = '<p class="sub" style="margin:2px 0 8px;">Separate multiple names with commas to acknowledge several at once.</p>'
+    if options is None:
+        target_fields = (
+            f'<label>Target(s) (name or id) - could not load suggestions, type them manually</label>'
+            f'{bulk_hint}'
+            f'<input type="text" name="target" required>'
+        )
+    else:
+        single_opts = "".join(f'<option value="{_esc(o["name"])}">' for o in options.get("single", []))
+        grouped_opts = "".join(f'<option value="{_esc(g)}">' for g in options.get("grouped", []))
+        target_fields = f"""
+        <label>{_esc(single_label)}(s)</label>
+        {bulk_hint}
+        <input type="text" name="target" id="target-single-{key}" list="single-list-{key}" autocomplete="off">
+        <datalist id="single-list-{key}">{single_opts}</datalist>
+        <label>{_esc(grouped_label)}(s)</label>
+        <input type="text" name="target" id="target-grouped-{key}" list="grouped-list-{key}" autocomplete="off" disabled style="display:none;">
+        <datalist id="grouped-list-{key}">{grouped_opts}</datalist>
+        """
+
+    scheduled = _pending_scheduled_maintenance(key)
+    scheduled_html = ""
+    if scheduled:
+        scheduled_rows = "".join(
+            f"<tr><td>{_esc(s['target'])} <span class=\"tag\">{_esc(s['target_type'])}</span></td>"
+            f"<td>{_esc(s['reason']) or '-'}</td><td>{_esc(s['set_by'])}</td>"
+            f"<td>{datetime.fromtimestamp(s['start_at']).strftime('%b %d, %I:%M %p')}</td>"
+            f"<td><form method=\"post\" action=\"/acknowledge/{key}/scheduled/{s['id']}/cancel\" style=\"margin:0;\">"
+            f"<button type=\"submit\" class=\"cancel-btn\">Cancel</button></form></td></tr>"
+            for s in scheduled
+        )
+        scheduled_html = f"""
         <div class="card">
-          <h3>Currently acknowledged</h3>
-          {table_html}
-        </div>
-        <div class="card">
-          <h3>Acknowledge {_esc(cfg['label'])}</h3>
-          <form method="post" action="/maintenance">
-            <input type="hidden" name="system" value="{key}">
-            <div class="radio-row">{radio_html}</div>
-            {target_fields}
-            <label>Acknowledge for (hours)</label>
-            <input type="number" name="hours" min="1" max="168" value="24" required>
-            <label>Reason / action taken</label>
-            <textarea name="reason" required></textarea>
-            <label>Acknowledged by</label>
-            <input type="text" name="set_by" required>
-            <button type="submit">Acknowledge</button>
-          </form>
-        </div>
-        """)
+          <h3>Scheduled (not started yet)</h3>
+          <div class="table-scroll"><table><tr><th>Target</th><th>Reason</th>
+          <th>Scheduled by</th><th>Starts</th><th></th></tr>{scheduled_rows}</table></div>
+        </div>"""
+
+    return f"""
+    <h2 class="system-heading">{_esc(cfg['label'])}</h2>
+    <div class="card">
+      <h3>Currently acknowledged</h3>
+      {table_html}
+    </div>
+    {scheduled_html}
+    <div class="card">
+      <h3>Acknowledge {_esc(cfg['label'])}</h3>
+      <form method="post" action="/acknowledge">
+        <input type="hidden" name="system" value="{key}">
+        <div class="radio-row">{radio_html}</div>
+        {target_fields}
+        <label>Acknowledge for (hours)</label>
+        <input type="number" name="hours" min="1" max="168" value="24" required>
+        <label>Reason / action taken</label>
+        <textarea name="reason" required></textarea>
+        <label>Incident number (optional)</label>
+        <input type="text" name="incident_number">
+        <label>Start at (optional - leave blank to start immediately)</label>
+        <input type="datetime-local" name="start_at">
+        <p class="sub" style="margin:8px 0 0;">Acknowledged by <strong>{_esc(username)}</strong></p>
+        <button type="submit">Acknowledge</button>
+      </form>
+    </div>
+    """
+
+
+def _hyperview_ack_section_html(username):
+    alarms = _hyperview_active_alarms()
+    if alarms is None:
+        return f"""
+        <h2 class="system-heading">Hyperview</h2>
+        <div class="msg warn">Could not reach Hyperview ({_esc(HYPERVIEW_BASE_URL)}).</div>"""
+
+    acked = [a for a in alarms if a.get("acknowledged") and a.get("id")]
+    open_alarms = [a for a in alarms if not a.get("acknowledged") and a.get("id")]
+
+    if not acked:
+        acked_table_html = '<p class="empty">Nothing currently acknowledged.</p>'
+    else:
+        acked_rows = "".join(
+            f"<tr><td>{_esc(_strip_emoji(a.get('location') or ''))}</td>"
+            f"<td>{_esc(a.get('device') or '')}</td>"
+            f"<td>{_esc(a.get('alarm') or '')}</td>"
+            f"<td><form method=\"post\" action=\"/acknowledge/hyperview/{quote(a['id'], safe='')}/cancel\" style=\"margin:0;\">"
+            f"<input type=\"hidden\" name=\"device\" value=\"{_esc(a.get('device') or '')}\">"
+            f"<button type=\"submit\" class=\"cancel-btn\">Un-acknowledge</button></form></td></tr>"
+            for a in acked
+        )
+        acked_table_html = (
+            '<div class="table-scroll"><table><tr><th>Location</th><th>Device</th><th>Alarm</th><th></th></tr>'
+            f'{acked_rows}</table></div>'
+        )
+
+    if not open_alarms:
+        form_html = '<p class="empty">No open alarms to acknowledge right now.</p>'
+    else:
+        # id and device are both needed - the API acts on the alarm's id,
+        # but our own local log (Recent Activity, Leadership, MTTA) is
+        # keyed by device name, so both travel together in the option value.
+        options = "".join(
+            f'<option value="{_esc(a["id"])}::{_esc(a.get("device") or "")}">'
+            f'{_esc(_strip_emoji(a.get("location") or ""))} - {_esc(a.get("device") or "")} - {_esc(a.get("alarm") or "")}'
+            f'</option>'
+            for a in open_alarms
+        )
+        form_html = f"""
+        <form method="post" action="/acknowledge/hyperview/create">
+          <label>Alarm</label>
+          <select name="alarm_ref" required>
+            <option value="" disabled selected>Select an open alarm&hellip;</option>
+            {options}
+          </select>
+          <label>Reason / action taken (optional)</label>
+          <textarea name="reason"></textarea>
+          <p class="sub" style="margin:8px 0 0;">Acknowledged by <strong>{_esc(username)}</strong></p>
+          <button type="submit">Acknowledge</button>
+        </form>"""
+
+    return f"""
+    <h2 class="system-heading">Hyperview</h2>
+    <div class="card">
+      <h3>Currently acknowledged</h3>
+      {acked_table_html}
+    </div>
+    <div class="card">
+      <h3>Acknowledge an alarm</h3>
+      {form_html}
+    </div>
+    """
+
+
+def _downtime_ack_section_html(username):
+    acks = _pending_downtime_acks()
+    if not acks:
+        downtime_table_html = '<p class="empty">Nothing currently acknowledged.</p>'
+    else:
+        downtime_rows_html = "".join(
+            f"<tr><td>{_esc(s['target'])}</td>"
+            f"<td>{_esc(s['reason']) or '-'}</td><td>{_esc(s['incident_number']) or '-'}</td>"
+            f"<td>{_esc(s['set_by']) or '-'}</td>"
+            f"<td>{_esc(s['remaining'])}</td>"
+            f"<td><form method=\"post\" action=\"/acknowledge/downtime/{quote(s['key'], safe='')}/cancel\" style=\"margin:0;\">"
+            f"<button type=\"submit\" class=\"cancel-btn\">Un-acknowledge</button></form></td></tr>"
+            for s in acks
+        )
+        downtime_table_html = (
+            '<div class="table-scroll"><table><tr><th>Workstation</th><th>Reason</th><th>Incident #</th>'
+            f'<th>Acknowledged by</th><th>Expires in</th><th></th></tr>{downtime_rows_html}</table></div>'
+        )
+
+    downtime_rows = _fetch_downtime_data()
+    host_names = sorted({r.get("strhostname") for r in (downtime_rows or []) if r.get("strhostname")})
+    host_opts = "".join(f'<option value="{_esc(h)}">{_esc(h)}</option>' for h in host_names)
+
+    default_hours = _downtime_default_ack_hours()
+    return f"""
+    <h2 class="system-heading">Downtime Workstations</h2>
+    <div class="card">
+      <h3>Currently acknowledged</h3>
+      {downtime_table_html}
+    </div>
+    <div class="card">
+      <h3>Acknowledge a workstation</h3>
+      <form method="post" action="/acknowledge/downtime/create">
+        <label>Workstation (hostname)</label>
+        <p class="sub" style="margin:2px 0 8px;">Acknowledging only affects alert nagging/flashing - it doesn't stop reporting or restart anything.</p>
+        <select name="hostname" required>
+          <option value="" disabled selected>Select a workstation&hellip;</option>
+          {host_opts}
+        </select>
+        <label>Incident number (required)</label>
+        <input type="text" name="incident_number" required>
+        <label>Reason (optional)</label>
+        <textarea name="reason"></textarea>
+        <p class="sub" style="margin:2px 0 8px;">Acknowledgment length is set automatically by the on-call schedule, not chosen here:
+        Monday 7 AM&ndash;Thursday 5 PM defaults to 24 hours; Thursday 5:01 PM through Monday 6:59 AM defaults to the
+        upcoming Monday at noon. Right now that would be about <strong>{default_hours}h</strong>.</p>
+        <p class="sub" style="margin:8px 0 0;">Acknowledged by <strong>{_esc(username)}</strong></p>
+        <button type="submit">Acknowledge</button>
+      </form>
+    </div>
+    """
+
+
+@app.route("/acknowledge", methods=["GET"])
+@require_login
+def acknowledge_page(username):
+    systems = accessible_full_systems(username)
+    sections = [_ack_section_html(username, key, cfg) for key, cfg in systems.items()]
+    if "hyperview" in _user_full_systems(username):
+        sections.append(_hyperview_ack_section_html(username))
+    if "downtime" in _user_full_systems(username):
+        sections.append(_downtime_ack_section_html(username))
 
     body = f"""
-    <h1>Acknowledge issues</h1>
-    <p class="sub">{_esc(', '.join(cfg['label'] for cfg in systems.values()))}.</p>
+    <div class="page-header">
+      <div>
+        <h1>Acknowledge issues</h1>
+        <p class="sub">Acknowledge open issues across the systems you have access to.</p>
+      </div>
+    </div>
     {_msg_html()}
     {''.join(sections)}
-    <script>
-    function toggleTarget(system, singleChosen) {{
-      const single = document.getElementById('target-single-' + system);
-      const grouped = document.getElementById('target-grouped-' + system);
-      if (!single || !grouped) return;  // options failed to load - plain text input instead, nothing to toggle
-      single.disabled = !singleChosen;
-      single.style.display = singleChosen ? '' : 'none';
-      grouped.disabled = singleChosen;
-      grouped.style.display = singleChosen ? 'none' : '';
-    }}
-    </script>
     """
-    return Response(render_shell("Maintenance", body, "maintenance", username), mimetype="text/html")
+    return Response(render_shell("Acknowledge", body, "acknowledge", username), mimetype="text/html")
 
 
-@app.route("/maintenance", methods=["POST"])
+@app.route("/acknowledge/panel/<system>", methods=["GET"])
 @require_login
-def maintenance_create(username):
+def acknowledge_panel(username, system):
+    if system == "hyperview":
+        if "hyperview" not in _user_full_systems(username):
+            return Response("Your account does not have Full Control access to 'hyperview'", 403)
+        section_html = _hyperview_ack_section_html(username)
+    elif system == "downtime":
+        if "downtime" not in _user_full_systems(username):
+            return Response("Your account does not have Full Control access to 'downtime'", 403)
+        section_html = _downtime_ack_section_html(username)
+    else:
+        denied = _forbidden_or_unknown_full(username, system)
+        if denied:
+            return denied
+        section_html = _ack_section_html(username, system, SYSTEMS[system])
+    body = f"""
+    {_msg_html()}
+    {section_html}
+    """
+    return Response(body, mimetype="text/html")
+
+
+@app.route("/acknowledge", methods=["POST"])
+@require_login
+def acknowledge_create(username):
     system = request.form.get("system", "")
-    denied = _forbidden_or_unknown(username, system)
+    denied = _forbidden_or_unknown_full(username, system)
     if denied:
         return denied
     cfg = SYSTEMS[system]
-    try:
-        resp = requests.post(
-            f"{cfg['base_url']}/maintenance",
-            data={
-                "target_type": request.form.get("target_type", ""),
-                "target": request.form.get("target", ""),
-                "hours": request.form.get("hours", ""),
-                "reason": request.form.get("reason", ""),
-                "set_by": request.form.get("set_by", ""),
-            },
-            headers={"Authorization": cfg["maintenance_auth"]},
-            timeout=REQUEST_TIMEOUT, allow_redirects=False,
-        )
-    except requests.RequestException:
-        return redirect(f"/maintenance?error={quote('Could not reach ' + cfg['label'])}")
-    return _proxy_redirect_query(resp, system)
+    target_type = request.form.get("target_type", "")
+    target = request.form.get("target", "")
+    hours = request.form.get("hours", "")
+    reason = request.form.get("reason", "")
+    incident_number = request.form.get("incident_number", "").strip() or None
+    hours_int = int(hours) if hours.isdigit() else None
+
+    targets = list(dict.fromkeys(t.strip() for t in target.split(",") if t.strip()))
+    if not targets:
+        return _redirect_msg("/acknowledge", error='No target specified', system=system)
+
+    start_at_raw = request.form.get("start_at", "").strip()
+    start_at_ts = _parse_local_datetime(start_at_raw) if start_at_raw else None
+    if start_at_ts and start_at_ts > time.time() + 30:
+        for t in targets:
+            _schedule_maintenance(system, target_type, t, hours_int or 24, reason, username, start_at_ts,
+                                   incident_number=incident_number)
+        when_txt = datetime.fromtimestamp(start_at_ts).strftime("%b %d, %I:%M %p")
+        if len(targets) == 1:
+            msg = f"Scheduled for {when_txt}"
+        else:
+            msg = f"Scheduled {len(targets)} targets for {when_txt}"
+        return _redirect_msg("/acknowledge", message=msg, system=system)
+
+    if len(targets) == 1:
+        try:
+            resp = requests.post(
+                f"{cfg['base_url']}/maintenance",
+                data={
+                    "target_type": target_type,
+                    "target": targets[0],
+                    "hours": hours,
+                    "reason": reason,
+                    "set_by": username,
+                },
+                headers={"Authorization": cfg["maintenance_auth"]},
+                timeout=REQUEST_TIMEOUT, allow_redirects=False,
+            )
+        except requests.RequestException:
+            return _redirect_msg("/acknowledge", error='Could not reach ' + cfg['label'])
+        if "error=" not in resp.headers.get("Location", ""):
+            try:
+                _log_maintenance_action(system, "acknowledged", targets[0], target_type, reason, username,
+                                         hours=hours_int, incident_number=incident_number)
+            except Exception:
+                pass
+        return _proxy_redirect_query(resp, system)
+
+    succeeded, failed = [], []
+    for t in targets:
+        try:
+            resp = requests.post(
+                f"{cfg['base_url']}/maintenance",
+                data={"target_type": target_type, "target": t, "hours": hours, "reason": reason, "set_by": username},
+                headers={"Authorization": cfg["maintenance_auth"]},
+                timeout=REQUEST_TIMEOUT, allow_redirects=False,
+            )
+        except requests.RequestException:
+            failed.append(t)
+            continue
+        if "error=" in resp.headers.get("Location", ""):
+            failed.append(t)
+            continue
+        succeeded.append(t)
+        try:
+            _log_maintenance_action(system, "acknowledged", t, target_type, reason, username,
+                                     hours=hours_int, incident_number=incident_number)
+        except Exception:
+            pass
+
+    if failed:
+        msg = f"Acknowledged {len(succeeded)} of {len(targets)}. Failed: {', '.join(failed)}"
+        return _redirect_msg("/acknowledge", error=msg, system=system)
+    return _redirect_msg("/acknowledge", message='Acknowledged ' + str(len(succeeded)) + ' targets', system=system)
 
 
-@app.route("/maintenance/<system>/<path:key>/cancel", methods=["POST"])
+@app.route("/acknowledge/hyperview/create", methods=["POST"])
 @require_login
-def maintenance_cancel(username, system, key):
-    denied = _forbidden_or_unknown(username, system)
+def acknowledge_hyperview_create(username):
+    if "hyperview" not in _user_full_systems(username):
+        return Response("Your account does not have Full Control access to 'hyperview'", 403)
+    alarm_ref = request.form.get("alarm_ref", "")
+    reason = request.form.get("reason", "").strip() or None
+    if "::" not in alarm_ref:
+        return _redirect_msg("/acknowledge", error="No alarm selected", system="hyperview")
+    alarm_event_id, device = alarm_ref.split("::", 1)
+    if not alarm_event_id:
+        return _redirect_msg("/acknowledge", error="No alarm selected", system="hyperview")
+    try:
+        _hyperview_set_ack_state(alarm_event_id, True)
+    except requests.RequestException:
+        return _redirect_msg("/acknowledge", error="Could not reach Hyperview", system="hyperview")
+    # Mark it acked in our own tracking immediately so the next
+    # _hyperview_status_tick poll sees it as already-known and doesn't log a
+    # second, redundant 'acknowledged' row crediting the automated monitor.
+    with _hyperview_acked_devices_lock:
+        _hyperview_acked_devices.add(device)
+    try:
+        _log_maintenance_action("hyperview", "acknowledged", device, "device", reason, username)
+    except Exception:
+        pass
+    return _redirect_msg("/acknowledge", message=f"Acknowledged {device}", system="hyperview")
+
+
+@app.route("/acknowledge/hyperview/<alarm_event_id>/cancel", methods=["POST"])
+@require_login
+def acknowledge_hyperview_cancel(username, alarm_event_id):
+    if "hyperview" not in _user_full_systems(username):
+        return Response("Your account does not have Full Control access to 'hyperview'", 403)
+    device = request.form.get("device", "")
+    try:
+        _hyperview_set_ack_state(alarm_event_id, False)
+    except requests.RequestException:
+        return _redirect_msg("/acknowledge", error="Could not reach Hyperview", system="hyperview")
+    if device:
+        with _hyperview_acked_devices_lock:
+            _hyperview_acked_devices.discard(device)
+        try:
+            _log_maintenance_action("hyperview", "un-acknowledged", device, "device", None, username)
+        except Exception:
+            pass
+    return _redirect_msg("/acknowledge", message=f"Un-acknowledged {device or alarm_event_id}", system="hyperview")
+
+
+@app.route("/acknowledge/<system>/<path:key>/cancel", methods=["POST"])
+@require_login
+def acknowledge_cancel(username, system, key):
+    denied = _forbidden_or_unknown_full(username, system)
     if denied:
         return denied
     cfg = SYSTEMS[system]
+    matched = next((w for w in (_fetch_windows(system) or []) if w["key"] == key), None)
     try:
         resp = requests.post(
             f"{cfg['base_url']}/maintenance/{quote(key, safe='')}/cancel",
@@ -709,11 +4232,66 @@ def maintenance_cancel(username, system, key):
             timeout=REQUEST_TIMEOUT, allow_redirects=False,
         )
     except requests.RequestException:
-        return redirect(f"/maintenance?error={quote('Could not reach ' + cfg['label'])}")
+        return _redirect_msg("/acknowledge", error='Could not reach ' + cfg['label'])
+    if "error=" not in resp.headers.get("Location", ""):
+        try:
+            if matched:
+                _log_maintenance_action(system, "un-acknowledged", matched["target"], matched["target_type"], None, username)
+            else:
+                _log_maintenance_action(system, "un-acknowledged", key, None, None, username)
+        except Exception:
+            pass
     return _proxy_redirect_query(resp, system)
 
 
-# --- event search page ---------------------------------------------------
+@app.route("/acknowledge/<system>/scheduled/<int:sched_id>/cancel", methods=["POST"])
+@require_login
+def acknowledge_scheduled_cancel(username, system, sched_id):
+    denied = _forbidden_or_unknown_full(username, system)
+    if denied:
+        return denied
+    _cancel_scheduled_maintenance(system, sched_id)
+    return _redirect_msg("/acknowledge", message='Scheduled acknowledgment cancelled', system=system)
+
+
+@app.route("/acknowledge/downtime/create", methods=["POST"])
+@require_login
+def acknowledge_downtime_create(username):
+    if "downtime" not in _user_full_systems(username):
+        return Response("Your account does not have Full Control access to 'downtime'", 403)
+    hostname = request.form.get("hostname", "").strip()
+    reason = request.form.get("reason", "")
+    incident_number = request.form.get("incident_number", "").strip()
+    if not hostname:
+        return _redirect_msg("/acknowledge", error='Workstation is required', system='downtime')
+    if not incident_number:
+        return _redirect_msg("/acknowledge", error='Incident number is required to acknowledge a workstation', system='downtime')
+    known_rows = _fetch_downtime_data()
+    known_hosts = {r.get("strhostname") for r in (known_rows or [])}
+    if hostname not in known_hosts:
+        return _redirect_msg("/acknowledge", error='Unknown workstation: ' + hostname, system='downtime')
+    hours = _downtime_acknowledge(hostname, reason, username, incident_number)
+    return _redirect_msg("/acknowledge", message=f'Acknowledged {hostname} for {hours}h', system='downtime')
+
+
+@app.route("/acknowledge/downtime/<hostname>/cancel", methods=["POST"])
+@require_login
+def acknowledge_downtime_cancel(username, hostname):
+    if "downtime" not in _user_full_systems(username):
+        return Response("Your account does not have Full Control access to 'downtime'", 403)
+    _downtime_unacknowledge(hostname, username)
+    return _redirect_msg("/acknowledge", message='Un-acknowledged ' + hostname, system='downtime')
+
+
+@app.route("/maintenance")
+def acknowledge_legacy_redirect():
+    return _redirect_preserving_query("/acknowledge")
+
+
+@app.route("/triage")
+def acknowledge_triage_redirect():
+    return _redirect_preserving_query("/acknowledge")
+
 
 EVENTS_SCRIPT = """
 <script>
@@ -723,6 +4301,7 @@ const DEVICE_ID_BY_NAME = %(device_id_by_name_json)s;
 function severityClass(sev) {
   if (sev === 'Critical') return 'sev-critical';
   if (sev === 'Degraded') return 'sev-degraded';
+  if (sev === 'Maintenance') return 'sev-maintenance';
   return '';
 }
 function escapeHtml(s) {
@@ -750,7 +4329,9 @@ function renderRows(rows) {
     }
     tr.innerHTML = '<td class="time">' + when + '</td>'
       + '<td>' + escapeHtml(r.system) + '</td>'
-      + '<td>' + escapeHtml(r.device) + '<span class="was">' + escapeHtml(r.account) + '</span></td>'
+      + '<td><span class="tag" style="background:' + r.event_color + '22; color:' + r.event_color + ';">' + escapeHtml(r.event_label) + '</span></td>'
+      + '<td>' + escapeHtml(r.device) + '</td>'
+      + '<td>' + escapeHtml(r.account) + '</td>'
       + '<td><span class="tag">' + escapeHtml(r.device_type || r.group_name) + '</span></td>'
       + '<td class="change">' + changeHtml + '</td>';
     body.appendChild(tr);
@@ -760,10 +4341,6 @@ function currentParams() {
   const params = new URLSearchParams();
   const system = document.getElementById('system-select').value;
   const deviceTyped = document.getElementById('device-id-input').value;
-  // The field shows/holds the friendly name (so a selected suggestion
-  // displays correctly instead of collapsing to a raw id) - resolve it
-  // to the id /events actually filters on; if it's not a known name
-  // (typed free-hand, or already an id), send it through as-is.
   const deviceId = DEVICE_ID_BY_NAME[deviceTyped] || deviceTyped;
   const account = document.getElementById('account-input').value;
   const since = document.getElementById('since-input').value;
@@ -819,25 +4396,28 @@ runSearch();
 @app.route("/events-search", methods=["GET"])
 @require_login
 def events_search_page(username):
-    systems = accessible_systems(username)
+    systems = accessible_full_systems(username)
+    has_downtime = "downtime" in _user_full_systems(username)
+    has_hyperview = "hyperview" in _user_full_systems(username)
+    system_labels = {key: cfg["label"] for key, cfg in systems.items()}
+    if has_hyperview:
+        system_labels["hyperview"] = "Hyperview"
+    if has_downtime:
+        system_labels["downtime"] = "Downtime Workstations"
+    if not system_labels:
+        return _error_page(username, "Your account does not have Full Control access to any system's Event Search.")
     system_options = "".join(
-        f'<option value="{key}">{_esc(cfg["label"])}</option>' for key, cfg in systems.items()
+        f'<option value="{key}">{_esc(label)}</option>' for key, label in system_labels.items()
     )
-    # single-system accounts get a locked selector - nothing to pick between
     system_select_html = (
         f'<select id="system-select" onchange="runSearch()">'
-        f'<option value="">All ({_esc(", ".join(systems))})</option>{system_options}</select>'
-        if len(systems) > 1 else
-        f'<select id="system-select" disabled><option value="{next(iter(systems))}" selected>'
-        f'{_esc(next(iter(systems.values()))["label"])}</option></select>'
-        f'<input type="hidden" id="system-select-value" value="{next(iter(systems))}">'
+        f'<option value="">All ({_esc(", ".join(system_labels))})</option>{system_options}</select>'
+        if len(system_labels) > 1 else
+        f'<select id="system-select" disabled><option value="{next(iter(system_labels))}" selected>'
+        f'{_esc(next(iter(system_labels.values())))}</option></select>'
+        f'<input type="hidden" id="system-select-value" value="{next(iter(system_labels))}">'
     )
 
-    # Device/account pickers - merged across every system this login can
-    # see, rather than re-fetched client-side when the System filter
-    # changes. Simpler, and a device_id/account value that doesn't apply
-    # to whichever system is actually queried just matches nothing - no
-    # different from picking a stale value out of any dropdown.
     seen_devices, device_opts = set(), []
     seen_accounts, account_opts = set(), []
     for sys_key in systems:
@@ -853,22 +4433,31 @@ def events_search_page(username):
             if a not in seen_accounts:
                 seen_accounts.add(a)
                 account_opts.append(a)
+    if has_hyperview:
+        opts = _hyperview_search_options()
+        if opts:
+            for d in opts.get("single", []):
+                dedupe_key = (d["id"], d["name"])
+                if dedupe_key not in seen_devices:
+                    seen_devices.add(dedupe_key)
+                    device_opts.append(d)
+            for a in opts.get("grouped", []):
+                if a not in seen_accounts:
+                    seen_accounts.add(a)
+                    account_opts.append(a)
+    if has_downtime:
+        downtime_rows = _fetch_downtime_data()
+        for r in downtime_rows or []:
+            hostname = r.get("strhostname")
+            if not hostname:
+                continue
+            dedupe_key = (hostname, hostname)
+            if dedupe_key not in seen_devices:
+                seen_devices.add(dedupe_key)
+                device_opts.append({"id": hostname, "name": hostname})
     device_opts.sort(key=lambda d: d["name"].lower())
     account_opts.sort(key=str.lower)
 
-    # <input list=...> + <datalist> - free typing with autocomplete
-    # suggestions, not a closed picklist. The datalist's value is the
-    # NAME, not the id - a datalist option's value is what actually gets
-    # inserted into the field when you click a suggestion, so if that
-    # differed from what's shown as the label (the id, invisible-ish vs
-    # the friendly name you clicked), selecting a suggestion left the
-    # field showing a raw id instead of the name you picked - looked
-    # broken, and made the dropdown feel like it never really
-    # "selected" anything. Device search still needs an id (that's what
-    # /events' device_id filter expects) - DEVICE_ID_BY_NAME below
-    # resolves the typed name back to its id client-side at search time,
-    # so what you see in the field is always the friendly name, and what
-    # gets sent to the API is still the id it actually needs.
     device_id_by_name = {}
     for d in device_opts:
         device_id_by_name.setdefault(d["name"], d["id"])
@@ -884,16 +4473,19 @@ def events_search_page(username):
     )
 
     body = f"""
-    <h1>Device event history</h1>
-    <p class="sub">Every time a device's status changed, across
-    {_esc(', '.join(cfg['label'] for cfg in systems.values()))}.</p>
+    <div class="page-header">
+      <div>
+        <h1>Device event history</h1>
+        <p class="sub">Search and export status-change events for a single system.</p>
+      </div>
+    </div>
 
     <div class="card">
       <h3>Search</h3>
       <div class="filters">
         <div class="field"><label>System</label>{system_select_html}</div>
         <div class="field wide"><label>Device / camera</label>{device_select_html}</div>
-        <div class="field wide"><label>Account / location</label>{account_select_html}</div>
+        <div class="field wide"><label>Location</label>{account_select_html}</div>
         <div class="field"><label>Since</label><input type="datetime-local" id="since-input"></div>
         <div class="field"><label>Until</label><input type="datetime-local" id="until-input"></div>
         <div class="field"><label>Limit</label><input type="number" id="limit-input" min="1" max="2000" value="200"></div>
@@ -906,25 +4498,67 @@ def events_search_page(username):
       <div id="status-line" class="sub"></div>
       <div class="table-scroll">
         <table>
-          <thead><tr><th>Time</th><th>System</th><th>Device</th><th>Group</th><th>Change</th></tr></thead>
+          <thead><tr><th>Time</th><th>System</th><th>Event</th><th>Device</th><th>Location</th><th>Type</th><th>Change</th></tr></thead>
           <tbody id="results-body"></tbody>
         </table>
         <div id="empty-msg" class="empty" style="display:none;">No matching events.</div>
       </div>
     </div>
     {EVENTS_SCRIPT % {
-        'systems_json': _json_for_script(list(systems.keys())),
+        'systems_json': _json_for_script(list(system_labels.keys())),
         'device_id_by_name_json': _json_for_script(device_id_by_name),
     }}
     """
     return Response(render_shell("Event search", body, "events", username), mimetype="text/html")
 
 
+def _events_system_denied(username, system):
+    if system in ("downtime", "hyperview"):
+        if system not in _user_full_systems(username):
+            return Response(f"Your account does not have Full Control access to '{system}'", 403)
+        return None
+    return _forbidden_or_unknown_full(username, system)
+
+
+def _fetch_merged_downtime_events():
+    since_ts = _parse_local_datetime(request.args.get("since"))
+    until_ts = _parse_local_datetime(request.args.get("until"))
+    device_filter = (request.args.get("device_id") or "").strip().lower()
+
+    action_events = []
+    for r in _query_maintenance_actions("downtime", since_ts, until_ts):
+        # Auto-detected alarm/resolved rows are already covered by
+        # _downtime_status_events_for below - rendering them here too
+        # mislabels them as "Restart triggered by system-monitor".
+        if r["action"] not in ("acknowledged", "un-acknowledged", "restarted"):
+            continue
+        target = r["target"] or ""
+        if device_filter and device_filter not in target.lower():
+            continue
+        incident_txt = f" [Incident #{r['incident_number']}]" if r["incident_number"] else ""
+        if r["action"] == "acknowledged":
+            hours_txt = f" ({r['hours']}h)" if r["hours"] else ""
+            new_message = f"Acknowledged{hours_txt} by {r['set_by']}: {r['reason']}" if r["reason"] else f"Acknowledged{hours_txt} by {r['set_by']}"
+            new_message += incident_txt
+        elif r["action"] == "un-acknowledged":
+            new_message = f"Un-acknowledged by {r['set_by']}{incident_txt}"
+        else:
+            new_message = f"Restart triggered by {r['set_by']}"
+        action_events.append({
+            "changed_at": r["ts"], "device": target, "account": "",
+            "device_type": "workstation", "group_name": "workstation",
+            "old_message": None, "new_message": new_message, "new_severity": "Maintenance",
+        })
+
+    combined = action_events + _downtime_status_events_for(since_ts, until_ts, device_filter)
+    combined.sort(key=lambda r: r.get("changed_at") or 0, reverse=True)
+    limit = request.args.get("limit", type=int)
+    if limit:
+        combined = combined[:limit]
+    return combined, None
+
+
 def _events_params_for_backend(system, cfg):
-    """The portal's UI always sends the filter as 'device_id', but each
-    backend's own /events route names that query param differently
-    (ipro's is device_id, ooma's is myx_id) - translate here so the
-    filter actually reaches the field the backend binds to."""
     params = {k: v for k, v in request.args.items() if k != "system"}
     backend_param = cfg.get("device_id_param", "device_id")
     if backend_param != "device_id" and "device_id" in params:
@@ -932,69 +4566,182 @@ def _events_params_for_backend(system, cfg):
     return params
 
 
-@app.route("/events")
-@require_login
-def events_api(username):
-    system = request.args.get("system", "")
-    denied = _forbidden_or_unknown(username, system)
-    if denied:
-        return denied
-    cfg = SYSTEMS[system]
+def _fetch_merged_events(system, cfg):
     params = _events_params_for_backend(system, cfg)
     try:
         resp = requests.get(f"{cfg['base_url']}/events", params=params, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
+        rows = resp.json()
     except requests.RequestException as e:
-        return Response(f"Could not reach {cfg['label']}: {e}", 502)
-    return Response(resp.content, resp.status_code, content_type="application/json")
+        return None, f"Could not reach {cfg['label']}: {e}"
+    except ValueError:
+        return None, f"Unexpected response from {cfg['label']}"
+
+    combined = rows + _maintenance_events_for(system, cfg)
+    combined.sort(key=lambda r: r.get("changed_at") or 0, reverse=True)
+    limit = request.args.get("limit", type=int)
+    if limit:
+        combined = combined[:limit]
+    return combined, None
+
+
+_EVENT_SEVERITY_CLASS = {"Critical": "sev-critical", "Degraded": "sev-degraded", "Maintenance": "sev-maintenance"}
+
+
+def _classify_merged_event(r):
+    """Maps an event-search row onto Recent Activity's action vocabulary so
+    the same event reads identically in both places."""
+    new_message = r.get("new_message")
+    old_message = r.get("old_message")
+    if new_message and new_message.startswith("Acknowledged"):
+        action = "acknowledged"
+    elif new_message and new_message.startswith("Un-acknowledged"):
+        action = "un-acknowledged"
+    elif new_message and new_message.startswith("Restart triggered"):
+        action = "restarted"
+    elif new_message is None:
+        action = "resolved"
+    elif old_message is None:
+        action = "alarm"
+    else:
+        action = "changed"
+    return DEVICE_HISTORY_ACTION_META.get(action, (action, "var(--text-dim)"))
+
+
+def _annotate_event_kind(rows):
+    for r in rows:
+        label, color = _classify_merged_event(r)
+        r["event_label"] = label
+        r["event_color"] = color
+    return rows
+
+
+def _merged_event_row_html(r):
+    ts = r.get("changed_at")
+    when = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %I:%M %p") if ts else ""
+    old_message = r.get("old_message")
+    new_message = r.get("new_message")
+    new_severity = r.get("new_severity")
+    sev_class = _EVENT_SEVERITY_CLASS.get(new_severity, "")
+    if new_message is None:
+        change_html = f'<span class="sev-recovered">Recovered</span><span class="was">was: {_esc(old_message)}</span>'
+    elif old_message is None:
+        change_html = f'<span class="{sev_class}">{_esc(new_severity)}: {_esc(new_message)}</span>'
+    else:
+        change_html = (
+            f'<span class="{sev_class}">{_esc(new_severity)}: {_esc(new_message)}</span>'
+            f'<span class="was">was: {_esc(old_message)}</span>'
+        )
+    device_type = r.get("device_type") or r.get("group_name") or ""
+    event_label, event_color = _classify_merged_event(r)
+    return (
+        f'<tr><td class="time">{_esc(when)}</td>'
+        f'<td><span class="tag" style="background:{event_color}22; color:{event_color};">{_esc(event_label)}</span></td>'
+        f'<td>{_esc(r.get("device") or "")}<span class="was">{_esc(r.get("account") or "")}</span></td>'
+        f'<td><span class="tag">{_esc(device_type)}</span></td>'
+        f'<td class="change">{change_html}</td></tr>'
+    )
+
+
+def _merged_event_rows_html(rows):
+    return "".join(_merged_event_row_html(r) for r in rows) or (
+        '<tr><td colspan="5" class="empty">No events in range.</td></tr>'
+    )
+
+
+@app.route("/events")
+@require_login
+def events_api(username):
+    system = request.args.get("system", "")
+    denied = _events_system_denied(username, system)
+    if denied:
+        return denied
+    if system == "downtime":
+        combined, error = _fetch_merged_downtime_events()
+    elif system == "hyperview":
+        combined, error = _fetch_merged_hyperview_events()
+    else:
+        combined, error = _fetch_merged_events(system, SYSTEMS[system])
+    if error:
+        return Response(error, 502)
+    return Response(json.dumps(_annotate_event_kind(combined)), 200, content_type="application/json")
 
 
 @app.route("/events.csv")
 @require_login
 def events_csv(username):
     system = request.args.get("system", "")
-    denied = _forbidden_or_unknown(username, system)
+    denied = _events_system_denied(username, system)
     if denied:
         return denied
-    cfg = SYSTEMS[system]
-    params = _events_params_for_backend(system, cfg)
-    try:
-        resp = requests.get(f"{cfg['base_url']}/events.csv", params=params, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        return Response(f"Could not reach {cfg['label']}: {e}", 502)
+    if system == "downtime":
+        combined, error = _fetch_merged_downtime_events()
+        system_label = "Downtime Workstations"
+    elif system == "hyperview":
+        combined, error = _fetch_merged_hyperview_events()
+        system_label = "Hyperview"
+    else:
+        combined, error = _fetch_merged_events(system, SYSTEMS[system])
+        system_label = SYSTEMS[system]["label"]
+    if error:
+        return Response(error, 502)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Time", "System", "Event", "Device", "Location", "Type", "Old Status", "New Status", "Severity"])
+    for r in _annotate_event_kind(combined):
+        ts = r.get("changed_at")
+        when = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts else ""
+        writer.writerow([
+            when, system_label, r.get("event_label") or "", r.get("device") or "", r.get("account") or "",
+            r.get("device_type") or r.get("group_name") or "",
+            r.get("old_message") or "", r.get("new_message") or "", r.get("new_severity") or "",
+        ])
+    filename = f"{system}-events-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
     return Response(
-        resp.content, mimetype="text/csv",
-        headers={"Content-Disposition": resp.headers.get("Content-Disposition", "attachment")},
+        buf.getvalue(), mimetype="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
-# --- shared dashboard components (Hyperview / iPRO / Ooma) ---------------
-# Component CSS (matrix/gauge/tiles/alarm log) shared by /hyperview,
-# /ipro and /ooma - built on top of whichever :root token set the
-# including page already defines (PAGE_SHELL's brand tokens for the
-# logged-in pages, HYPERVIEW_KIOSK_SHELL's dark tokens for the kiosk), so
-# it's written entirely in var(--...) with no colors of its own.
 HYPERVIEW_COMPONENT_CSS = """
   .redundancy-alert { display: flex; align-items: center; gap: 10px; background: var(--danger-tint);
-    border: 1px solid var(--danger); color: var(--danger-dark); border-radius: 8px; padding: 12px 18px;
-    font-size: 14px; margin-bottom: 18px; }
-  .board { display: grid; grid-template-columns: 1fr 300px 1fr; gap: 18px; align-items: start; margin-bottom: 18px; }
-  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.04); overflow: hidden; margin-bottom: 18px; }
-  .panel-head { padding: 14px 18px 11px; border-bottom: 1px solid var(--border); display: flex;
+    border: 1px solid var(--danger); color: var(--danger-dark); border-radius: 8px; padding: 9px 18px;
+    font-size: 14px; margin-bottom: 12px; }
+  .board { display: grid; grid-template-columns: 1fr minmax(280px, 380px) 1fr; gap: 14px; align-items: start; margin-bottom: 14px; }
+
+  /* iPRO/Ooma/Hyperview's own dashboards: the whole board plus its
+     trailing alarm/device-detail panel is sized to the viewport instead
+     of the page itself growing - the matrix/summary panels above keep
+     their natural height, and only the trailing panel scrolls internally
+     to fill whatever room is left. Falls back to normal page flow on
+     short or narrow viewports where this can't work. */
+  .board-viewport-wrap { display: flex; flex-direction: column; height: calc(100vh - 380px); min-height: 460px; }
+  .board-viewport-wrap > .board { flex: 0 0 auto; }
+  .board-viewport-wrap > .board-fill-panel { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; margin-bottom: 0; }
+  .board-fill-panel .matrix-wrap { flex: 1 1 auto; overflow-y: auto; min-height: 0; }
+  .board-fill-panel .matrix-wrap table thead th { position: sticky; top: 0; z-index: 1; }
+  @media (max-width: 1080px), (max-height: 700px) {
+    .board-viewport-wrap { height: auto; min-height: 0; }
+    .board-viewport-wrap > .board-fill-panel { flex: none; }
+    .board-fill-panel .matrix-wrap { overflow-y: visible; }
+  }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius, 10px);
+    box-shadow: var(--shadow-sm, 0 1px 3px rgba(0,0,0,0.04)); overflow: hidden; margin-bottom: 14px;
+    transition: box-shadow 0.15s ease; }
+  .panel-head { padding: 11px 16px 9px; border-bottom: 1px solid var(--border); display: flex;
     align-items: baseline; justify-content: space-between; gap: 14px; }
-  .panel-head h2 { margin: 0; font-size: 15px; color: var(--teal); }
+  .panel-head h2 { margin: 0; font-size: 14px; color: var(--teal); font-weight: 700; }
   .panel-head .count-note { font-size: 12px; color: var(--text-faint); white-space: nowrap; }
   .matrix-wrap { overflow-x: auto; }
   table.matrix, table.summary, table.alarmlog { width: 100%; border-collapse: collapse; font-size: 13px; }
   table.matrix th, table.matrix td, table.summary th, table.summary td,
-  table.alarmlog th, table.alarmlog td { padding: 9px 10px; text-align: center; border-bottom: 1px solid var(--border); }
+  table.alarmlog th, table.alarmlog td { padding: 7px 10px; text-align: center; border-bottom: 1px solid var(--border); }
   table.matrix th:first-child, table.matrix td:first-child,
   table.summary th:first-child, table.summary td:first-child,
   table.alarmlog th, table.alarmlog td { text-align: left; }
   table.matrix thead th, table.summary thead th, table.alarmlog thead th {
-    font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-faint);
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-faint);
     background: var(--panel-raised); font-weight: 700; }
   table.matrix tbody tr:hover td, table.summary tbody tr:hover td, table.alarmlog tbody tr:hover td {
     filter: brightness(0.97); }
@@ -1003,18 +4750,25 @@ HYPERVIEW_COMPONENT_CSS = """
   tr.affected .site-cell { color: var(--danger-dark); }
   .clear-mark { color: var(--ok); }
   .badge { display: inline-flex; align-items: center; justify-content: center; min-width: 22px; height: 20px;
-    padding: 0 5px; border-radius: 5px; font-weight: 700; font-size: 12px; }
+    padding: 0 6px; border-radius: 6px; font-weight: 700; font-size: 12px; }
   .badge.open { background: var(--danger); color: #fff; }
   .badge.ack { background: var(--teal-tint); color: var(--teal-dark); border: 1px solid var(--teal); }
   .center-col { display: flex; flex-direction: column; }
-  .gauge-card { text-align: center; padding: 18px 16px 22px; }
+  .gauge-card { text-align: center; padding: 10px 16px 14px; }
   .gauge-card .panel-head { justify-content: center; border-bottom: none; padding-bottom: 0; }
-  .gauge-svg { width: 170px; height: 106px; margin: 4px auto -4px; display: block; }
-  .gauge-track { fill: none; stroke: var(--border); stroke-width: 14; stroke-linecap: round; }
-  .gauge-fill { fill: none; stroke-width: 14; stroke-linecap: round; transition: stroke-dashoffset 0.4s ease; }
-  .gauge-score-num { font-size: 34px; font-weight: 700; line-height: 1; }
-  .gauge-score-lbl { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-faint); margin-top: 3px; }
-  .status-banner { margin-top: 14px; padding: 9px 8px; border-radius: 8px; font-weight: 700; font-size: 15px; color: #fff; }
+  .health-medallion-body { padding-top: 6px; }
+  .health-medallion { width: 52px; height: 52px; border-radius: 50%; margin: 0 auto 10px;
+    display: flex; align-items: center; justify-content: center; }
+  .health-medallion svg { width: 26px; height: 26px; }
+  .health-state { font-size: 16px; font-weight: 700; }
+  .health-detail { margin-top: 6px; font-size: 12.5px; color: var(--text-dim); }
+  .health-tone-ok { color: var(--ok); }
+  .health-tone-warn { color: var(--warn); }
+  .health-tone-danger { color: var(--danger); }
+  .health-tint-ok { background: color-mix(in srgb, var(--ok) 18%, transparent); }
+  .health-tint-warn { background: color-mix(in srgb, var(--warn) 18%, transparent); }
+  .health-tint-danger { background: var(--danger-tint); }
+  .status-banner { margin-top: 8px; padding: 6px 8px; border-radius: 8px; font-weight: 700; font-size: 13px; color: #fff; }
   table.summary .n { font-weight: 700; }
   table.summary .open-n { color: var(--danger); }
   table.summary .ack-n { color: var(--teal); }
@@ -1033,66 +4787,154 @@ HYPERVIEW_COMPONENT_CSS = """
   }
 """
 
-# Extra component CSS specific to /ipro and /ooma (vendor lockup, stat
-# tiles, warn-tone badges, the gauge+summary+red-phone summary row) - kept
-# separate from HYPERVIEW_COMPONENT_CSS above since /hyperview doesn't use
-# any of it.
 DASHBOARD_EXTRA_CSS = """
   .badge.warn { background: var(--warn); color: #fff; }
   .dash-mark { color: var(--text-faint); }
   .stat-row { display: flex; }
-  .stat-tile { flex: 1; padding: 14px 10px; text-align: center; border-right: 1px solid var(--border); }
+  .stat-tile { flex: 1; padding: 8px 10px; text-align: center; border-right: 1px solid var(--border); }
   .stat-tile:last-child { border-right: none; }
   .stat-tile .stat-lbl { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-faint); }
-  .stat-tile .stat-num { font-size: 26px; font-weight: 700; }
+  .stat-tile .stat-num { font-size: 20px; font-weight: 700; }
   .stat-tile.unhealthy .stat-num { color: var(--danger); }
-  .updated-note { padding: 8px 18px 14px; font-size: 12px; color: var(--text-faint); text-align: center; }
+  .updated-note { padding: 5px 18px 8px; font-size: 12px; color: var(--text-faint); text-align: center; }
   td.status-cell { font-weight: 700; color: var(--danger); }
   td.priority-cell.critical { color: var(--danger); font-weight: 700; }
   td.priority-cell.warning { color: var(--warn); font-weight: 700; }
-  /* A capped-height scroll area with a frozen header - NOT the
-     display:table-per-row trick this used to use (tr{display:table}
-     inside a display:block tbody breaks the fixed-layout column-width
-     algorithm each row relied on, since every row becomes its own
-     unrelated table with no shared column metrics - that's what was
-     making Device/Status text run into each other in the Device Detail
-     table). A plain scrollable wrapper with a sticky <thead> gets the
-     same "long list, frozen header" effect without touching how the
-     table itself lays out its columns. */
-  .device-scroll { max-height: 420px; overflow-y: auto; }
-  .device-scroll table.alarmlog thead th { position: sticky; top: 0; z-index: 1; }
-  /* Same 3-col .board Hyperview/iPRO use, but for a dashboard (Ooma)
-     with only one site matrix instead of two - a matrix column plus a
-     fixed-width center-col, no empty third column forced in just to
-     match column count. */
-  .board-2col { grid-template-columns: 1fr 320px; }
 
-  /* /overview's per-system status cards - same .panel/.panel-head shell
-     every dashboard already uses, just wrapped in a link and given a
-     status dot + state line instead of a table. */
-  .status-grid { display: flex; flex-wrap: wrap; gap: 16px; }
-  a.panel.status-panel { flex: 1 1 220px; text-decoration: none; color: inherit;
-    display: block; transition: border-color 0.15s ease; }
-  a.panel.status-panel:hover { border-color: var(--teal); }
-  .status-panel .panel-head { border-bottom: none; }
-  .status-body { display: flex; align-items: center; gap: 10px; padding: 0 18px 8px; }
-  .status-dot { width: 14px; height: 14px; border-radius: 50%; flex-shrink: 0; }
-  .status-state { font-size: 13px; color: var(--text-dim); }
-  .status-detail { padding: 0 18px 16px; font-size: 12px; color: var(--text-faint); }
-  .quick-links { display: flex; flex-wrap: wrap; gap: 8px 20px; padding: 0 18px 18px; }
-  .quick-link { color: var(--teal); text-decoration: none; font-weight: 600; font-size: 13px; }
-  .quick-link:hover { text-decoration: underline; }
+  .device-scroll { max-height: 280px; overflow-y: auto; }
+  .device-scroll table.alarmlog thead th { position: sticky; top: 0; z-index: 1; }
+
+  .board-2col { grid-template-columns: 1fr minmax(300px, 400px); }
+
+
+  .status-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  @media (max-width: 1080px) {
+    .status-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+
+  .overview-2col { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 760px) {
+    .overview-2col { grid-template-columns: 1fr; }
+  }
+
+  /* Overview page's own left-hand info column is narrower than the
+     system-cards column next to it, giving the cards more breathing room
+     than an even 1:1 split would. */
+  .overview-main-row { display: grid; grid-template-columns: 1fr 1.4fr; gap: 14px; align-items: start; }
+  @media (max-width: 760px) {
+    .overview-main-row { grid-template-columns: 1fr; }
+  }
+  .top-sites-table td.site-cell {
+    white-space: normal; word-break: break-word; line-height: 1.3;
+  }
+  a.panel.status-panel { text-decoration: none; color: inherit;
+    display: flex; flex-direction: column; align-items: stretch; gap: 8px; padding: 18px 20px;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.1s ease; }
+  a.panel.status-panel:hover { border-color: var(--teal); box-shadow: var(--shadow-md, 0 4px 16px rgba(0,0,0,0.08)); transform: translateY(-1px); }
+  .status-id { display: flex; align-items: center; gap: 8px; }
+  .status-dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+  .status-id h2 { margin: 0; font-size: 14px; color: var(--teal); }
+  .status-state { font-size: 12.5px; color: var(--text-dim); }
+
+  .status-stats { display: flex; flex-wrap: wrap; gap: 10px 16px; }
+  .status-stat { display: flex; flex-direction: column; }
+  .status-stat-num { font-size: 18px; font-weight: 700; line-height: 1.1; }
+  .status-stat-num.unhealthy { color: var(--danger); }
+  .status-stat-lbl { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-faint); margin-top: 2px; }
+  .status-unreachable { font-size: 13px; color: var(--text-faint); }
+  .status-updated { font-size: 11px; color: var(--text-faint); }
+
+  .status-trend { display: flex; align-items: center; gap: 8px; border-radius: 6px; padding: 2px 4px; margin: 0 -4px; transition: background 0.12s ease; }
+  .status-trend:hover { background: var(--panel-raised); }
+  .status-trend:hover .status-trend-label { color: var(--teal); }
+  .status-trend-label { font-size: 10px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.04em; }
+  .sparkline { width: 90px; height: 24px; flex-shrink: 0; }
+  .sparkline-empty { font-size: 11px; color: var(--text-faint); font-style: italic; }
+
+  .trend-chart { width: 100%; display: block; }
+  .trend-grid-line { stroke: var(--border); stroke-width: 1; }
+  .trend-chart-wrap { position: relative; }
+  .trend-grid-labels { position: absolute; top: 0; left: 0; right: 0; pointer-events: none; }
+  .trend-grid-labels span { position: absolute; left: 4px; font-size: 10px; color: var(--text-faint); }
+  .trend-x-labels { position: absolute; left: 0; right: 0; height: 16px; pointer-events: none; }
+  .trend-x-labels span { position: absolute; transform: translateX(-50%); font-size: 10px; color: var(--text-faint); white-space: nowrap; }
+  .trend-area { opacity: 0.08; }
+  .trend-hoverable { cursor: crosshair; }
+  .trend-hover-dot {
+    position: absolute; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--teal); border: 2px solid var(--panel); box-shadow: var(--shadow-sm);
+    transform: translate(-50%, -50%); pointer-events: none; z-index: 2;
+  }
+  .trend-hover-tip {
+    position: absolute; background: var(--panel); border: 1px solid var(--border-bright);
+    border-radius: 6px; padding: 4px 9px; font-size: 11px; color: var(--text); white-space: nowrap;
+    box-shadow: var(--shadow-md); pointer-events: none; transform: translate(-50%, -135%); z-index: 3;
+  }
+  .trend-range-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .log-filter-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .log-filter-row select, .log-filter-row input[type=text] { width: auto; max-width: 220px; margin: 0; padding: 7px 10px; font-size: 13px; }
+  .log-filter-row button { margin: 0; padding: 7px 16px; font-size: 13px; }
+  .log-filter-row a.ghost { display: inline-block; padding: 7px 14px; border-radius: 7px; border: 1.5px solid var(--border-bright);
+    color: var(--text-dim); font-size: 12px; font-weight: 600; text-decoration: none; }
+  .log-filter-row a.ghost:hover { border-color: var(--teal); color: var(--teal); }
+  .trend-range-sep { width: 1px; height: 18px; background: var(--border); margin: 0 2px; }
+  .trend-selector {
+    display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600;
+    color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  .trend-selector select {
+    width: auto; max-width: none; margin: 0; padding: 6px 10px; font-size: 13px;
+    font-weight: 400; text-transform: none; letter-spacing: normal; color: var(--text);
+  }
+  .trend-sys-checks { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .trend-sys-check {
+    display: inline-flex; align-items: center; gap: 5px; font-size: 13px;
+    font-weight: 400; text-transform: none; letter-spacing: normal; color: var(--text); cursor: pointer;
+  }
+  .trend-sys-check input[type=checkbox] { margin: 0; cursor: pointer; }
+  .trend-range-row a.range-btn {
+    font-size: 12px; font-weight: 600; padding: 5px 12px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--text-dim); text-decoration: none;
+  }
+  .trend-range-row a.range-btn:hover { border-color: var(--teal); color: var(--teal); }
+  .trend-range-row a.range-btn.active { background: var(--teal); border-color: var(--teal); color: #fff; }
+  .trend-stats { display: flex; gap: 20px; flex-wrap: wrap; margin: 10px 0 0; }
+  .trend-stat { font-size: 12px; color: var(--text-faint); }
+  .trend-stat strong { color: var(--text); font-size: 14px; display: block; }
+  .trend-subhead { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;
+    color: var(--text-faint); margin: 18px 0 6px; }
+  .trend-legend { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 8px; }
+  .trend-legend-item { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-dim); }
+  .trend-legend-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+  .leadership-sys-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; margin-bottom: 16px; }
+  .leadership-score-row { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; }
+  .leadership-score-num { font-size: 28px; font-weight: 700; }
+  .leadership-trend-up { color: var(--ok); font-size: 12px; font-weight: 600; }
+  .leadership-trend-down { color: var(--danger); font-size: 12px; font-weight: 600; }
+  .leadership-trend-flat { color: var(--text-faint); font-size: 12px; }
+
+  .icon-links { display: flex; gap: 8px; flex-wrap: wrap; }
+  .icon-links a {
+    display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600;
+    color: var(--text-dim); background: var(--panel-raised); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 11px; text-decoration: none;
+  }
+  .icon-links a:hover { border-color: var(--teal); color: var(--teal); }
+
+  .site-chips-row { display: flex; gap: 8px; flex-wrap: wrap; padding: 12px 16px; }
+  .site-chips-row .chip {
+    display: flex; align-items: center; gap: 6px; background: var(--panel-raised);
+    border: 1px solid var(--border); border-radius: 999px; padding: 4px 10px 4px 6px; font-size: 11.5px;
+    color: inherit; text-decoration: none; transition: border-color 0.12s ease, color 0.12s ease;
+  }
+  .site-chips-row .chip:hover { border-color: var(--teal); color: var(--teal); }
+  .chip-count {
+    display: inline-flex; align-items: center; justify-content: center; min-width: 16px; height: 16px;
+    padding: 0 4px; border-radius: 999px; background: var(--danger); color: #fff;
+    font-size: 10px; font-weight: 700; line-height: 1;
+  }
 """
 
-# Responsive overrides for /ipro, /ooma and /hyperview - no separate
-# /mobile routes or URL to remember, this is just a @media breakpoint on
-# the same page: below 720px it forces every board grid to a single
-# column and turns each matrix/summary/alarmlog table into a stacked
-# label:value card list (the standard responsive-table pattern) instead
-# of a wide table a phone has to scroll sideways to read. Relies on the
-# data-label attributes the HTML builders below (and the HYPERVIEW_SCRIPT
-# render functions) put on every <td> - those attributes are inert above
-# the breakpoint, this media query is the only place that reads them.
 RESPONSIVE_DASHBOARD_CSS = """
   @media (max-width: 720px) {
     .wrap { width: 100%; padding: 16px 12px 40px; }
@@ -1115,56 +4957,59 @@ RESPONSIVE_DASHBOARD_CSS = """
       font-weight: 700; text-align: left;
     }
     table.matrix td.site-cell::before, table.alarmlog td.loc::before, table.alarmlog td.dev::before { content: ""; }
-    /* Stacked cards already keep each device's fields readable without a
-       capped-height nested scroll area - let the list flow with the page
-       instead of scrolling twice (page scroll + a tiny inner scrollbar). */
+
     .device-scroll { max-height: none; overflow-y: visible; }
     .device-scroll table.alarmlog thead th { position: static; }
-    button, nav.top a { min-height: 40px; }
+    button, nav.top a, nav.top summary { min-height: 40px; }
+
+    .stat-row { display: grid; grid-template-columns: repeat(2, 1fr); }
+    .stat-tile { border-right: none; border-bottom: 1px solid var(--border); padding: 10px; }
+    .stat-tile:nth-last-child(-n+2) { border-bottom: none; }
+    .stat-tile:nth-child(odd) { border-right: 1px solid var(--border); }
+
+    .leadership-sys-grid { grid-template-columns: 1fr; }
+    .status-grid { grid-template-columns: 1fr; }
   }
 """
 
-# Every dashboard page's <style> tag was independently concatenating the
-# same 2-3 constants (HYPERVIEW_COMPONENT_CSS + DASHBOARD_EXTRA_CSS,
-# sometimes + RESPONSIVE_DASHBOARD_CSS) - collected here once so a future
-# dashboard route just uses DASHBOARD_CSS and there's one place that
-# decides what "the dashboard family's styling" means.
-DASHBOARD_BASE_CSS = HYPERVIEW_COMPONENT_CSS + DASHBOARD_EXTRA_CSS
-DASHBOARD_CSS = DASHBOARD_BASE_CSS + RESPONSIVE_DASHBOARD_CSS
+DASHBOARD_BASE_CSS = HYPERVIEW_COMPONENT_CSS + DASHBOARD_EXTRA_CSS + RESPONSIVE_DASHBOARD_CSS
 
 
-def _gauge_html(score, state, tone):
-    dashoffset = round(251.2 * (1 - score / 100), 1)
+HEALTH_ICONS = {
+    "ok": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" '
+          'stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>',
+    "warn": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" '
+            'stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4M12 17h.01M10.3 3.9L2.7 17a2 2 0 0 0 '
+            '1.7 3h15.2a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>',
+    "danger": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" '
+              'stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/>'
+              '<path d="M12 8v5M12 16h.01"/></svg>',
+}
+
+
+def _gauge_html(state, tone, detail=""):
+    """System Health card: plain-language status with an icon, not a raw
+    0-100 gauge - the score is still computed/stored, just not the display."""
+    icon = HEALTH_ICONS.get(tone, HEALTH_ICONS["warn"])
+    detail_html = f'<div class="health-detail">{detail}</div>' if detail else ""
     return f"""
     <div class="panel gauge-card">
       <div class="panel-head"><h2>System Health</h2></div>
-      <svg class="gauge-svg" viewBox="0 0 190 118">
-        <path class="gauge-track" d="M15 105 A80 80 0 0 1 175 105" />
-        <path class="gauge-fill" d="M15 105 A80 80 0 0 1 175 105"
-              stroke="var(--{tone})" stroke-dasharray="251.2" stroke-dashoffset="{dashoffset}" />
-      </svg>
-      <div class="gauge-score-num" style="color:var(--{tone})">{score}</div>
-      <div class="gauge-score-lbl">Health score</div>
-      <div class="status-banner" style="background:var(--{tone})">{_esc(state)}</div>
+      <div class="health-medallion-body">
+        <div class="health-medallion health-tint-{tone}"><span class="health-tone-{tone}">{icon}</span></div>
+        <div class="health-state health-tone-{tone}">{_esc(state)}</div>
+        {detail_html}
+      </div>
     </div>"""
 
 
 def _format_epoch_ms(epoch_ms):
-    """Renders the epoch-ms timestamp Hyperview's and Ooma's own
-    /last-updated share (matrix.py and ooma.py use the identical shape -
-    see ooma.py's own last_updated() docstring) as 12-hour local time,
-    matching this file's existing time display convention. None means
-    that bridge's poller hasn't completed a first cycle yet."""
     if epoch_ms is None:
         return "Never"
     return datetime.fromtimestamp(epoch_ms / 1000).strftime('%I:%M:%S %p').lstrip('0')
 
 
 def _format_ipro_last_updated(value):
-    """ipro2.py's /last-updated is shaped differently from Hyperview's/
-    Ooma's - {'updated': 'HH:MM:SS'} (24-hour, local time) instead of an
-    epoch-ms timestamp, or the literal string 'Never' before its first
-    successful refresh."""
     if not value or value == "Never":
         return "Never"
     try:
@@ -1174,71 +5019,43 @@ def _format_ipro_last_updated(value):
 
 
 def _summary_table_html(rows, last_updated):
-    """rows use the shape both bridges' own summary endpoints already
-    return - {category, open, acknowledged} - so this renders them
-    directly rather than translating into a portal-specific shape first.
-    Always computes its own totals row from whatever categories it's
-    given; callers strip the backend's own precomputed total row before
-    calling this (see _fetch_ipro_dashboard/_fetch_ooma_dashboard) so it
-    isn't rendered twice.
-
-    last_updated is the bridge's own real /last-updated value (already
-    formatted by _format_epoch_ms/_format_ipro_last_updated) - NOT this
-    portal's own render time. Those aren't the same thing: this portal
-    can render a page (or a kiosk page can reload) well after the
-    bridge's last successful poll - especially now that a hung poll can
-    cost a bridge up to a full cycle_timeout (see ooma.py's Poller fix) -
-    so a server-render timestamp would silently claim data is fresher
-    than it actually is."""
     total_open = sum(r["open"] for r in rows)
     total_ack = sum(r["acknowledged"] for r in rows)
     body_rows = "".join(
         f'<tr><td data-label="Category">{_esc(r["category"])}</td>'
         f'<td class="n open-n" data-label="Open">{r["open"]}</td>'
-        f'<td class="n ack-n" data-label="Ack\'d">{r["acknowledged"]}</td></tr>'
+        f'<td class="n ack-n" data-label="Acknowledged">{r["acknowledged"]}</td></tr>'
         for r in rows
     )
     body_rows += (
         f'<tr class="row-all"><td data-label="Category">All</td>'
         f'<td class="n open-n" data-label="Open">{total_open}</td>'
-        f'<td class="n ack-n" data-label="Ack\'d">{total_ack}</td></tr>'
+        f'<td class="n ack-n" data-label="Acknowledged">{total_ack}</td></tr>'
     )
     return f"""
     <div class="panel">
       <div class="panel-head"><h2>Alarm Summary</h2></div>
-      <table class="summary"><thead><tr><th>Category</th><th>Open</th><th>Ack'd</th></tr></thead>
+      <table class="summary"><thead><tr><th>Category</th><th>Open</th><th>Acknowledged</th></tr></thead>
         <tbody>{body_rows}</tbody></table>
       <div class="updated-note">Last Updated: {_esc(last_updated)}</div>
     </div>"""
 
 
 def _health_state_label(score):
-    """iPRO's /overall-health returns only the raw score, no text label
-    (unlike Ooma's, which already includes one) - mirrors the same
-    four-tier wording ooma.py's own build_overall_health uses, so the two
-    dashboards read consistently even though only one bridge computes the
-    label itself."""
     if score == 100:
         return "Healthy"
-    if score >= 90:
-        return "Degraded"
     if score >= 70:
-        return "Significant"
+        return "Degraded"
     return "Critical"
 
 
 def _ipro_matrix_html(title, rows):
-    """Renders one of iPRO's two site matrices, straight off
-    /location-health-matrix or /clinic-health-matrix - see
-    _build_location_matrix()'s docstring in ipro2.py for exactly what
-    'site', 'infrastructureIssues', 'degradedCams', 'offlineCams' and the
-    1000+ acknowledged-offset mean; _score_cell_html() decodes that offset."""
     affected_count = sum(1 for r in rows if r.get("site"))
     body_rows = []
     for r in rows:
         cls = ' class="affected"' if r.get("site") else ""
         body_rows.append(
-            f'<tr{cls}><td class="site-cell" data-label="Location">{_esc(r["locationDisplay"])}</td>'
+            f'<tr{cls}><td class="site-cell" data-label="Location">{_esc(_strip_emoji(r["locationDisplay"]))}</td>'
             f'<td data-label="Infra Issues">{_score_cell_html(r.get("infrastructureIssues"), "warn")}</td>'
             f'<td data-label="Degraded Cams">{_score_cell_html(r.get("degradedCams"), "warn")}</td>'
             f'<td data-label="Offline Cams">{_score_cell_html(r.get("offlineCams"), "open")}</td></tr>'
@@ -1258,39 +5075,55 @@ def _ipro_matrix_html(title, rows):
 
 
 def _severity_row_class(severity):
-    """Maps a row's own severity to the two-tier tr.sev-critical /
-    tr.sev-warning classes table.alarmlog already styles (see
-    HYPERVIEW_COMPONENT_CSS) - anything not literally "Critical" reads as
-    the warning tier, same convention Hyperview's own Active Alarms table
-    uses."""
     return "sev-critical" if str(severity).strip().lower() == "critical" else "sev-warning"
 
 
+def _alarm_rows_html(items, row_class_fn, cell_fns):
+    """Shared row renderer for iPRO/Ooma/Hyperview alarm tables - each
+    system supplies its own row-class rule and per-column cell-builders."""
+    def row(item):
+        cells = "".join(fn(item) for fn in cell_fns)
+        return f'<tr class="{row_class_fn(item)}">{cells}</tr>'
+    return "".join(row(item) for item in items)
+
+
+_IPRO_ROW_CELLS = (
+    lambda d: f'<td class="loc" data-label="Location">{_esc(_strip_emoji(d.get("location") or ""))}</td>',
+    lambda d: f'<td class="dev" data-label="Device">{_esc(d["device"])}{_ack_tag_html(d.get("acknowledged"))}</td>',
+    lambda d: f'<td class="status-cell" data-label="Status">{_esc(d["status"])}</td>',
+    lambda d: f'<td data-label="Detail">{_esc(d["detail"])}</td>',
+    lambda d: f'<td class="dur" data-label="Duration">{_esc(d["duration"])}</td>',
+    lambda d: f'<td class="priority-cell {_esc(d["priority"].strip().lower())}" data-label="Priority">{_esc(d["priority"])}</td>',
+)
+
+
+def _ipro_device_rows_html(devices):
+    row_class = lambda d: _severity_row_class("Critical" if d["status"] in ("Offline", "Infrastructure Issue") else "Degraded")
+    return _alarm_rows_html(devices, row_class, _IPRO_ROW_CELLS)
+
+
+def _ipro_open_device_count(devices):
+    """Devices minus the acknowledged ones - devices now includes both
+    (see _fetch_ipro_dashboard), so a header reading 'N open issue(s)'
+    needs this instead of a plain len() to stay accurate."""
+    return sum(1 for d in devices if not d.get("acknowledged"))
+
+
 def _ipro_board_html(data):
-    # /camera-outage-log's own "priority" field is camera IMPORTANCE
-    # (Critical/High/Standard - see camera_priority() in ipro2.py, a tag
-    # on which cameras matter more, e.g. a pharmacy cam vs a parking lot
-    # one) - NOT the failure severity. That's "status" (Offline/
-    # Infrastructure Issue vs Degraded), which is what decides this row's
-    # color. Conflating the two earlier was the bug: every device here
-    # happened to be Critical-priority in the one snapshot that got
-    # tested, which hid that "priority" was never the right field to
-    # color rows by in the first place.
-    device_rows = "".join(
-        f'<tr class="{_severity_row_class("Critical" if d["status"] in ("Offline", "Infrastructure Issue") else "Degraded")}">'
-        f'<td class="dev" data-label="Device">{_esc(d["device"])}</td>'
-        f'<td class="status-cell" data-label="Status">{_esc(d["status"])}</td>'
-        f'<td data-label="Detail">{_esc(d["detail"])}</td>'
-        f'<td class="dur" data-label="Duration">{_esc(d["duration"])}</td>'
-        f'<td class="priority-cell {_esc(d["priority"].strip().lower())}" data-label="Priority">{_esc(d["priority"])}</td></tr>'
-        for d in data["devices"]
-    )
+    device_rows = _ipro_device_rows_html(data["devices"])
+    total_open = sum(r["open"] for r in data["summary"])
+    gauge_detail = (f"{total_open} open issue(s) &middot; {data['totals']['unhealthyCameras']} of "
+                     f"{data['totals']['totalCameras']} cameras unhealthy")
     return f"""
+    <div class="board-viewport-wrap">
     <div class="board">
       {_ipro_matrix_html("Datacenters / Hospitals", data["hospitals"])}
       <div class="center-col">
-        {_gauge_html(data["gauge"]["score"], _health_state_label(data["gauge"]["score"]), data["gauge"]["tone"])}
+        {_gauge_html(_health_state_label(data["gauge"]["score"]), data["gauge"]["tone"], gauge_detail)}
         {_summary_table_html(data["summary"], data["last_updated"])}
+      </div>
+      <div class="center-col">
+        {_ipro_matrix_html("Primary Care / Clinics", data["clinics"])}
         <div class="panel">
           <div class="stat-row">
             <div class="stat-tile"><div class="stat-lbl">Total Cameras</div><div class="stat-num">{data['totals']['totalCameras']}</div></div>
@@ -1298,23 +5131,20 @@ def _ipro_board_html(data):
           </div>
         </div>
       </div>
-      {_ipro_matrix_html("Primary Care / Clinics", data["clinics"])}
     </div>
-    <div class="panel">
+    <div class="panel board-fill-panel">
       <div class="panel-head"><h2>Device Detail</h2><span class="count-note">{data['totals']['unhealthyCameras']} unhealthy device(s)</span></div>
-      <div class="matrix-wrap device-scroll">
+      <div class="matrix-wrap">
         <table class="alarmlog">
-          <thead><tr><th>Device</th><th>Status</th><th>Detail</th><th>Duration</th><th>Priority</th></tr></thead>
-          <tbody>{device_rows or '<tr><td colspan="5" class="empty">No open camera issues.</td></tr>'}</tbody>
+          <thead><tr><th>Location</th><th>Device</th><th>Status</th><th>Detail</th><th>Duration</th><th>Priority</th></tr></thead>
+          <tbody>{device_rows or '<tr><td colspan="6" class="empty">No open camera issues.</td></tr>'}</tbody>
         </table>
       </div>
+    </div>
     </div>"""
 
 
 def _ooma_matrix_html(accounts):
-    """Straight off ooma.py's own /accounts - see build_account_rollup()'s
-    docstring for exactly what 'site', 'connectivity_issues',
-    'battery_issues' and the 1000+ acknowledged-offset mean."""
     affected_count = sum(1 for a in accounts if a.get("site"))
     rows = []
     for a in accounts:
@@ -1337,46 +5167,51 @@ def _ooma_matrix_html(accounts):
     </div>"""
 
 
+_OOMA_ROW_CELLS = (
+    lambda a: f'<td class="loc" data-label="Location">{_esc(a["account"])}</td>',
+    lambda a: f'<td class="dev" data-label="Device">{_esc(a["device"])}{_ack_tag_html(a.get("acknowledged"))}</td>',
+    lambda a: f'<td data-label="Severity"><span class="sev-{_esc(a["severity"].strip().lower())}">{_esc(a["severity"])}</span></td>',
+    lambda a: f'<td data-label="Detail">{_esc(a["message"])}</td>',
+    lambda a: f'<td data-label="Category">{_esc(a["category"])}</td>',
+)
+
+
+def _ooma_issue_rows_html(issues):
+    return _alarm_rows_html(issues, lambda a: _severity_row_class(a["severity"]), _OOMA_ROW_CELLS)
+
+
+def _ooma_open_issue_count(issues):
+    """Issues minus the acknowledged ones - issues now includes both (see
+    _fetch_ooma_dashboard), so a header reading 'N open issue(s)' needs
+    this instead of a plain len() to stay accurate."""
+    return sum(1 for a in issues if not a.get("acknowledged"))
+
+
 def _ooma_board_html(data):
-    # Row class and the Severity cell's own text color both come from
-    # each issue's actual severity ("Critical"/"Degraded", straight off
-    # /issues - see get_device_issues() in ooma.py), not assumed.
-    alarm_rows = "".join(
-        f'<tr class="{_severity_row_class(a["severity"])}"><td class="loc" data-label="Location">{_esc(a["account"])}</td>'
-        f'<td class="dev" data-label="Device">{_esc(a["device"])}</td>'
-        f'<td data-label="Severity"><span class="sev-{_esc(a["severity"].strip().lower())}">{_esc(a["severity"])}</span></td>'
-        f'<td data-label="Category">{_esc(a["category"])}</td>'
-        f'<td data-label="Detail">{_esc(a["message"])}</td></tr>'
-        for a in data["issues"]
-    )
-    # Same board shape as Hyperview/iPRO: a site matrix beside a
-    # center-col (gauge, then Alarm Summary - same order as the other
-    # two), then the device/issue log as its own full-width panel below,
-    # plain .panel-head styling like Active Alarms / Device Detail rather
-    # than the one-off teal-dark header this used to have. Ooma only has
-    # one matrix (Site Status - ooma.py's /accounts has no
-    # hospital/clinic-style split the way ipro2.py does), so this uses
-    # board-2col instead of forcing an empty third column.
+    alarm_rows = _ooma_issue_rows_html(data["issues"])
+    total_open = sum(r["open"] for r in data["summary"])
+    affected = sum(1 for a in data["accounts"] if a.get("site"))
+    gauge_detail = f"{total_open} open issue(s) &middot; {affected} of {len(data['accounts'])} sites affected"
     return f"""
+    <div class="board-viewport-wrap">
     <div class="board board-2col">
       {_ooma_matrix_html(data["accounts"])}
       <div class="center-col">
-        {_gauge_html(data["gauge"]["score"], data["gauge"]["state"], data["gauge"]["tone"])}
+        {_gauge_html(data["gauge"]["state"], data["gauge"]["tone"], gauge_detail)}
         {_summary_table_html(data["summary"], data["last_updated"])}
       </div>
     </div>
-    <div class="panel">
+    <div class="panel board-fill-panel">
       <div class="panel-head"><h2>Ooma AirDial &mdash; Emergency Red Phone System</h2></div>
       <div class="matrix-wrap">
         <table class="alarmlog">
-          <thead><tr><th>Location</th><th>Device</th><th>Severity</th><th>Category</th><th>Detail</th></tr></thead>
+          <thead><tr><th>Location</th><th>Device</th><th>Severity</th><th>Detail</th><th>Category</th></tr></thead>
           <tbody>{alarm_rows or '<tr><td colspan="5" class="empty">No open AirDial issues.</td></tr>'}</tbody>
         </table>
       </div>
+    </div>
     </div>"""
 
-
-# --- iPRO / Ooma dashboard pages ------------------------------------------
 
 def _bridge_unreachable_html(label, base_url):
     return f"""
@@ -1387,16 +5222,42 @@ def _bridge_unreachable_html(label, base_url):
     </div>"""
 
 
-# /ipro and /ooma render server-side from a fresh fetch on every request
-# (see _fetch_ipro_dashboard/_fetch_ooma_dashboard) rather than
-# live-polling client-side like Hyperview's HYPERVIEW_SCRIPT does -
-# ipro2.py's raw feeds are deliberately localhost-only (camera names/
-# locations across a behavioral-health fleet are sensitive - see that
-# fetch function's own comment), so there's no client-safe JSON endpoint
-# on this portal to poll against. A plain reload gets the same "stays
-# current without a person refreshing" result without exposing one.
-# Same 30s cadence as Hyperview's own client-side poll.
-DASHBOARD_AUTO_REFRESH_SCRIPT = '<script>setTimeout(function () { location.reload(); }, 30000);</script>'
+def _dashboard_page_header_html(title, videowall_href, extra_action_html=""):
+    return f"""
+    <div class="page-header">
+      <div>
+        <h1>{_esc(title)}</h1>
+      </div>
+      <div style="display:flex; gap:8px;">
+        {extra_action_html}
+        <a class="ghost page-action" href="{videowall_href}" target="_blank" rel="noopener"
+           title="No login required, for a wall display - opens in a new tab">Videowall view &rarr;</a>
+      </div>
+    </div>"""
+
+
+DASHBOARD_AUTO_REFRESH_SCRIPT = """<script>
+(function () {
+  var REFRESH_MS = 30000;
+  var due = Date.now() + REFRESH_MS;
+  function maybeReload() {
+    if (window.isFlyoutOpen && window.isFlyoutOpen()) { return; }
+    if (Date.now() >= due) { location.reload(); }
+  }
+  setInterval(maybeReload, 5000);
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible') { maybeReload(); }
+  });
+})();
+</script>"""
+
+
+def _alert_state_from_summary(data):
+    total_open = sum(r["open"] for r in data["summary"])
+    total_ack = sum(r["acknowledged"] for r in data["summary"])
+    has_unacked = total_open > 0
+    has_acked_only = (not has_unacked) and total_ack > 0
+    return has_unacked, has_acked_only, data["gauge"]["tone"]
 
 
 @app.route("/ipro")
@@ -1407,14 +5268,13 @@ def ipro_page(username):
         return denied
     data = _fetch_ipro_dashboard()
     board = _ipro_board_html(data) if data else _bridge_unreachable_html("iPRO Cameras", SYSTEMS["ipro"]["base_url"])
+    alert_script = _critical_alert_script(*_alert_state_from_summary(data)) if data else ""
     body = f"""
-    <h1>iPRO Cameras</h1>
-    <p class="sub">Camera health &amp; infrastructure status across all sites.
-    &middot; <a href="/ipro/kiosk" target="_blank" rel="noopener">Open kiosk view</a>
-    (no login, for a wall display &mdash; opens in a new tab)</p>
-    <style>{DASHBOARD_CSS}</style>
+    {_dashboard_page_header_html("iPRO Cameras", "/ipro/videowall")}
+    <style>{DASHBOARD_BASE_CSS}</style>
     {board}
     {DASHBOARD_AUTO_REFRESH_SCRIPT}
+    {alert_script}
     """
     return Response(render_shell("iPRO Cameras", body, "ipro", username), mimetype="text/html")
 
@@ -1427,126 +5287,1580 @@ def ooma_page(username):
         return denied
     data = _fetch_ooma_dashboard()
     board = _ooma_board_html(data) if data else _bridge_unreachable_html("Ooma AirDial", SYSTEMS["ooma"]["base_url"])
+    alert_script = _critical_alert_script(*_alert_state_from_summary(data)) if data else ""
     body = f"""
-    <h1>Ooma AirDial</h1>
-    <p class="sub">Emergency red phone connectivity &amp; battery health across all sites.
-    &middot; <a href="/ooma/kiosk" target="_blank" rel="noopener">Open kiosk view</a>
-    (no login, for a wall display &mdash; opens in a new tab)</p>
-    <style>{DASHBOARD_CSS}</style>
+    {_dashboard_page_header_html("Ooma AirDial", "/ooma/videowall")}
+    <style>{DASHBOARD_BASE_CSS}</style>
     {board}
     {DASHBOARD_AUTO_REFRESH_SCRIPT}
+    {alert_script}
     """
     return Response(render_shell("Ooma AirDial", body, "ooma", username), mimetype="text/html")
 
 
-# --- overview page ---------------------------------------------------------
+def _dedup_site_rows(rows, issue_fields):
+    """Collapses Hyperview/iPRO matrix rows (shared 'location'/'locationDisplay'/
+    'site' shape) into a deduplicated site-name set, the subset flagged
+    'site', and a per-site issue total - rows that share a site name (the
+    98-vs-112 bug) are merged into one site instead of counted twice."""
+    site_names, site_names_affected, site_issue_counts = set(), set(), {}
+    for r in rows:
+        name = _strip_emoji(r.get("locationDisplay") or r["location"])
+        site_names.add(name)
+        if r.get("site"):
+            site_names_affected.add(name)
+        site_issue_counts[name] = site_issue_counts.get(name, 0) + _row_issue_total(r, issue_fields)
+    return site_names, site_names_affected, site_issue_counts
+
+
+def _hyperview_overview_card():
+    state, tone, detail, critical = "Could not reach Hyperview", "text-faint", "", False
+    open_count, ack_count, affected, total_sites = None, None, None, None
+    site_names, site_names_affected, site_issue_counts, last_updated = None, None, None, None
+    try:
+        resp = _parallel_get(HYPERVIEW_BASE_URL, [
+            "/overall-health", "/category-summary", "/location-health-matrix", "/clinic-health-matrix",
+            "/last-updated",
+        ])
+        resp["/overall-health"].raise_for_status()
+        health = resp["/overall-health"].json()[0]
+        state = _health_state_label(health["health"])
+        tone = _health_tone(health["health"])
+        resp["/category-summary"].raise_for_status()
+        all_row = next((c for c in resp["/category-summary"].json() if "All" in c.get("category", "")), None)
+        if all_row:
+            open_count = all_row["open"]
+            ack_count = all_row["ack"]
+            detail = f"{all_row['open']} open issue(s) &middot; {all_row['ack']} acknowledged"
+        critical = bool(open_count)
+        resp["/location-health-matrix"].raise_for_status()
+        resp["/clinic-health-matrix"].raise_for_status()
+        sites = resp["/location-health-matrix"].json() + resp["/clinic-health-matrix"].json()
+        site_names, site_names_affected, site_issue_counts = _dedup_site_rows(
+            sites, ("power", "facilities", "compute", "network")
+        )
+        affected = len(site_names_affected)
+        total_sites = len(site_names)
+        resp["/last-updated"].raise_for_status()
+        last_updated = _format_epoch_ms(resp["/last-updated"].json()[0].get("timestamp"))
+    except (requests.RequestException, KeyError, IndexError, ValueError, FuturesTimeoutError):
+        pass
+    return {"key": "hyperview", "name": "Hyperview", "href": "/hyperview", "state": state, "tone": tone,
+            "detail": detail, "critical": critical, "open": open_count, "ack": ack_count,
+            "affected": affected, "total_sites": total_sites, "last_updated": last_updated,
+            "site_names": site_names, "site_names_affected": site_names_affected,
+            "site_issue_counts": site_issue_counts}
+
+
+def _ipro_overview_card():
+    ipro_data = _fetch_ipro_dashboard()
+    if ipro_data is None:
+        return {"key": "ipro", "name": "iPRO Cameras", "href": "/ipro",
+                "state": "Could not reach iPRO Cameras", "tone": "text-faint", "detail": "",
+                "critical": False, "open": None, "ack": None, "affected": None, "total_sites": None,
+                "last_updated": None, "site_names": None, "site_names_affected": None,
+                "site_issue_counts": None}
+    g = ipro_data["gauge"]
+    totals = ipro_data["totals"]
+    total_open = sum(r["open"] for r in ipro_data["summary"])
+    total_ack = sum(r["acknowledged"] for r in ipro_data["summary"])
+    detail = (f"{total_open} open issue(s) &middot; {totals['unhealthyCameras']} of "
+              f"{totals['totalCameras']} cameras unhealthy")
+    critical = total_open > 0
+    sites = ipro_data["hospitals"] + ipro_data["clinics"]
+    site_names, site_names_affected, site_issue_counts = _dedup_site_rows(
+        sites, ("infrastructureIssues", "degradedCams", "offlineCams")
+    )
+    return {"key": "ipro", "name": "iPRO Cameras", "href": "/ipro",
+            "state": _health_state_label(g["score"]), "tone": g["tone"], "detail": detail,
+            "critical": critical, "open": total_open, "ack": total_ack, "affected": len(site_names_affected),
+            "total_sites": len(site_names), "last_updated": ipro_data["last_updated"],
+            "site_names": site_names,
+            "site_names_affected": site_names_affected,
+            "site_issue_counts": site_issue_counts}
+
+
+SITE_NAME_SIMILARITY_THRESHOLD = 0.82
+
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0001F1E6-\U0001F1FF"
+    "\U00002190-\U000021FF"
+    "\U00002B00-\U00002BFF"
+    "\uFE0F"
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def _strip_emoji(name):
+    """Hyperview's locationDisplay carries a leading emoji that other
+    systems' site names don't - strip it wherever a site name reaches a
+    user so Top Impacted Sites and similar widgets read consistently
+    instead of some entries having an icon and others not."""
+    return _EMOJI_RE.sub("", name or "").strip()
+
+
+def _normalize_site_name(name):
+    normalized = "".join(ch for ch in name if ch.isalnum() or ch.isspace())
+    return " ".join(normalized.lower().split())
+
+
+def _find_similar_site_names(names):
+    """Pairs of DIFFERENT site names that are suspiciously close (typo,
+    abbreviation, stray whitespace/emoji) - a likely sign the same physical
+    site is being counted twice under two slightly different names."""
+    normalized = sorted({n: _normalize_site_name(n) for n in names}.items())
+    pairs = []
+    for i, (name_a, norm_a) in enumerate(normalized):
+        for name_b, norm_b in normalized[i + 1:]:
+            if norm_a == norm_b or not norm_a or not norm_b:
+                continue
+            ratio = difflib.SequenceMatcher(None, norm_a, norm_b).ratio()
+            if ratio >= SITE_NAME_SIMILARITY_THRESHOLD:
+                pairs.append((name_a, name_b, ratio))
+    pairs.sort(key=lambda p: -p[2])
+    return pairs
+
+
+def _merge_cross_system_site_names(name_sets):
+    """Union site names across systems, collapsing ones that normalize the
+    same (case, emoji, stray whitespace) even though the raw strings don't
+    match - Hyperview's locationDisplay carries a leading emoji that
+    Downtime/Ooma's plain site names don't, so a plain set union counts the
+    same physical site twice: once per spelling."""
+    seen = {}
+    for names in name_sets:
+        for name in names:
+            key = _normalize_site_name(name)
+            if key and key not in seen:
+                seen[key] = name
+    return set(seen.values())
+
+
+def _ooma_overview_card():
+    ooma_data = _fetch_ooma_dashboard()
+    if ooma_data is None:
+        return {"key": "ooma", "name": "Ooma AirDial", "href": "/ooma",
+                "state": "Could not reach Ooma AirDial", "tone": "text-faint", "detail": "",
+                "critical": False, "open": None, "ack": None, "affected": None, "total_sites": None,
+                "last_updated": None, "site_names": None, "site_names_affected": None,
+                "site_issue_counts": None}
+    g = ooma_data["gauge"]
+    accounts = ooma_data["accounts"]
+    total_open = sum(r["open"] for r in ooma_data["summary"])
+    total_ack = sum(r["acknowledged"] for r in ooma_data["summary"])
+    affected = sum(1 for a in accounts if a.get("site"))
+    detail = f"{total_open} open issue(s) &middot; {affected} of {len(accounts)} sites affected"
+    critical = total_open > 0
+    ooma_site_names = {site for a in accounts if (site := OOMA_ACCOUNT_TO_SITE.get(a["account"]))}
+    ooma_site_names_affected = {site for a in accounts if a.get("site") and (site := OOMA_ACCOUNT_TO_SITE.get(a["account"]))}
+    ooma_site_issue_counts = {}
+    for a in accounts:
+        site = OOMA_ACCOUNT_TO_SITE.get(a["account"])
+        if site:
+            ooma_site_issue_counts[site] = ooma_site_issue_counts.get(site, 0) + _row_issue_total(
+                a, ("connectivity_issues", "battery_issues")
+            )
+    return {"key": "ooma", "name": "Ooma AirDial", "href": "/ooma", "state": g["state"], "tone": g["tone"],
+            "detail": detail, "critical": critical, "open": total_open, "ack": total_ack,
+            "affected": affected, "total_sites": len(accounts), "last_updated": ooma_data["last_updated"],
+            "site_names": ooma_site_names, "site_names_affected": ooma_site_names_affected,
+            "site_issue_counts": ooma_site_issue_counts}
+
+
+def _downtime_row_site(row):
+    group = row.get("strgroupname", "")
+    if group in DOWNTIME_GROUP_TO_SITE:
+        return DOWNTIME_GROUP_TO_SITE[group]
+    if group.startswith("AMB_"):
+        return row.get("strhostdesc") or None
+    return None
+
+
+def _downtime_overview_card():
+    rows = _fetch_downtime_data()
+    if rows is None:
+        return {"key": "downtime", "name": "Downtime Workstations", "href": "/downtime",
+                "state": "Could not reach Downtime Workstations", "tone": "text-faint", "detail": "",
+                "critical": False, "open": None, "ack": None, "affected": None, "total_sites": None,
+                "last_updated": None, "site_names": None, "site_names_affected": None,
+                "site_issue_counts": None}
+    candidates = [r for r in rows if r.get("strclassname") == "cssDeviceAlert"]
+    ping_results = _ping_hosts([r.get("strhostname") for r in candidates])
+    alerting = _downtime_issue_rows(rows, ping_results)
+    acks = _active_downtime_acks()
+    unacked_alerting = [r for r in alerting if r.get("strhostname") not in acks]
+    total_open = len(unacked_alerting)
+    total_ack = len(alerting) - total_open
+    if not alerting:
+        detail = f"All {len(rows)} workstation(s) reporting"
+    elif total_open:
+        detail = f"{total_open} not acknowledged &middot; {total_ack} acknowledged &middot; {len(rows)} total"
+    else:
+        detail = f"{total_ack} acknowledged &middot; {len(rows)} total"
+    critical = total_open > 0
+    all_sites = set()
+    alerting_sites = set()
+    site_issue_counts = {}
+    for r in rows:
+        site = _downtime_row_site(r)
+        if not site:
+            continue
+        all_sites.add(site)
+        if _downtime_row_is_issue(r, ping_results.get(r.get("strhostname"))):
+            alerting_sites.add(site)
+            site_issue_counts[site] = site_issue_counts.get(site, 0) + 1
+    most_recent = None
+    for r in rows:
+        try:
+            ts = datetime.strptime(r.get("strlastcheckin", ""), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        if most_recent is None or ts > most_recent:
+            most_recent = ts
+    last_updated = most_recent.strftime('%I:%M:%S %p').lstrip('0') if most_recent else None
+    if not alerting:
+        state = "All reporting"
+    elif total_open:
+        state = f"{total_open} not reporting"
+    else:
+        state = f"{total_ack} acknowledged"
+    approx_score = 100 if not rows else round(max(0, 100 - (len(alerting) / len(rows)) * 100))
+    tone = _health_tone(approx_score)
+    return {"key": "downtime", "name": "Downtime Workstations", "href": "/downtime",
+            "state": state, "tone": tone, "detail": detail, "critical": critical,
+            "open": total_open, "ack": total_ack, "affected": len(alerting_sites),
+            "total_sites": len(all_sites), "last_updated": last_updated,
+            "site_names": all_sites, "site_names_affected": alerting_sites,
+            "site_issue_counts": site_issue_counts}
+
+
+_OVERVIEW_CARD_BUILDERS = {
+    "hyperview": _hyperview_overview_card,
+    "ipro": _ipro_overview_card,
+    "ooma": _ooma_overview_card,
+    "downtime": _downtime_overview_card,
+}
+
+
+def _recent_activity_widget_html(system_labels_map, human_actions, limit=10):
+    """One 'Recent Activity' feed combining human actions with what the
+    monitored systems detected on their own, filtered client-side via an
+    All/Human/System toggle."""
+    since_ts = time.time() - 24 * 3600
+    events = [dict(a, kind="human") for a in human_actions]
+    for key, label in system_labels_map.items():
+        for a in _query_maintenance_actions(key, since_ts=since_ts):
+            if a["action"] not in ("alarm", "resolved"):
+                continue
+            a = dict(a, system_label=label, kind="system")
+            events.append(a)
+    if not events:
+        return ""
+    events.sort(key=lambda a: a["ts"], reverse=True)
+    events = events[:limit]
+
+    def event_row(a):
+        label, color = DEVICE_HISTORY_ACTION_META.get(a["action"], (a["action"], "var(--text-dim)"))
+        target = a["target"] or "-"
+        target_html = (
+            f'<a href="/device/{a["system"]}/{quote(a["target"], safe="")}">{_esc(target)}</a>'
+            if a["target"] else _esc(target)
+        )
+        return (
+            f'<tr data-kind="{a["kind"]}">'
+            f'<td class="time">{_esc(datetime.fromtimestamp(a["ts"]).strftime("%I:%M %p"))}</td>'
+            f'<td><span class="tag">{_esc(a["system_label"])}</span></td>'
+            f'<td><span class="tag" style="background:{color}22; color:{color};">{_esc(label)}</span></td>'
+            f'<td>{target_html}</td>'
+            f'<td>{_esc(a.get("incident_number")) or "-"}</td>'
+            f'<td>{_esc(a["set_by"])}</td></tr>'
+        )
+
+    rows = "".join(event_row(a) for a in events)
+    return f"""
+    <div class="panel">
+      <div class="panel-head">
+        <h2>Recent Activity</h2>
+        <div style="display:flex; align-items:center; gap:10px;">
+          <div class="trend-range-row" style="margin:0;">
+            <a href="#" class="range-btn active" data-activity-kind="all" onclick="return filterRecentActivity(this)">All</a>
+            <a href="#" class="range-btn" data-activity-kind="human" onclick="return filterRecentActivity(this)">Human</a>
+            <a href="#" class="range-btn" data-activity-kind="system" onclick="return filterRecentActivity(this)">System</a>
+          </div>
+          <span class="count-note">Last 24h</span>
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table id="recent-activity-table">
+          <tr><th>Time</th><th>System</th><th>Event</th><th>Target</th><th>Incident #</th><th>By</th></tr>
+          {rows}
+        </table>
+      </div>
+    </div>
+    <script>
+    function filterRecentActivity(btn) {{
+      var kind = btn.getAttribute('data-activity-kind');
+      var panel = btn.closest('.panel');
+      panel.querySelectorAll('.range-btn').forEach(function (b) {{ b.classList.remove('active'); }});
+      btn.classList.add('active');
+      panel.querySelectorAll('#recent-activity-table tr[data-kind]').forEach(function (tr) {{
+        tr.style.display = (kind === 'all' || tr.getAttribute('data-kind') === kind) ? '' : 'none';
+      }});
+      return false;
+    }}
+    </script>"""
+
+
+def _card_urgency(c):
+    """Urgency tier from a system's open/ack counts. 'open' and 'ack' are
+    independent tallies (not a split of the same issues), so any open
+    issue stays 'urgent' regardless of ack count."""
+    if c["open"] is None:
+        return "unreachable"
+    if c["open"]:
+        return "urgent"
+    if c["ack"]:
+        return "resolved"
+    return "normal"
+
+
+def _status_card_alert_class(c):
+    urgency = _card_urgency(c)
+    if urgency == "urgent":
+        return f" status-alert tone-{c['tone']}"
+    if urgency == "resolved":
+        return f" status-solid tone-{c['tone']}"
+    return ""
+
+
+def _status_stat(num, label, unhealthy=False):
+    cls = " unhealthy" if unhealthy else ""
+    return (
+        f'<div class="status-stat"><div class="status-stat-num{cls}">{num}</div>'
+        f'<div class="status-stat-lbl">{_esc(label)}</div></div>'
+    )
+
+
+def _status_stats_html(c):
+    if c["open"] is None:
+        return f'<div class="status-unreachable">{_esc(c["state"])}</div>'
+    stats = [
+        _status_stat(c["open"], "Open", unhealthy=bool(c["open"])),
+        _status_stat(c["ack"], "Acknowledged"),
+    ]
+    if c["total_sites"]:
+        stats.append(_status_stat(f'{c["affected"]}/{c["total_sites"]}', "Sites Affected", unhealthy=bool(c["affected"])))
+    return f'<div class="status-stats">{"".join(stats)}</div>'
+
+
+def _status_card_sort_key(c):
+    urgency = _card_urgency(c)
+    if urgency == "urgent":
+        return 0 if c["tone"] == "danger" else 1
+    if urgency == "resolved":
+        return 2
+    if urgency == "unreachable":
+        return 4
+    return 3
+
+
+def _status_card_html(c):
+    """The same status card used on the Overview page - reused verbatim on
+    the unified videowall so the two never drift into two different designs
+    for the same four systems."""
+    return f"""
+      <a class="panel status-panel{_status_card_alert_class(c)}" href="{c['href']}">
+        <div class="status-id">
+          <span class="status-dot" style="background:var(--{c['tone']})"></span>
+          <div>
+            <h2>{_esc(c['name'])}</h2>
+            <div class="status-state">{_esc(c['state']) if c['open'] is not None else ''}</div>
+          </div>
+        </div>
+        {_status_stats_html(c)}
+        {f'<div class="status-updated">As of {_esc(c["last_updated"])}</div>' if c.get('last_updated') else ''}
+        <span class="status-trend" onclick="event.preventDefault(); event.stopPropagation(); location.href='/trends?range=24h&system={c['key']}';" title="Open full trend history">
+          <span class="status-trend-label">Last 16h</span>
+          {_sparkline_svg(c['key'])}
+        </span>
+      </a>"""
+
 
 @app.route("/overview")
 @require_login
 def overview_page(username):
-    allowed = USERS[username]["systems"]
+    allowed = _user_systems(username)
+    wanted = [key for key in ("hyperview", "ipro", "ooma", "downtime") if key in allowed]
     cards = []
-    if "hyperview" in allowed:
-        state, tone, detail, critical = "Could not reach Hyperview", "text-faint", "", False
+    if wanted:
+        pool = ThreadPoolExecutor(max_workers=len(wanted))
         try:
-            resp = requests.get(f"{HYPERVIEW_BASE_URL}/overall-health", timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            health = resp.json()[0]
-            state = health["state"]
-            tone = "ok" if health["health"] == 100 else "warn" if health["health"] >= 70 else "danger"
-            critical = tone == "danger"
-            summary_resp = requests.get(f"{HYPERVIEW_BASE_URL}/category-summary", timeout=REQUEST_TIMEOUT)
-            summary_resp.raise_for_status()
-            all_row = next((c for c in summary_resp.json() if "All" in c.get("category", "")), None)
-            if all_row:
-                detail = f"{all_row['open']} open issue(s) &middot; {all_row['ack']} acknowledged"
-        except (requests.RequestException, KeyError, IndexError, ValueError):
-            pass
-        cards.append(("Hyperview", "/hyperview", state, tone, detail, critical))
-    if "ipro" in allowed:
-        ipro_data = _fetch_ipro_dashboard()
-        if ipro_data is None:
-            cards.append(("iPRO Cameras", "/ipro", "Could not reach iPRO Cameras", "text-faint", "", False))
-        else:
-            g = ipro_data["gauge"]
-            totals = ipro_data["totals"]
-            total_open = sum(r["open"] for r in ipro_data["summary"])
-            detail = (f"{total_open} open issue(s) &middot; {totals['unhealthyCameras']} of "
-                      f"{totals['totalCameras']} cameras unhealthy")
-            critical = any(d["status"] in ("Offline", "Infrastructure Issue") for d in ipro_data["devices"])
-            cards.append(("iPRO Cameras", "/ipro", _health_state_label(g["score"]), g["tone"], detail, critical))
-    if "ooma" in allowed:
-        ooma_data = _fetch_ooma_dashboard()
-        if ooma_data is None:
-            cards.append(("Ooma AirDial", "/ooma", "Could not reach Ooma AirDial", "text-faint", "", False))
-        else:
-            g = ooma_data["gauge"]
-            accounts = ooma_data["accounts"]
-            total_open = sum(r["open"] for r in ooma_data["summary"])
-            affected = sum(1 for a in accounts if a.get("site"))
-            detail = f"{total_open} open issue(s) &middot; {affected} of {len(accounts)} sites affected"
-            critical = any(a["severity"].strip().lower() == "critical" for a in ooma_data["issues"])
-            cards.append(("Ooma AirDial", "/ooma", g["state"], g["tone"], detail, critical))
+            futures = {key: pool.submit(_OVERVIEW_CARD_BUILDERS[key]) for key in wanted}
+            result_timeout = REQUEST_TIMEOUT + 15
+            cards = [futures[key].result(timeout=result_timeout) for key in wanted]
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
-    has_critical = any(critical for *_, critical in cards)
+    urgent_cards = [c for c in cards if _card_urgency(c) == "urgent"]
+    calm_cards = [c for c in cards if _card_urgency(c) == "resolved"]
+    has_critical = bool(urgent_cards)
+    has_acked_only = (not has_critical) and bool(calm_cards)
+    alert_tone_cards = urgent_cards if has_critical else calm_cards
+    worst_tone = "danger" if any(c["tone"] == "danger" for c in alert_tone_cards) else "warn"
 
-    # Reuses the exact .panel/.panel-head shell every other dashboard page
-    # is built from (see HYPERVIEW_COMPONENT_CSS) rather than a bespoke
-    # card style, so this page reads as part of the same family instead
-    # of a one-off landing screen. New systems just append another card
-    # here the same way ipro/ooma/hyperview do above - nothing about the
-    # markup or CSS is specific to today's three.
-    cards_html = "".join(f"""
-      <a class="panel status-panel" href="{href}">
-        <div class="panel-head"><h2>{_esc(name)}</h2></div>
-        <div class="status-body">
-          <span class="status-dot" style="background:var(--{tone})"></span>
-          <span class="status-state">{_esc(state)}</span>
+    reachable = [c for c in cards if c["open"] is not None]
+    stats_html = ""
+    if cards:
+        total_open = sum(c["open"] for c in reachable)
+        total_ack = sum(c["ack"] for c in reachable)
+        all_site_names = _merge_cross_system_site_names(c["site_names"] for c in reachable if c["site_names"])
+        all_site_names_affected = _merge_cross_system_site_names(
+            c["site_names_affected"] for c in reachable if c["site_names_affected"]
+        )
+        total_affected = len(all_site_names_affected)
+        total_sites_all = len(all_site_names)
+        systems_critical = sum(1 for c in cards if c["tone"] == "danger")
+        unreachable_count = len(cards) - len(reachable)
+        dash = '<span class="dash-mark">&mdash;</span>'
+        stats_html = f"""
+    <div class="panel">
+      <div class="stat-row">
+        <div class="stat-tile{' unhealthy' if reachable and total_open else ''}">
+          <div class="stat-num">{total_open if reachable else dash}</div>
+          <div class="stat-lbl">Needs Acknowledgment</div>
         </div>
-        {f'<div class="status-detail">{detail}</div>' if detail else ''}
-      </a>""" for name, href, state, tone, detail, _critical in cards)
+        <div class="stat-tile">
+          <div class="stat-num">{total_ack if reachable else dash}</div>
+          <div class="stat-lbl">Acknowledged</div>
+        </div>
+        <div class="stat-tile{' unhealthy' if reachable and total_affected else ''}">
+          <div class="stat-num">{f'{total_affected} / {total_sites_all}' if reachable else dash}</div>
+          <div class="stat-lbl">Sites Affected</div>
+        </div>
+        <div class="stat-tile{' unhealthy' if systems_critical else ''}">
+          <div class="stat-num">{systems_critical if reachable else dash} / {len(reachable) or len(cards)}</div>
+          <div class="stat-lbl">Systems Critical</div>
+        </div>
+        <div class="stat-tile{' unhealthy' if unreachable_count else ''}">
+          <div class="stat-num">{unreachable_count} / {len(cards)}</div>
+          <div class="stat-lbl">Unreachable</div>
+        </div>
+      </div>
+    </div>"""
 
-    # Maintenance/event-search only ever cover the auth-forwarding
-    # bridges (see accessible_systems) - Hyperview has no windows/events
-    # of its own, so an account with only hyperview access sees no
-    # Maintenance/Event search link here, same as it sees no
-    # Maintenance/Event search nav items with anything to act on. Kiosk
-    # mode is offered unconditionally - its routes are unauthenticated
-    # already (see the "kiosk" section below), so the link exposes
-    # nothing this account couldn't already reach by URL.
-    quick_link_items = ["<a class=\"quick-link\" href=\"/kiosk\">Kiosk mode &rarr;</a>"]
-    if accessible_systems(username):
-        quick_link_items = [
-            "<a class=\"quick-link\" href=\"/maintenance\">Maintenance &rarr;</a>",
-            "<a class=\"quick-link\" href=\"/events-search\">Event search &rarr;</a>",
-        ] + quick_link_items
-    quick_links_html = f"""
-        <div class="panel">
-          <div class="panel-head"><h2>Quick Links</h2></div>
-          <div class="quick-links">{''.join(quick_link_items)}</div>
-        </div>"""
+    sorted_cards = sorted(cards, key=_status_card_sort_key)
+    cards_html = "".join(_status_card_html(c) for c in sorted_cards)
+
+    icon_link_items = ["<a href=\"/videowall\">&#9635; Videowall</a>"]
+    if _is_admin(username) or _user_has_operations(username):
+        icon_link_items = ["<a href=\"/handoff\">&#8644; Shift handoff</a>"] + icon_link_items
+    if accessible_full_systems(username) or "downtime" in _user_full_systems(username):
+        icon_link_items = [
+            "<a href=\"/acknowledge\">&#10003; Acknowledge</a>",
+            "<a href=\"/events-search\">&#128269; Event search</a>",
+        ] + icon_link_items
+    icon_links_html = f'<div class="icon-links">{"".join(icon_link_items)}</div>'
+
+    merged_issue_counts = {}
+    site_best_system = {}
+    for c in reachable:
+        for name, count in (c["site_issue_counts"] or {}).items():
+            merged_issue_counts[name] = merged_issue_counts.get(name, 0) + count
+            if count > site_best_system.get(name, (None, -1))[1]:
+                site_best_system[name] = (c["key"], count)
+    top_sites = sorted((i for i in merged_issue_counts.items() if i[1] > 0), key=lambda i: -i[1])[:5]
+    top_sites_banner_html = ""
+    if top_sites:
+        # Each chip links to the system contributing the most of that site's issues.
+        chips = "".join(
+            f'<a class="chip" href="/device/{site_best_system[name][0]}/{quote(name, safe="")}">'
+            f'<span class="chip-count">{count}</span>{_esc(name)}</a>'
+            for name, count in top_sites
+        )
+        top_sites_banner_html = f"""
+    <div class="panel">
+      <div class="panel-head"><h2>Top Impacted Sites</h2></div>
+      <div class="site-chips-row">{chips}</div>
+    </div>"""
+
+    system_labels_map = {key: cfg["label"] for key, cfg in accessible_systems(username).items()}
+    if "hyperview" in allowed:
+        system_labels_map["hyperview"] = "Hyperview"
+    if "downtime" in allowed:
+        system_labels_map["downtime"] = "Downtime Workstations"
+
+    human_actions = []
+    activity_since_ts = time.time() - 24 * 3600
+    for key, label in system_labels_map.items():
+        for a in _query_maintenance_actions(key, since_ts=activity_since_ts):
+            if a["action"] in ("alarm", "resolved"):
+                continue  # system-detected - the widget's own "System" side already covers both
+            a["system_label"] = label
+            human_actions.append(a)
+    human_actions.sort(key=lambda a: a["ts"], reverse=True)
+    # Not sliced to the display limit here - _recent_activity_widget_html
+    # merges this with system-detected events and applies the limit itself,
+    # once, on the combined list. Pre-truncating here would silently drop a
+    # quieter system's real events (e.g. Hyperview's rare upstream-detected
+    # acknowledgements) whenever a busier system's actions filled the slice
+    # first, even though they'd have made the final merged top-10 easily.
+    recent_activity_html = _recent_activity_widget_html(system_labels_map, human_actions, limit=10)
+
+    planned = []
+    for key, cfg in accessible_systems(username).items():
+        for s in _pending_scheduled_maintenance(key):
+            s["system_label"] = cfg["label"]
+            planned.append(s)
+    planned.sort(key=lambda s: s["start_at"])
+    planned_banner_html = ""
+    if planned:
+        items = "; ".join(
+            f'{_esc(p["system_label"])}: {_esc(p["target"])} at '
+            f'{_esc(datetime.fromtimestamp(p["start_at"]).strftime("%b %d, %I:%M %p"))}'
+            for p in planned
+        )
+        plural = "s are" if len(planned) != 1 else " is"
+        planned_banner_html = f"""
+    <div class="msg ok">{len(planned)} maintenance window{plural} scheduled: {items}</div>"""
+
+    cards_inner_html = cards_html or '<p class="empty">Your account has no systems assigned.</p>'
+    cards_grid_html = f'<div class="status-grid">{cards_inner_html}</div>'
+
+    # Left column: Top Impacted Sites stacked above Recent Activity, both
+    # half-width. Right column: the system cards grid. Side by side, not
+    # stacked - falls back to just the cards grid (full width) if there's
+    # nothing to show on the left.
+    left_col_parts = [p for p in (top_sites_banner_html, recent_activity_html) if p]
+    if left_col_parts:
+        left_col_html = f'<div style="display:flex; flex-direction:column; gap:14px;">{"".join(left_col_parts)}</div>'
+        top_and_activity_html = f'<div class="overview-main-row">{left_col_html}{cards_grid_html}</div>'
+        cards_grid_html = ""
+    else:
+        top_and_activity_html = ""
 
     body = f"""
-    <h1>System overview</h1>
-    <p class="sub">One login for every Covenant Health facility system you have access to
-    &mdash; camera health, emergency phone lines, and site infrastructure today, with more
-    systems landing here over time.</p>
+    <div class="page-header">
+      <div>
+        <h1>System overview</h1>
+        <p class="sub">A live snapshot of every system you have access to.</p>
+      </div>
+      {icon_links_html}
+    </div>
     <style>{DASHBOARD_BASE_CSS}</style>
-    <div class="status-grid">{cards_html or '<p class="empty">Your account has no systems assigned.</p>'}</div>
-    {quick_links_html}
-    {_critical_alert_script(has_critical)}
+    {planned_banner_html}
+    {stats_html}
+    {top_and_activity_html}
+    {cards_grid_html}
+    {_critical_alert_script(has_critical, has_acked_only, worst_tone, total_open if cards else None)}
+    {DASHBOARD_AUTO_REFRESH_SCRIPT}
     """
     return Response(render_shell("Overview", body, "overview", username), mimetype="text/html")
 
 
-# --- Hyperview dashboard --------------------------------------------------
-# Shared between the logged-in /hyperview page (responsive down to phone
-# widths via RESPONSIVE_DASHBOARD_CSS) and the unauthenticated
-# /hyperview/kiosk wall display - same rendering logic, different CSS
-# theme and auto-refresh interval (see the %(...)s placeholders each page
-# fills in). Talks only to /hyperview/api/* (this portal's own proxy),
-# never straight to HYPERVIEW_BASE_URL - keeps the real matrix.py host out
-# of client-side JS entirely.
+# Shift handoff acceptance: one 'pending' row at a time, stays pending
+# until a DIFFERENT operator accepts it.
+
+def _pending_shift_handoff():
+    conn = _maintenance_log_db()
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM shift_handoffs WHERE status = 'pending' ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _create_shift_handoff(notes, created_by):
+    """Refuses to create a new handoff while one is already pending - the
+    outgoing shift must wait for the current one to be accepted rather than
+    stacking a second handoff on top of an unacknowledged one."""
+    if _pending_shift_handoff():
+        return None, "A handoff is already pending acceptance - it must be accepted before a new one can be started."
+    conn = _maintenance_log_db()
+    try:
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO shift_handoffs (created_at, created_by, notes, status) VALUES (?, ?, ?, 'pending')",
+            (now, created_by, (notes or "").strip()[:4000]),
+        )
+        conn.commit()
+        return now, None
+    finally:
+        conn.close()
+
+
+def _accept_shift_handoff(handoff_id, accepted_by):
+    """Accepts by id, not 'whatever is pending', so a stale page can't
+    accept the wrong handoff. Refuses a self-accept."""
+    conn = _maintenance_log_db()
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM shift_handoffs WHERE id = ? AND status = 'pending'", (handoff_id,)
+        ).fetchone()
+        if row is None:
+            return "That handoff is no longer pending."
+        if row["created_by"] == accepted_by:
+            return "You can't accept your own handoff - it needs to be accepted by the operator taking over."
+        conn.execute(
+            "UPDATE shift_handoffs SET status = 'accepted', accepted_at = ?, accepted_by = ? WHERE id = ?",
+            (int(time.time()), accepted_by, handoff_id),
+        )
+        conn.commit()
+        return None
+    finally:
+        conn.close()
+
+
+def _recent_shift_handoffs(limit=10):
+    conn = _maintenance_log_db()
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM shift_handoffs ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def _search_shift_handoffs(q=None, since_ts=None, until_ts=None):
+    """Full, filterable/pageable history behind /handoff/history. q matches
+    notes and either side of the handoff."""
+    conn = _maintenance_log_db()
+    try:
+        conn.row_factory = sqlite3.Row
+        query = "SELECT * FROM shift_handoffs WHERE 1=1"
+        params = []
+        if since_ts is not None:
+            query += " AND created_at >= ?"
+            params.append(since_ts)
+        if until_ts is not None:
+            query += " AND created_at <= ?"
+            params.append(until_ts)
+        query += " ORDER BY created_at DESC"
+        rows = [dict(r) for r in conn.execute(query, params).fetchall()]
+    finally:
+        conn.close()
+    if q:
+        q = q.strip().lower()
+        rows = [
+            h for h in rows
+            if q in (h.get("notes") or "").lower()
+            or q in (h.get("created_by") or "").lower()
+            or q in (h.get("accepted_by") or "").lower()
+        ]
+    return rows
+
+
+def _pending_handoff_banner_html(username):
+    """Shown on every page, not just /handoff, so acceptance can't be
+    avoided by not visiting the report. No dismiss button."""
+    if not (_is_admin(username) or _user_has_operations(username)):
+        return ""
+    pending = _pending_shift_handoff()
+    if not pending:
+        return ""
+    when = datetime.fromtimestamp(pending["created_at"]).strftime("%b %d, %I:%M %p")
+    can_accept = pending["created_by"] != username
+    action_html = (
+        f'<form method="post" action="/handoff/accept" style="display:inline;">'
+        f'<input type="hidden" name="handoff_id" value="{pending["id"]}">'
+        f'<button type="submit" class="ghost">Accept Handoff</button></form>'
+        if can_accept else
+        '<span class="count-note">Waiting for another operator to accept</span>'
+    )
+    notes_preview = f': &ldquo;{_esc(pending["notes"])}&rdquo;' if pending.get("notes") else ""
+    return f"""
+    <div class="msg warn handoff-banner">
+      <span>Shift handoff pending from <strong>{_esc(pending["created_by"])}</strong> at {_esc(when)}{notes_preview}
+      &mdash; <a href="/handoff">review it</a>.</span>
+      {action_html}
+    </div>"""
+
+
+_HYPERVIEW_ROW_CELLS = (
+    lambda a: f'<td class="loc" data-label="Location"><span class="sev-dot"></span>{_esc(a["location"])}</td>',
+    lambda a: f'<td class="dev" data-label="Device">{_esc(a["device"])}{_ack_tag_html(a.get("acknowledged"))}</td>',
+    lambda a: f'<td data-label="Severity">{_esc(a["severity"])}</td>',
+    lambda a: f'<td data-label="Alarm">{_esc(a["alarm"])}{_hyperview_runbook_hint_html(a.get("device"), a.get("alarm"))}</td>',
+)
+
+
+def _hyperview_alarm_rows_html(alarms):
+    return _alarm_rows_html(alarms, lambda a: _severity_row_class(a["severity"]), _HYPERVIEW_ROW_CELLS)
+
+
+def _handoff_hyperview_section():
+    try:
+        resp = requests.get(f"{HYPERVIEW_BASE_URL}/active-alarm-log", timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        alarms = resp.json()
+    except (requests.RequestException, ValueError, KeyError):
+        return _bridge_unreachable_html("Hyperview", HYPERVIEW_BASE_URL)
+    rows = _hyperview_alarm_rows_html(alarms)
+    return f"""
+    <div class="panel">
+      <div class="panel-head"><h2>Hyperview</h2><span class="count-note">{len(alarms)} active alarm(s)</span></div>
+      <div class="matrix-wrap">
+        <table class="alarmlog">
+          <thead><tr><th>Location</th><th>Device</th><th>Severity</th><th>Alarm</th></tr></thead>
+          <tbody>{rows or '<tr><td colspan="4" class="empty">No active alarms.</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>"""
+
+
+def _handoff_ipro_section():
+    data = _fetch_ipro_dashboard()
+    if data is None:
+        return _bridge_unreachable_html("iPRO Cameras", SYSTEMS["ipro"]["base_url"])
+    rows = _ipro_device_rows_html(data["devices"])
+    open_count = _ipro_open_device_count(data["devices"])
+    return f"""
+    <div class="panel">
+      <div class="panel-head"><h2>iPRO Cameras</h2><span class="count-note">{open_count} open issue(s) &middot; {len(data['devices'])} total</span></div>
+      <div class="matrix-wrap">
+        <table class="alarmlog">
+          <thead><tr><th>Location</th><th>Device</th><th>Status</th><th>Detail</th><th>Duration</th><th>Priority</th></tr></thead>
+          <tbody>{rows or '<tr><td colspan="6" class="empty">No open camera issues.</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>"""
+
+
+def _handoff_ooma_section():
+    data = _fetch_ooma_dashboard()
+    if data is None:
+        return _bridge_unreachable_html("Ooma AirDial", SYSTEMS["ooma"]["base_url"])
+    rows = _ooma_issue_rows_html(data["issues"])
+    open_count = _ooma_open_issue_count(data["issues"])
+    return f"""
+    <div class="panel">
+      <div class="panel-head"><h2>Ooma AirDial</h2><span class="count-note">{open_count} open issue(s) &middot; {len(data['issues'])} total</span></div>
+      <div class="matrix-wrap">
+        <table class="alarmlog">
+          <thead><tr><th>Location</th><th>Device</th><th>Severity</th><th>Detail</th><th>Category</th></tr></thead>
+          <tbody>{rows or '<tr><td colspan="5" class="empty">No open AirDial issues.</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>"""
+
+
+def _handoff_downtime_section():
+    rows = _fetch_downtime_data()
+    if rows is None:
+        return _bridge_unreachable_html("Downtime Workstations", DOWNTIME_FEED_URL)
+    candidates = [r for r in rows if r.get("strclassname") == "cssDeviceAlert"]
+    ping_results = _ping_hosts([r.get("strhostname") for r in candidates])
+    alerting = sorted(
+        _downtime_issue_rows(rows, ping_results),
+        key=lambda r: -(r.get("intlastcheckin_hoursold") or 0),
+    )
+    acks = _active_downtime_acks()
+
+    def row_html(r):
+        hostname = r.get("strhostname")
+        tag = _ack_tag_html(hostname in acks)
+        return (
+            f'<tr><td class="loc" data-label="Group">{_esc(r.get("strgroupname"))}</td>'
+            f'<td class="dev" data-label="Workstation">{_esc(hostname)}{tag}</td>'
+            f'<td data-label="Description">{_esc(r.get("strhostdesc"))}</td>'
+            f'<td data-label="Since">{_esc(r.get("intlastcheckin_hoursold"))}h</td></tr>'
+        )
+
+    rows_html = "".join(row_html(r) for r in alerting)
+    return f"""
+    <div class="panel">
+      <div class="panel-head"><h2>Downtime Workstations</h2><span class="count-note">{len(alerting)} not reporting</span></div>
+      <div class="matrix-wrap">
+        <table class="alarmlog">
+          <thead><tr><th>Group</th><th>Workstation</th><th>Description</th><th>Since</th></tr></thead>
+          <tbody>{rows_html or '<tr><td colspan="4" class="empty">All workstations reporting normally.</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>"""
+
+
+_HANDOFF_SECTION_BUILDERS = {
+    "hyperview": _handoff_hyperview_section,
+    "ipro": _handoff_ipro_section,
+    "ooma": _handoff_ooma_section,
+    "downtime": _handoff_downtime_section,
+}
+
+
+def _handoff_workflow_panel_html(username):
+    """A pending handoff to accept (full notes), or the close-out form when
+    nothing's pending, plus recent history."""
+    pending = _pending_shift_handoff()
+    parts = []
+    if pending:
+        when = datetime.fromtimestamp(pending["created_at"]).strftime("%A, %B %-d at %-I:%M %p")
+        can_accept = pending["created_by"] != username
+        notes_html = (
+            f'<p style="white-space:pre-wrap;">{_esc(pending["notes"])}</p>' if pending.get("notes")
+            else '<p class="empty">No notes were left.</p>'
+        )
+        action_html = (
+            f'<form method="post" action="/handoff/accept">'
+            f'<input type="hidden" name="handoff_id" value="{pending["id"]}">'
+            f'<button type="submit">Accept Handoff</button></form>'
+            if can_accept else
+            '<p class="count-note">You created this handoff - the operator taking over needs to accept it, not you.</p>'
+        )
+        parts.append(f"""
+        <div class="panel handoff-pending-panel">
+          <div class="panel-head"><h2>Pending Handoff</h2><span class="count-note">from {_esc(pending["created_by"])} &middot; {_esc(when)}</span></div>
+          <div style="padding:14px 18px;">
+            {notes_html}
+            {action_html}
+          </div>
+        </div>""")
+    else:
+        parts.append(f"""
+        <div class="panel">
+          <div class="panel-head"><h2>End of Shift</h2></div>
+          <form method="post" action="/handoff/create" style="padding:14px 18px;">
+            <label for="handoff-notes">Notes for the next shift</label>
+            <textarea id="handoff-notes" name="notes" rows="4" placeholder="What to watch, what's in progress, anything unusual..."></textarea>
+            <button type="submit">Create Handoff</button>
+          </form>
+        </div>""")
+
+    history = _recent_shift_handoffs(limit=5)
+    if history:
+        def hist_row(h):
+            created = datetime.fromtimestamp(h["created_at"]).strftime("%b %d, %I:%M %p")
+            if h["status"] == "accepted":
+                status_html = f'<span class="tag" style="background:var(--ok)22; color:var(--ok);">Accepted</span> by {_esc(h["accepted_by"])}'
+            else:
+                status_html = '<span class="tag" style="background:var(--warn)22; color:var(--warn);">Pending</span>'
+            return (
+                f'<tr><td class="time">{_esc(created)}</td><td>{_esc(h["created_by"])}</td>'
+                f'<td>{_esc(h.get("notes")) or "-"}</td><td>{status_html}</td></tr>'
+            )
+        parts.append(f"""
+        <div class="panel">
+          <div class="panel-head"><h2>Recent Handoffs</h2></div>
+          <div class="table-scroll"><table>
+            <tr><th>Created</th><th>By</th><th>Notes</th><th>Status</th></tr>
+            {"".join(hist_row(h) for h in history)}
+          </table></div>
+          <div style="padding:10px 18px; border-top:1px solid var(--border);">
+            <a href="/handoff/history" style="font-size:12px; font-weight:600;">View all handoffs &rarr;</a>
+          </div>
+        </div>""")
+    return "".join(parts)
+
+
+@app.route("/handoff/create", methods=["POST"])
+@require_login
+def handoff_create(username):
+    if not _is_admin(username) and not _user_has_operations(username):
+        return _error_page(username, "Your account does not have the Operations permission needed for Shift Handoff.")
+    _, err = _create_shift_handoff(request.form.get("notes", ""), username)
+    if err:
+        return _redirect_msg("/handoff", error=err)
+    return _redirect_msg("/handoff", message='Handoff created - waiting for the next shift to accept it.')
+
+
+@app.route("/handoff/accept", methods=["POST"])
+@require_login
+def handoff_accept(username):
+    if not _is_admin(username) and not _user_has_operations(username):
+        return _error_page(username, "Your account does not have the Operations permission needed for Shift Handoff.")
+    handoff_id = request.form.get("handoff_id", type=int)
+    if not handoff_id:
+        return _redirect_msg("/handoff", error='No handoff specified')
+    err = _accept_shift_handoff(handoff_id, username)
+    if err:
+        return _redirect_msg("/handoff", error=err)
+    return _redirect_msg("/handoff", message='Handoff accepted - you have the shift.')
+
+
+HANDOFF_HISTORY_PER_PAGE = 25
+
+
+@app.route("/handoff/history")
+@require_login
+def handoff_history_page(username):
+    if not _is_admin(username) and not _user_has_operations(username):
+        return _error_page(username, "Your account does not have the Operations permission needed for Shift Handoff.")
+
+    q = request.args.get("q", "").strip()
+    since = request.args.get("since", "")
+    until = request.args.get("until", "")
+    since_ts = _parse_local_datetime(since)
+    until_ts = _parse_local_datetime(until)
+
+    all_rows = _search_shift_handoffs(q or None, since_ts, until_ts)
+    total = len(all_rows)
+    try:
+        page = max(1, int(request.args.get("page", "1")))
+    except ValueError:
+        page = 1
+    total_pages = max(1, -(-total // HANDOFF_HISTORY_PER_PAGE))
+    page = min(page, total_pages)
+    start = (page - 1) * HANDOFF_HISTORY_PER_PAGE
+    page_rows = all_rows[start:start + HANDOFF_HISTORY_PER_PAGE]
+
+    def row_html(h):
+        created = datetime.fromtimestamp(h["created_at"]).strftime("%Y-%m-%d %I:%M %p")
+        if h["status"] == "accepted":
+            accepted_at = datetime.fromtimestamp(h["accepted_at"]).strftime("%Y-%m-%d %I:%M %p")
+            status_html = (
+                f'<span class="tag" style="background:var(--ok)22; color:var(--ok);">Accepted</span> '
+                f'by {_esc(h["accepted_by"])} at {_esc(accepted_at)}'
+            )
+        else:
+            status_html = '<span class="tag" style="background:var(--warn)22; color:var(--warn);">Pending</span>'
+        return (
+            f'<tr><td class="time">{_esc(created)}</td><td>{_esc(h["created_by"])}</td>'
+            f'<td>{_esc(h.get("notes")) or "-"}</td><td>{status_html}</td></tr>'
+        )
+
+    rows_html = "".join(row_html(h) for h in page_rows)
+
+    def nav_url(**overrides):
+        params = {"q": q, "since": since, "until": until, "page": page}
+        params.update(overrides)
+        qs = "&".join(f"{k}={quote(str(v))}" for k, v in params.items() if v)
+        return f"/handoff/history?{qs}"
+
+    active_filters = bool(q or since or until)
+    pager_html = ""
+    if total_pages > 1:
+        pager_html = f"""
+        <div class="radio-row" style="align-items:center; justify-content:space-between; margin-top:10px;">
+          <span class="sub" style="margin:0;">Page {page} of {total_pages} &middot; {total} total</span>
+          <div class="radio-row" style="gap:6px;">
+            {f'<a class="ghost" href="{nav_url(page=page - 1)}">&larr; Prev</a>' if page > 1 else '<span class="ghost" style="opacity:.4;">&larr; Prev</span>'}
+            {f'<a class="ghost" href="{nav_url(page=page + 1)}">Next &rarr;</a>' if page < total_pages else '<span class="ghost" style="opacity:.4;">Next &rarr;</span>'}
+          </div>
+        </div>"""
+
+    body = f"""
+    <div class="page-header">
+      <div>
+        <h1>Handoff History</h1>
+        <p class="sub">Every shift handoff on record - who created it, who accepted it, and when.</p>
+      </div>
+    </div>
+    <style>{DASHBOARD_BASE_CSS}</style>
+    <div class="panel">
+      <div class="panel-head"><h2>Search</h2></div>
+      <form method="get" action="/handoff/history" class="log-filter-row" style="padding:14px 18px;">
+        <input type="text" name="q" placeholder="Search notes / by / accepted by" value="{_esc(q)}">
+        <input type="datetime-local" name="since" value="{_esc(since)}">
+        <input type="datetime-local" name="until" value="{_esc(until)}">
+        <button type="submit">Filter</button>
+        {'<a class="ghost" href="/handoff/history">Clear</a>' if active_filters else ''}
+      </form>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h2>Handoffs</h2><span class="count-note">{total} total</span></div>
+      <div class="table-scroll"><table>
+        <tr><th>Created</th><th>By</th><th>Notes</th><th>Status</th></tr>
+        {rows_html or '<tr><td colspan="4" class="empty">No handoffs match this filter.</td></tr>'}
+      </table></div>
+      {pager_html}
+    </div>
+    """
+    return Response(render_shell("Handoff History", body, "handoff", username), mimetype="text/html")
+
+
+def _rack_audit_parse_date(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _rack_audit_last_audit_html(value):
+    dt = _rack_audit_parse_date(value)
+    if dt is None:
+        return '<span class="overdue">Never audited</span>'
+    days = max(0, (datetime.now(dt.tzinfo) - dt).days)
+    return f'<span class="overdue">{days} day{"s" if days != 1 else ""} ago</span> &middot; {_esc(dt.strftime("%b %-d, %Y"))}'
+
+
+RACK_AUDIT_ELEVATION_CSS = """
+  .ra-target { padding: 22px 24px 24px; display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+  .ra-target .site-tag { display: inline-block; font-size: 11px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.05em; color: var(--teal); background: var(--teal-tint); padding: 3px 9px; border-radius: 20px;
+    margin-bottom: 10px; }
+  .ra-target h2 { margin: 0 0 6px; font-size: 24px; }
+  .ra-target .meta { font-size: 13.5px; color: var(--text-dim); }
+  .ra-target .meta .overdue { color: var(--danger); font-weight: 700; }
+  .ra-sheet { max-width: 900px; margin: 20px auto 0; background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); box-shadow: var(--shadow-sm); padding: 30px 36px; }
+  .ra-sheet .ra-sheet-head { display: flex; justify-content: space-between; border-bottom: 3px solid var(--teal);
+    padding-bottom: 12px; margin-bottom: 18px; }
+  .ra-sheet .ra-sheet-head h1 { margin: 0; font-size: 17px; color: var(--teal-dark); }
+  .ra-id-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
+  .ra-id-grid .f-lbl { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-faint); }
+  .ra-id-grid .f-val { font-size: 13.5px; font-weight: 700; margin-top: 2px; }
+  .ra-elevation-row { display: flex; gap: 20px; margin-bottom: 20px; flex-wrap: wrap; }
+  .ra-elevation-col .ev-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 700;
+    color: var(--text-dim); margin-bottom: 5px; text-align: center; }
+  .ra-elevation { width: 140px; border: 2px solid var(--text); border-radius: 4px; overflow: hidden; }
+  .ra-elevation .u-row { display: flex; align-items: center; height: 21px; border-bottom: 1px solid var(--border); font-size: 9px; }
+  .ra-elevation .u-num { width: 20px; text-align: center; color: var(--text-faint); border-right: 1px solid var(--border);
+    height: 100%; display: flex; align-items: center; justify-content: center; background: var(--panel-raised); }
+  .ra-elevation .u-slot { flex: 1; padding: 0 5px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .ra-elevation .u-slot.filled { background: var(--teal-tint); font-weight: 600; }
+  .ra-elevation .u-slot.empty { color: var(--text-faint); }
+  table.ra-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  table.ra-table th, table.ra-table td { padding: 6px 7px; border-bottom: 1px solid var(--border); text-align: left; }
+  table.ra-table th { font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-faint);
+    background: var(--panel-raised); font-weight: 700; }
+  table.ra-table td.chk { text-align: center; width: 55px; }
+  table.ra-table .box { display: inline-block; width: 13px; height: 13px; border: 1.5px solid var(--text-dim); border-radius: 2px; }
+  @media print { .ra-sheet { border: none; box-shadow: none; padding: 0; } }
+"""
+
+
+def _rack_audit_elevation_html(assets, side, total_u=None):
+    """Always draws the rack's full physical height (U1 through its real
+    provided-rack-units capacity), not just the span between the highest
+    and lowest occupied slot - an audit sheet should show the whole rack,
+    empty space included, not a cropped view of only what's mounted.
+    Falls back to the occupied range if Hyperview has no recorded height
+    for this rack at all."""
+    rows = [a for a in assets if (a.get("side") or "").lower() == side and a.get("u_location") is not None]
+    by_u = {a["u_location"]: a for a in rows}
+    if total_u:
+        lo, hi = 1, total_u
+    elif by_u:
+        lo, hi = min(by_u), max(by_u)
+    else:
+        return '<div class="ra-elevation"><div class="u-row"><div class="u-slot empty" style="text-align:center; flex:1;">&mdash; none &mdash;</div></div></div>'
+    html = ['<div class="ra-elevation">']
+    for u in range(hi, lo - 1, -1):
+        a = by_u.get(u)
+        cls = "filled" if a else "empty"
+        label = _esc(a["name"]) if a else "&mdash;"
+        html.append(f'<div class="u-row"><div class="u-num">{u}</div><div class="u-slot {cls}">{label}</div></div>')
+    html.append("</div>")
+    return "".join(html)
+
+
+@app.route("/tools/rack-audit")
+@require_login
+def rack_audit_page(username):
+    if "hyperview" not in _user_systems(username):
+        return _error_page(username, "Your account does not have access to Hyperview")
+
+    sites = _rack_audit_eligible_sites(username)
+    assignment_html = (
+        f"Every site (no shift-specific AD group matched)" if sites is None
+        else ", ".join(sorted(sites)) if sites else "No sites (your AD group grants an empty scope)"
+    )
+
+    result, error = _rack_audit_next(sites)
+    if error:
+        body = f"""
+        <div class="page-header"><div><h1>Rack Audit</h1></div></div>
+        {_msg_html()}
+        <div class="msg err">{_esc(error)}</div>
+        """
+        return Response(render_shell("Rack Audit", body, "rack-audit", username), mimetype="text/html")
+
+    rack, assets = result
+    asset_rows = "".join(
+        f'<tr><td>{a["u_location"] if a.get("u_location") is not None else "&mdash;"}</td>'
+        f'<td>{_esc((a.get("side") or "").capitalize() or "&mdash;")}</td>'
+        f'<td>{_esc(a["name"])}</td><td>{_esc(a.get("type") or "")}</td>'
+        f'<td>{_esc(" ".join(x for x in (a.get("manufacturer"), a.get("model")) if x))}</td>'
+        f'<td>{_esc(", ".join(a.get("power_sources") or [])) or "&mdash;"}</td>'
+        f'<td class="chk"><span class="box"></span></td><td class="chk"><span class="box"></span></td><td></td></tr>'
+        for a in assets
+    )
+
+    body = f"""
+    <div class="page-header">
+      <div>
+        <h1>Rack Audit</h1>
+        <p class="sub">Automatically targeted &mdash; there's nothing to search or pick.</p>
+      </div>
+      <button class="ghost print-btn" onclick="window.print()" type="button">Generate (Print / Save as PDF)</button>
+    </div>
+    <style>{DASHBOARD_BASE_CSS}{RACK_AUDIT_ELEVATION_CSS}</style>
+    {_msg_html()}
+    <div class="panel">
+      <div class="assign-note" style="font-size:12.5px; color:var(--text-faint); padding:10px 20px; background:var(--panel-raised); border-bottom:1px solid var(--border);">
+        <strong style="color:var(--text-dim);">Your assignment:</strong> {assignment_html}
+      </div>
+      <div class="ra-target">
+        <div>
+          <span class="site-tag">{_esc(rack["site"])}</span>
+          <h2>{_esc(rack["name"] or rack["id"])}</h2>
+          <div class="meta">Last audited {_rack_audit_last_audit_html(rack["last_audit"])}</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="ra-sheet">
+      <div class="ra-sheet-head">
+        <h1>Rack Audit Sheet</h1>
+        <div style="font-size:11.5px; color:var(--text-faint);">Generated {_esc(datetime.now().strftime("%b %-d, %Y &middot; %-I:%M %p"))}</div>
+      </div>
+      <div class="ra-id-grid">
+        <div><div class="f-lbl">Site</div><div class="f-val">{_esc(rack["site"])}</div></div>
+        <div><div class="f-lbl">Rack</div><div class="f-val">{_esc(rack["name"] or rack["id"])}</div></div>
+        <div><div class="f-lbl">Assets</div><div class="f-val">{len(assets)}</div></div>
+        <div><div class="f-lbl">Auditor</div><div class="f-val">{_esc(username)}</div></div>
+      </div>
+      <div class="ra-elevation-row">
+        <div class="ra-elevation-col"><div class="ev-label">Front</div>{_rack_audit_elevation_html(assets, "front", rack.get("total_u"))}</div>
+        <div class="ra-elevation-col"><div class="ev-label">Rear</div>{_rack_audit_elevation_html(assets, "rear", rack.get("total_u"))}</div>
+      </div>
+      <table class="ra-table">
+        <thead><tr><th>U</th><th>Side</th><th>Device</th><th>Type</th><th>Model</th><th>Power</th><th class="chk">Present</th><th class="chk">Labeled</th><th>Notes</th></tr></thead>
+        <tbody>{asset_rows or '<tr><td colspan="9" class="empty">No assets.</td></tr>'}</tbody>
+      </table>
+      <div style="margin-top:20px; display:flex; justify-content:space-between; font-size:11.5px; color:var(--text-faint);">
+        <div style="border-top:1px solid var(--text-dim); width:220px; padding-top:4px;">Auditor signature &amp; date</div>
+        <div>InfraWatch &middot; Covenant Health IT</div>
+      </div>
+    </div>
+
+    <div class="panel" style="max-width:900px; margin:16px auto 0;">
+      <div style="padding:16px 24px; display:flex; align-items:center; justify-content:space-between; gap:16px;">
+        <div style="font-size:13px; color:var(--text-dim);">Walked the rack? Mark it done &mdash; this is the only step that touches Hyperview.</div>
+        <form method="POST" action="/tools/rack-audit/complete" style="margin:0;">
+          <input type="hidden" name="rack_id" value="{_esc(rack['id'])}">
+          <input type="hidden" name="rack_name" value="{_esc(rack['name'] or rack['id'])}">
+          <button class="btn" style="background:var(--ok); color:#fff; border:none; padding:11px 22px; border-radius:8px; font-weight:700; cursor:pointer;" type="submit">&#10003; Mark Audit Complete</button>
+        </form>
+      </div>
+    </div>
+    """
+    return Response(render_shell("Rack Audit", body, "rack-audit", username), mimetype="text/html")
+
+
+@app.route("/tools/rack-audit/complete", methods=["POST"])
+@require_login
+def rack_audit_complete_action(username):
+    if "hyperview" not in _user_systems(username):
+        return Response("Your account does not have access to Hyperview", 403)
+    rack_id = request.form.get("rack_id", "")
+    rack_name = request.form.get("rack_name", rack_id)
+    if not rack_id:
+        return _redirect_msg("/tools/rack-audit", error="No rack selected")
+    error = _rack_audit_mark_complete(rack_id)
+    if error:
+        return _redirect_msg("/tools/rack-audit", error=error)
+    try:
+        _log_maintenance_action("hyperview", "rack_audited", rack_name, "rack", None, username)
+    except Exception:
+        pass
+    return _redirect_msg("/tools/rack-audit", message=f"Marked {rack_name} audited")
+
+
+@app.route("/handoff")
+@require_login
+def handoff_page(username):
+    if not _is_admin(username) and not _user_has_operations(username):
+        return _error_page(username, "Your account does not have the Operations permission needed for Shift Handoff.")
+    allowed = _user_systems(username)
+    wanted = [key for key in ("hyperview", "ipro", "ooma", "downtime") if key in allowed]
+    sections = []
+    if wanted:
+        pool = ThreadPoolExecutor(max_workers=len(wanted))
+        try:
+            futures = {key: pool.submit(_HANDOFF_SECTION_BUILDERS[key]) for key in wanted}
+            result_timeout = REQUEST_TIMEOUT + 15
+            sections = [futures[key].result(timeout=result_timeout) for key in wanted]
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    since = request.args.get("since", "")
+    until = request.args.get("until", "")
+    full_allowed = _user_full_systems(username)
+    search_wanted = [key for key in wanted if key in full_allowed and (key in SYSTEMS or key == "downtime")]
+    search_sections = []
+    if (since or until) and search_wanted:
+        for key in search_wanted:
+            if key == "downtime":
+                rows, err = _fetch_merged_downtime_events()
+                label, base_url = "Downtime Workstations", DOWNTIME_FEED_URL
+            else:
+                cfg = SYSTEMS[key]
+                rows, err = _fetch_merged_events(key, cfg)
+                label, base_url = cfg["label"], cfg["base_url"]
+            if err:
+                search_sections.append(_bridge_unreachable_html(label, base_url))
+                continue
+            search_sections.append(f"""
+            <div class="panel">
+              <div class="panel-head"><h2>{_esc(label)}</h2><span class="count-note">{len(rows)} event(s) in range</span></div>
+              <div class="matrix-wrap">
+                <table class="alarmlog">
+                  <thead><tr><th>Time</th><th>Event</th><th>Device</th><th>Type</th><th>Change</th></tr></thead>
+                  <tbody>{_merged_event_rows_html(rows)}</tbody>
+                </table>
+              </div>
+            </div>""")
+
+    search_form = ""
+    if search_wanted:
+        search_form = f"""
+        <div class="panel">
+          <div class="panel-head"><h2>Search events in range</h2></div>
+          <form method="get" action="/handoff" class="filters">
+            <div class="field">
+              <label for="since-input">Since</label>
+              <input type="datetime-local" id="since-input" name="since" value="{_esc(since)}">
+            </div>
+            <div class="field">
+              <label for="until-input">Until</label>
+              <input type="datetime-local" id="until-input" name="until" value="{_esc(until)}">
+            </div>
+            <button type="submit">Search</button>
+          </form>
+        </div>"""
+
+    generated_at = datetime.now().strftime("%A, %B %-d, %Y at %-I:%M %p")
+    body = f"""
+    <div class="page-header">
+      <div>
+        <h1>Shift Handoff Report</h1>
+      </div>
+      <div class="page-action" style="text-align:right;">
+        <button class="ghost print-btn" onclick="window.print()" type="button">Print / Save as PDF</button>
+        <div class="handoff-timestamp">Generated {generated_at}</div>
+      </div>
+    </div>
+    <style>{DASHBOARD_BASE_CSS}</style>
+    {_msg_html()}
+    {_handoff_workflow_panel_html(username)}
+    {''.join(sections) or '<p class="empty">Your account has no systems assigned.</p>'}
+    {search_form}
+    {''.join(search_sections)}
+    """
+    return Response(render_shell("Shift Handoff", body, "handoff", username), mimetype="text/html")
+
+
+TRENDS_SYSTEM_LABELS = {
+    "hyperview": "Hyperview", "ipro": "iPRO Cameras", "ooma": "Ooma AirDial",
+    "downtime": "Downtime Workstations", "combined": "Combined (All Systems)",
+}
+
+TREND_HOVER_SCRIPT = """
+<script>
+(function () {
+  document.querySelectorAll('.trend-hoverable').forEach(function (wrap) {
+    var pts;
+    try { pts = JSON.parse(wrap.dataset.points); } catch (e) { return; }
+    if (!pts || !pts.length) return;
+    var dot = wrap.querySelector('.trend-hover-dot');
+    var tip = wrap.querySelector('.trend-hover-tip');
+    var svg = wrap.querySelector('svg.trend-chart');
+    if (!dot || !tip || !svg) return;
+
+    function pointAt(clientX) {
+      var rect = svg.getBoundingClientRect();
+      var frac = rect.width ? (clientX - rect.left) / rect.width : 0;
+      frac = Math.max(0, Math.min(1, frac));
+      var idx = Math.round(frac * (pts.length - 1));
+      return pts[idx];
+    }
+
+    function show(clientX) {
+      var p = pointAt(clientX);
+      dot.style.left = p.x + '%';
+      dot.style.top = p.y + 'px';
+      dot.hidden = false;
+      var d = new Date(p.t * 1000);
+      var timeStr = d.toLocaleString(undefined, {month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'});
+      tip.textContent = timeStr + ' \\u2014 ' + p.v;
+      tip.style.left = p.x + '%';
+      tip.style.top = p.y + 'px';
+      tip.hidden = false;
+    }
+    function hide() { dot.hidden = true; tip.hidden = true; }
+
+    svg.addEventListener('mousemove', function (e) { show(e.clientX); });
+    svg.addEventListener('mouseleave', hide);
+    svg.addEventListener('touchmove', function (e) {
+      if (e.touches && e.touches[0]) show(e.touches[0].clientX);
+    }, {passive: true});
+    svg.addEventListener('touchend', hide);
+  });
+})();
+</script>
+"""
+
+
+def _trends_url(range_key, system_key, metric, rescale, show_zero):
+    return (
+        f"/trends?range={range_key}&system={system_key}&metric={metric}"
+        f"&scale={'auto' if rescale else 'full'}&zero={'1' if show_zero else '0'}"
+    )
+
+
+@app.route("/trends")
+@require_login
+def trends_page(username):
+    allowed = _user_full_systems(username)
+    wanted = [key for key in ("hyperview", "ipro", "ooma", "downtime") if key in allowed]
+    if not wanted:
+        return _error_page(username, "Your account does not have Full Control access to any system's Trends.")
+
+    range_key = request.args.get("range", TRENDS_DEFAULT_RANGE)
+    if range_key not in TRENDS_RANGE_HOURS:
+        range_key = TRENDS_DEFAULT_RANGE
+    until_ts = time.time()
+    since_ts = until_ts - TRENDS_RANGE_HOURS[range_key] * 3600
+    bucket_seconds = 3600 if range_key == "24h" else 86400
+
+    metric = request.args.get("metric", "score")
+    if metric not in ("score", "activity"):
+        metric = "score"
+
+    system_param = request.args.get("system", wanted[0])
+    if system_param == "all":
+        selected_systems = list(wanted)
+    else:
+        selected_systems = [k for k in system_param.split(",") if k in wanted or k == "combined"]
+    if metric == "activity":
+        # "Combined" has no activity series of its own - it's a health-score-only concept.
+        selected_systems = [k for k in selected_systems if k != "combined"]
+    if not selected_systems:
+        selected_systems = [wanted[0]]
+    if metric == "activity" and len(selected_systems) > 1:
+        selected_systems = selected_systems[:1]
+    systems_param_value = ",".join(selected_systems)
+
+    show_zero = request.args.get("zero") == "1"
+    rescale = request.args.get("scale", "auto") == "auto"
+
+    range_buttons = "".join(
+        f'<a href="{_trends_url(key, systems_param_value, metric, rescale, show_zero)}" '
+        f'class="range-btn{" active" if key == range_key else ""}">{key}</a>'
+        for key in TRENDS_RANGE_HOURS
+    )
+    zero_toggle = (
+        f'<a href="{_trends_url(range_key, systems_param_value, metric, rescale, not show_zero)}" '
+        f'class="range-btn{" active" if show_zero else ""}">'
+        f'{"Hide" if show_zero else "Show"} empty periods</a>'
+    )
+    scale_toggle = (
+        f'<a href="{_trends_url(range_key, systems_param_value, metric, not rescale, show_zero)}" '
+        f'class="range-btn{" active" if rescale else ""}" '
+        f'title="Zoom the health-score axis to the actual data range instead of the fixed 0-100 scale">'
+        f'{"Show full scale (0-100)" if rescale else "Zoom to data"}</a>'
+    )
+    metric_options = "".join(
+        f'<option value="{_trends_url(range_key, systems_param_value if m != "activity" else selected_systems[0], m, rescale, show_zero)}"'
+        f'{" selected" if m == metric else ""}>{label}</option>'
+        for m, label in (("score", "Health Score"), ("activity", "Activity"))
+    )
+    if metric == "score" and len(wanted) > 1:
+        checkbox_keys = list(wanted) + ["combined"]
+        system_selector_html = "".join(
+            f'<label class="trend-sys-check"><input type="checkbox" class="trend-sys-cb" value="{key}"'
+            f'{" checked" if key in selected_systems else ""} onchange="updateTrendSystems(this)"> '
+            f'{_esc(TRENDS_SYSTEM_LABELS[key])}</label>'
+            for key in checkbox_keys
+        )
+        system_selector_script = """
+        <script>
+        function updateTrendSystems(cb) {
+          var boxes = document.querySelectorAll('.trend-sys-cb:checked');
+          if (!boxes.length) { cb.checked = true; return; }
+          var vals = Array.prototype.map.call(boxes, function (b) { return b.value; });
+          var url = new URL(window.location.href);
+          url.searchParams.set('system', vals.join(','));
+          window.location.href = url.toString();
+        }
+        </script>"""
+    else:
+        system_options = "".join(
+            f'<option value="{_trends_url(range_key, s, metric, rescale, show_zero)}"'
+            f'{" selected" if s == selected_systems[0] else ""}>{_esc(TRENDS_SYSTEM_LABELS[s])}</option>'
+            for s in wanted
+        )
+        system_selector_html = f'<select onchange="location.href=this.value">{system_options}</select>'
+        system_selector_script = ""
+    selector_row = f"""
+    <div class="trend-range-row" style="padding:0 18px 14px;">
+      <label class="trend-selector">Systems
+        {system_selector_html}
+      </label>
+      <label class="trend-selector">Metric
+        <select onchange="location.href=this.value">{metric_options}</select>
+      </label>
+    </div>
+    {system_selector_script}"""
+
+    hover_script = ""
+    if metric == "score" and len(selected_systems) > 1:
+        series_by_key = [(key, _trend_points_for_key(key, wanted, since_ts, until_ts)) for key in selected_systems]
+        if rescale:
+            all_scores = [s for _, pts in series_by_key for _, s in pts]
+            overlay_range = _score_range(all_scores) if all_scores else None
+        else:
+            overlay_range = None
+        chart_html = _trend_overlay_chart_svg(
+            series_by_key, y_range=overlay_range,
+            since_ts=since_ts, until_ts=until_ts, bucket_seconds=bucket_seconds,
+        )
+        legend_html = _trend_overlay_legend_html(series_by_key)
+        stat_row = ""
+        panel_title = " vs ".join(TRENDS_SYSTEM_LABELS[k] for k in selected_systems)
+        toggles = scale_toggle
+    elif metric == "score":
+        system_key = selected_systems[0]
+        points = _trend_points_for_key(system_key, wanted, since_ts, until_ts)
+        chart_range = _score_range([s for _, s in points]) if rescale and points else None
+        chart_html = _trend_chart_svg(
+            points, y_range=chart_range,
+            since_ts=since_ts, until_ts=until_ts, bucket_seconds=bucket_seconds,
+        )
+        legend_html = ""
+        if points:
+            scores = [s for _, s in points]
+            uptime = _uptime_pct(points)
+            stat_row = f"""
+            <div class="trend-stats">
+              <div class="trend-stat"><strong>{scores[-1]}</strong>Current</div>
+              <div class="trend-stat"><strong>{round(sum(scores) / len(scores))}</strong>Average</div>
+              <div class="trend-stat"><strong>{min(scores)}</strong>Worst</div>
+              <div class="trend-stat"><strong>{uptime}%</strong>Uptime</div>
+              <div class="trend-stat"><strong>{len(points)}</strong>Samples shown</div>
+            </div>"""
+        else:
+            stat_row = ""
+        panel_title = _esc(TRENDS_SYSTEM_LABELS[system_key])
+        toggles = scale_toggle
+        hover_script = TREND_HOVER_SCRIPT
+    else:
+        system_key = selected_systems[0]
+        series_keys = (
+            ["ack"] + (["incident"] if system_key != "hyperview" else [])
+            + (["restart"] if system_key == "downtime" else []) + ["resolved"]
+        )
+        activity_buckets = _activity_series(system_key, since_ts, until_ts, bucket_seconds)
+        if not show_zero:
+            activity_buckets = [(b, c) for b, c in activity_buckets if any(c[k] for k in series_keys)]
+        chart_html = _activity_chart_svg(activity_buckets, bucket_seconds, series_keys)
+        legend_html = _activity_legend_html(series_keys)
+        stat_row = ""
+        panel_title = f"{_esc(TRENDS_SYSTEM_LABELS[system_key])} Activity"
+        toggles = zero_toggle
+
+    reliability_html = _device_reliability_section_html(username, since_ts, until_ts, range_key) if _is_admin(username) else ""
+
+    body = f"""
+    <div class="page-header">
+      <div>
+        <h1>Trends</h1>
+        <p class="sub">Health score history and activity for the systems you have access to.</p>
+      </div>
+      <a class="ghost page-action" href="/trends.csv?range={range_key}">Download CSV &darr;</a>
+    </div>
+    <style>{DASHBOARD_BASE_CSS}</style>
+    <div class="panel" style="margin-bottom:16px;">
+      <div style="padding:14px 18px;" class="trend-range-row">{range_buttons}<span class="trend-range-sep"></span>{toggles}</div>
+      {selector_row}
+    </div>
+    <div class="panel" id="trend-{'-'.join(selected_systems)}">
+      <div class="panel-head"><h2>{panel_title}</h2></div>
+      <div style="padding:14px 18px;">
+        {chart_html}
+        {stat_row}
+        {legend_html}
+      </div>
+    </div>
+    {hover_script}
+    {reliability_html}
+    """
+    return Response(render_shell("Trends", body, "trends", username), mimetype="text/html")
+
+
+def _device_reliability_section_html(username, since_ts, until_ts, range_key):
+    """Cross-system worst-offenders list, folded into Trends (admin-only,
+    same as it was as its own page) so reliability and the score/activity
+    charts share one range selector instead of two separate pages each
+    with their own range picker."""
+    rows = _cross_system_reliability_rows(username, since_ts, until_ts)
+
+    def row_html(r):
+        return (
+            f'<tr><td><span class="tag">{_esc(r["system_label"])}</span></td>'
+            f'<td>{_esc(r["device"])}</td>'
+            f'<td class="n">{r["incidents"]}</td>'
+            f'<td class="n">{_esc(_format_duration(r["total_seconds"]))}</td></tr>'
+        )
+
+    rows_html = "".join(row_html(r) for r in rows[:50])
+    return f"""
+    <div class="panel" style="margin-top:16px;">
+      <div class="panel-head"><h2>Device Reliability</h2></div>
+      <div style="padding:14px 18px;">
+        <p class="sub" style="margin-top:-6px;">Worst offenders across every system, {range_key} - ranked by
+        total downtime, then incident count.</p>
+        <div class="table-scroll"><table>
+          <tr><th>System</th><th>Device</th><th>Incidents</th><th>Total Downtime</th></tr>
+          {rows_html or '<tr><td colspan="4" class="empty">No incidents recorded in this range.</td></tr>'}
+        </table></div>
+      </div>
+    </div>
+    """
+
+
+@app.route("/trends.csv")
+@require_login
+def trends_csv(username):
+    allowed = _user_full_systems(username)
+    wanted = [key for key in ("hyperview", "ipro", "ooma", "downtime") if key in allowed]
+    if not wanted:
+        return Response("Your account does not have Full Control access to any system's Trends.", 403)
+
+    range_key = request.args.get("range", TRENDS_DEFAULT_RANGE)
+    if range_key not in TRENDS_RANGE_HOURS:
+        range_key = TRENDS_DEFAULT_RANGE
+    until_ts = time.time()
+    since_ts = until_ts - TRENDS_RANGE_HOURS[range_key] * 3600
+    bucket_seconds = 3600 if range_key == "24h" else 86400
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Period", "System", "Avg Health Score", "Uptime %", "Acknowledgments", "Incidents Logged", "Service Restarts", "Issues Cleared"])
+    for key in wanted:
+        points = _history_points(key, since_ts, until_ts, max_points=100000)
+        score_buckets = {}
+        for ts, score in points:
+            b = int(ts // bucket_seconds) * bucket_seconds
+            score_buckets.setdefault(b, []).append(score)
+        for b, counts in _activity_series(key, since_ts, until_ts, bucket_seconds):
+            scores = score_buckets.get(b, [])
+            avg_score = round(sum(scores) / len(scores)) if scores else ""
+            uptime = f"{_uptime_pct([(0, s) for s in scores])}%" if scores else ""
+            writer.writerow([
+                _bucket_label(b, bucket_seconds), TRENDS_SYSTEM_LABELS[key],
+                avg_score, uptime, counts["ack"],
+                counts["incident"] if key != "hyperview" else "",
+                counts["restart"] if key == "downtime" else "",
+                counts["resolved"],
+            ])
+    filename = f"trends-{range_key}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
+    return Response(
+        buf.getvalue(), mimetype="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
 
 HYPERVIEW_SCRIPT = """
 <script>
@@ -1556,20 +6870,25 @@ function escapeHtml(s) {
   return div.innerHTML;
 }
 
-// location-health-matrix / clinic-health-matrix rows score each category
-// as: 0 = clear, 1-999 = that many OPEN issues, 1000+ = ALL currently
-// acknowledged (subtract 1000 for the real count) - see
-// _score_category_total in matrix.py.
+function ackTagHtml(acknowledged) {
+  return acknowledged ? ' <span class="tag">Acknowledged</span>' : '';
+}
+
+// Hyperview's locationDisplay carries a leading emoji that other systems'
+// site names don't - strip it so this live board reads the same as the
+// server-rendered dashboards, which already strip it (_strip_emoji).
+function stripEmoji(s) {
+  return String(s || '').replace(
+    /[\\u{1F300}-\\u{1FAFF}\\u{2600}-\\u{27BF}\\u{1F1E6}-\\u{1F1FF}\\u{2190}-\\u{21FF}\\u{2B00}-\\u{2BFF}\\u{FE0F}]/gu, ''
+  ).trim();
+}
+
 function categoryCellHtml(count) {
   if (count === 0) return '<span class="clear-mark">&#10003;</span>';
   if (count >= 1000) return '<span class="badge ack">' + (count - 1000) + '</span>';
   return '<span class="badge open">' + count + '</span>';
 }
 
-// data-label attributes below are inert on the kiosk page and above the
-// RESPONSIVE_DASHBOARD_CSS breakpoint - only that media query's
-// responsive-table rules read them, to turn each row into a stacked
-// label:value card on a narrow /hyperview viewport.
 function renderMatrixTable(tbodyId, rows) {
   const tbody = document.getElementById(tbodyId);
   tbody.innerHTML = '';
@@ -1577,7 +6896,7 @@ function renderMatrixTable(tbodyId, rows) {
     const tr = document.createElement('tr');
     if (r.site) tr.className = 'affected';
     tr.innerHTML =
-      '<td class="site-cell" data-label="Location">' + escapeHtml(r.locationDisplay) + '</td>' +
+      '<td class="site-cell" data-label="Location">' + escapeHtml(stripEmoji(r.locationDisplay)) + '</td>' +
       '<td data-label="Power">' + categoryCellHtml(r.power) + '</td>' +
       '<td data-label="Cooling">' + categoryCellHtml(r.facilities) + '</td>' +
       '<td data-label="Server">' + categoryCellHtml(r.compute) + '</td>' +
@@ -1596,33 +6915,41 @@ function renderSummary(categories) {
     tr.innerHTML =
       '<td data-label="Category">' + escapeHtml(c.category) + '</td>' +
       '<td class="n open-n" data-label="Open">' + c.open + '</td>' +
-      '<td class="n ack-n" data-label="Ack\\'d">' + c.ack + '</td>';
+      '<td class="n ack-n" data-label="Acknowledged">' + c.ack + '</td>';
     tbody.appendChild(tr);
   }
 }
 
-// Gauge is a fixed 251.2-length semicircle arc (see the SVG path in both
-// pages) - dashoffset walks it from fully-hidden (0%% health) to
-// fully-drawn (100%% health).
-const GAUGE_ARC_LENGTH = 251.2;
+function healthTone(score) {
+  return score === 100 ? 'ok' : score >= 70 ? 'warn' : 'danger';
+}
 
-function renderGauge(health) {
-  const scoreEl = document.getElementById('gauge-score');
-  const fillEl = document.getElementById('gauge-fill');
-  const bannerEl = document.getElementById('status-banner');
+function healthStateLabel(score) {
+  if (score === 100) return 'Healthy';
+  if (score >= 70) return 'Degraded';
+  return 'Critical';
+}
+
+const HEALTH_ICONS = {
+  ok: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>',
+  warn: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4M12 17h.01M10.3 3.9L2.7 17a2 2 0 0 0 1.7 3h15.2a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>',
+  danger: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg>',
+};
+
+function renderGauge(health, detail) {
+  const medallionEl = document.getElementById('health-medallion');
+  const iconEl = document.getElementById('health-icon');
+  const stateEl = document.getElementById('health-state');
+  const detailEl = document.getElementById('health-detail');
   const redundancyEl = document.getElementById('redundancy-alert');
 
-  // gauge-score-lbl stays a static "Health score" caption (see the HTML
-  // below) - same convention _gauge_html() uses for iPRO/Ooma - the
-  // dynamic state text lives in the banner only, not duplicated in both
-  // places.
-  const color = health.health === 100 ? 'var(--ok)' : health.health >= 70 ? 'var(--warn)' : 'var(--danger)';
-  scoreEl.textContent = health.health;
-  scoreEl.style.color = color;
-  fillEl.setAttribute('stroke', color);
-  fillEl.setAttribute('stroke-dashoffset', String(GAUGE_ARC_LENGTH * (1 - health.health / 100)));
-  bannerEl.textContent = health.emoji + ' ' + health.state;
-  bannerEl.style.background = color;
+  const tone = healthTone(health.health);
+  medallionEl.className = 'health-medallion health-tint-' + tone;
+  iconEl.className = 'health-tone-' + tone;
+  iconEl.innerHTML = HEALTH_ICONS[tone];
+  stateEl.className = 'health-state health-tone-' + tone;
+  stateEl.textContent = healthStateLabel(health.health);
+  detailEl.textContent = detail || '';
 
   if (health.redundancyAlerts && health.redundancyAlerts.length) {
     redundancyEl.style.display = 'flex';
@@ -1633,20 +6960,88 @@ function renderGauge(health) {
   }
 }
 
-function renderAlarmLog(rows) {
+const ALERT_TYPE_FUZZY_MATCH_THRESHOLD = 0.90;
+
+function normalizeAlertText(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
+}
+
+function bigrams(s) {
+  const out = [];
+  for (let i = 0; i < s.length - 1; i++) out.push(s.slice(i, i + 2));
+  return out;
+}
+
+function bigramDiceRatio(a, b) {
+  const ba = bigrams(a), bb = bigrams(b);
+  if (!ba.length || !bb.length) return 0;
+  const counts = {};
+  ba.forEach(function (g) { counts[g] = (counts[g] || 0) + 1; });
+  let overlap = 0;
+  bb.forEach(function (g) {
+    if (counts[g] > 0) { overlap++; counts[g]--; }
+  });
+  return (2 * overlap) / (ba.length + bb.length);
+}
+
+// Same idea as the server's _alert_type_match_ratio (exact-substring, else
+// best fuzzy ratio over a same-length sliding window) but bigram-based
+// since there's no difflib in the browser - normally agrees with the
+// server's verdict, may differ slightly on edge cases.
+function alertTypeMatchRatio(alertType, alarmText) {
+  const needle = normalizeAlertText(alertType);
+  const haystack = normalizeAlertText(alarmText);
+  if (!needle || !haystack) return 0;
+  if (haystack.indexOf(needle) !== -1) return 1;
+  const n = needle.length;
+  if (n < 2 || n > haystack.length) return 0;
+  let best = 0;
+  for (let start = 0; start <= haystack.length - n; start++) {
+    const ratio = bigramDiceRatio(needle, haystack.slice(start, start + n));
+    if (ratio > best) best = ratio;
+  }
+  return best;
+}
+
+function runbookHintHtml(device, alarmText, hints) {
+  const entries = (hints || {})[device];
+  if (!entries || !entries.length) return '';
+  let bestEntry = null, bestRatio = 0;
+  entries.forEach(function (e) {
+    const ratio = alertTypeMatchRatio(e.alert_type, alarmText);
+    if (ratio > bestRatio) { bestRatio = ratio; bestEntry = e; }
+  });
+  const exactOrFuzzyMatch = bestRatio >= ALERT_TYPE_FUZZY_MATCH_THRESHOLD;
+  const matched = exactOrFuzzyMatch || entries.length === 1;
+  const match = exactOrFuzzyMatch ? bestEntry : entries[0];
+  const parts = [];
+  if (match.action) parts.push(escapeHtml(match.action));
+  if (match.contact) parts.push(escapeHtml(match.contact) + (match.phone ? ' (' + escapeHtml(match.phone) + ')' : ''));
+  if (!parts.length) return '';
+  if (matched) {
+    return '<span class="runbook-hint">&#128214; ' + parts.join(' &middot; ') + '</span>';
+  }
+  return '<span class="runbook-hint runbook-hint-unconfirmed">&#9888; No exact alert match - showing this ' +
+    "device's general entry, verify before acting: " + parts.join(' &middot; ') + '</span>';
+}
+
+function renderAlarmLog(rows, hints) {
   const tbody = document.getElementById('alarmlog-body');
   tbody.innerHTML = '';
   if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="3" class="empty">No active alarms.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="4" class="empty">No active alarms.</td></tr>';
     return;
   }
   for (const r of rows) {
     const tr = document.createElement('tr');
     tr.className = String(r.severity).toLowerCase() === 'critical' ? 'sev-critical' : 'sev-warning';
+    const ackedTag = ackTagHtml(r.acknowledged);
+    const runbookHtml = runbookHintHtml(r.device, r.alarm, hints);
     tr.innerHTML =
       '<td class="loc" data-label="Location"><span class="sev-dot"></span>' + escapeHtml(r.location) + '</td>' +
-      '<td class="dev" data-label="Device">' + escapeHtml(r.device) + '</td>' +
-      '<td data-label="Alarm">' + escapeHtml(r.alarm) + '</td>';
+      '<td class="dev" data-label="Device">' + escapeHtml(r.device) + ackedTag + '</td>' +
+      '<td data-label="Severity">' + escapeHtml(r.severity) + '</td>' +
+      '<td data-label="Alarm">' + escapeHtml(r.alarm) + runbookHtml + '</td>';
     tbody.appendChild(tr);
   }
 }
@@ -1655,42 +7050,39 @@ async function refreshAll() {
   const contentEl = document.getElementById('hv-content');
   const unreachableEl = document.getElementById('hv-unreachable');
   try {
-    const [health, summary, hospitals, clinics, alarms, lastUpdated] = await Promise.all([
+    const [health, summary, hospitals, clinics, alarms, lastUpdated, runbookHints] = await Promise.all([
       fetch('/hyperview/api/overall-health').then(r => r.json()).then(rows => rows[0]),
       fetch('/hyperview/api/category-summary').then(r => r.json()),
       fetch('/hyperview/api/location-health-matrix').then(r => r.json()),
       fetch('/hyperview/api/clinic-health-matrix').then(r => r.json()),
       fetch('/hyperview/api/active-alarm-log').then(r => r.json()),
       fetch('/hyperview/api/last-updated').then(r => r.json()).then(rows => rows[0]),
+      fetch('/hyperview/runbook/hints').then(r => r.json()).catch(() => ({})),
     ]);
-    renderGauge(health);
+    const allRow = summary.find(function (c) { return c.category.indexOf('All') !== -1; });
+    const gaugeDetail = allRow ? (allRow.open + ' open issue(s) · ' + allRow.ack + ' acknowledged') : '';
+    renderGauge(health, gaugeDetail);
     renderSummary(summary);
     renderMatrixTable('hospitals-body', hospitals);
     renderMatrixTable('clinics-body', clinics);
-    renderAlarmLog(alarms);
+    renderAlarmLog(alarms, runbookHints);
     document.getElementById('hosp-note').textContent =
       hospitals.filter(r => r.site).length + ' of ' + hospitals.length + ' affected';
     document.getElementById('clinic-note').textContent =
       clinics.filter(r => r.site).length + ' of ' + clinics.length + ' affected';
     document.getElementById('alarm-note').textContent =
       alarms.length + ' device' + (alarms.length === 1 ? '' : 's');
-    // matrix.py's own last completed poll cycle (same {timestamp: epoch-ms
-    // or null} shape ooma.py's /last-updated uses - see its docstring),
-    // not "when this browser's fetch happened" - a page left open for a
-    // while, or a poll that's fallen behind, would otherwise silently
-    // claim data is fresher than it actually is.
     const lastUpdatedEl = document.getElementById('hv-last-updated');
     if (lastUpdatedEl) {
       lastUpdatedEl.textContent = lastUpdated && lastUpdated.timestamp != null
         ? new Date(lastUpdated.timestamp).toLocaleTimeString()
         : 'Never';
     }
-    // No-op on the regular /hyperview page (kioskCriticalCue only exists
-    // on /hyperview/kiosk, see DASHBOARD_KIOSK_SHELL) - this same
-    // refreshAll() runs on both.
-    if (window.kioskCriticalCue) {
-      window.kioskCriticalCue(alarms.some(a => String(a.severity).toLowerCase() === 'critical'));
-    }
+    const hasUnacked = !!allRow && allRow.open > 0;
+    const hasAckedOnly = !!allRow && allRow.open === 0 && allRow.ack > 0;
+    const tone = healthTone(health.health);
+    if (window.videowallCriticalCue) window.videowallCriticalCue(hasUnacked, hasAckedOnly, tone);
+    if (window.pageAlertCue) window.pageAlertCue(hasUnacked, hasAckedOnly, tone);
     if (contentEl) contentEl.style.display = '';
     if (unreachableEl) unreachableEl.style.display = 'none';
   } catch (err) {
@@ -1698,12 +7090,13 @@ async function refreshAll() {
     if (unreachableEl) unreachableEl.style.display = '';
     const redundancyEl = document.getElementById('redundancy-alert');
     if (redundancyEl) redundancyEl.style.display = 'none';
-    if (window.kioskCriticalCue) window.kioskCriticalCue(false);
+    if (window.videowallCriticalCue) window.videowallCriticalCue(false, false);
+    if (window.pageAlertCue) window.pageAlertCue(false, false);
   }
 }
 
 function tickClock() {
-  const el = document.getElementById('kiosk-clock');
+  const el = document.getElementById('videowall-clock');
   if (el) el.textContent = new Date().toLocaleTimeString([], { hour12: false });
 }
 
@@ -1711,15 +7104,13 @@ refreshAll();
 tickClock();
 setInterval(tickClock, 1000);
 const AUTO_REFRESH_MS = %(auto_refresh_ms)s;
-if (AUTO_REFRESH_MS > 0) setInterval(refreshAll, AUTO_REFRESH_MS);
+if (AUTO_REFRESH_MS > 0) setInterval(function () {
+  if (window.isFlyoutOpen && window.isFlyoutOpen()) { return; }
+  refreshAll();
+}, AUTO_REFRESH_MS);
 </script>
 """
 
-# Shared markup for /hyperview and /hyperview/kiosk - the site matrices,
-# gauge, category tiles, and alarm log. Each page wraps this in its own
-# <style> (branded-light plus RESPONSIVE_DASHBOARD_CSS for the logged-in
-# page, dark/oversized for the kiosk) and its own header, then appends
-# HYPERVIEW_SCRIPT.
 def _hyperview_board_html():
     return f"""
     <div class="redundancy-alert" id="redundancy-alert" style="display:none;">
@@ -1729,6 +7120,7 @@ def _hyperview_board_html():
       {_bridge_unreachable_html("Hyperview", HYPERVIEW_BASE_URL)}
     </div>
     <div id="hv-content">
+    <div class="board-viewport-wrap">
     <div class="board">
       <div class="panel">
         <div class="panel-head"><h2>Datacenters / Hospitals</h2><span class="count-note" id="hosp-note"></span></div>
@@ -1743,18 +7135,15 @@ def _hyperview_board_html():
       <div class="center-col">
         <div class="panel gauge-card">
           <div class="panel-head"><h2>System Health</h2></div>
-          <svg class="gauge-svg" viewBox="0 0 190 118">
-            <path class="gauge-track" d="M15 105 A80 80 0 0 1 175 105" />
-            <path class="gauge-fill" id="gauge-fill" d="M15 105 A80 80 0 0 1 175 105"
-                  stroke="var(--warn)" stroke-dasharray="251.2" stroke-dashoffset="251.2" />
-          </svg>
-          <div class="gauge-score-num" id="gauge-score">&mdash;</div>
-          <div class="gauge-score-lbl">Health score</div>
-          <div class="status-banner" id="status-banner"></div>
+          <div class="health-medallion-body">
+            <div class="health-medallion" id="health-medallion"><span id="health-icon"></span></div>
+            <div class="health-state" id="health-state">&mdash;</div>
+            <div class="health-detail" id="health-detail"></div>
+          </div>
         </div>
         <div class="panel">
           <div class="panel-head"><h2>Alarm Summary</h2></div>
-          <table class="summary"><thead><tr><th>Category</th><th>Open</th><th>Ack'd</th></tr></thead>
+          <table class="summary"><thead><tr><th>Category</th><th>Open</th><th>Acknowledged</th></tr></thead>
             <tbody id="tiles-summary-body"></tbody></table>
           <div class="updated-note">Last Updated: <span id="hv-last-updated">&mdash;</span></div>
         </div>
@@ -1770,27 +7159,29 @@ def _hyperview_board_html():
         </div>
       </div>
     </div>
-    <div class="panel">
+    <div class="panel board-fill-panel">
       <div class="panel-head"><h2>Active Alarms</h2><span class="count-note" id="alarm-note"></span></div>
       <div class="matrix-wrap">
         <table class="alarmlog">
-          <thead><tr><th>Location</th><th>Device</th><th>Alarm</th></tr></thead>
+          <thead><tr><th>Location</th><th>Device</th><th>Severity</th><th>Alarm</th></tr></thead>
           <tbody id="alarmlog-body"></tbody>
         </table>
       </div>
+    </div>
     </div>
     </div>
     """
 
 
 @app.route("/hyperview/api/<endpoint>")
-def hyperview_api_proxy(endpoint):
-    # Deliberately no @require_login - matches matrix.py's own feeds,
-    # which have never had auth (see HYPERVIEW_BASE_URL comment above).
+@require_login
+def hyperview_api_proxy(username, endpoint):
+    if "hyperview" not in _user_systems(username):
+        return Response("Your account does not have access to Hyperview", 403)
     if endpoint not in HYPERVIEW_ENDPOINTS:
         return Response("Unknown Hyperview endpoint", 404)
     try:
-        resp = requests.get(f"{HYPERVIEW_BASE_URL}/{endpoint}", timeout=REQUEST_TIMEOUT)
+        resp = _cached_get(f"{HYPERVIEW_BASE_URL}/{endpoint}")
         resp.raise_for_status()
     except requests.RequestException as e:
         return Response(json.dumps({"error": f"Could not reach Hyperview: {e}"}), 502, content_type="application/json")
@@ -1800,192 +7191,2984 @@ def hyperview_api_proxy(endpoint):
 @app.route("/hyperview")
 @require_login
 def hyperview_page(username):
-    if "hyperview" not in USERS[username]["systems"]:
-        return Response("Your account does not have access to Hyperview", 403)
+    if "hyperview" not in _user_systems(username):
+        return _error_page(username, "Your account does not have access to Hyperview")
     body = f"""
-    <h1>Hyperview</h1>
-    <p class="sub">Live alarm status across Covenant Health hospitals, datacenters, and clinics.
-    &middot; <a href="/hyperview/kiosk" target="_blank" rel="noopener">Open kiosk view</a>
-    (no login, for a wall display &mdash; opens in a new tab)</p>
-    <style>{DASHBOARD_CSS}</style>
+    {_dashboard_page_header_html("Hyperview", "/hyperview/videowall")}
+    <style>{DASHBOARD_BASE_CSS}</style>
     {_hyperview_board_html()}
     {HYPERVIEW_SCRIPT % {'auto_refresh_ms': 30000}}
     """
     return Response(render_shell("Hyperview", body, "hyperview", username), mimetype="text/html")
 
 
-# Deliberately outside PAGE_SHELL/render_shell and unauthenticated - a
-# wall-mounted display has no one there to log in, and shouldn't need a
-# browser session kept alive. Dark, oversized treatment for readability
-# across a room; own <style> block rather than PAGE_SHELL's light tokens.
-# Shared by all three dashboards' /kiosk routes below (and whatever the
-# next dashboard's /kiosk route turns out to be) - {title} is what goes
-# in the browser tab and the small subtitle under the big Covenant Health
-# heading, {board}/{script} are that dashboard's own markup/JS, and
-# {rotate} is the auto-rotate badge from _kiosk_rotate_html() below.
-DASHBOARD_KIOSK_SHELL = """<!DOCTYPE html>
+# location_id/primary_contact_id/escalation_contact_id are FKs into
+# runbook_locations/runbook_contacts, not free text.
+HYPERVIEW_RUNBOOK_FIELDS = (
+    "device_name", "alert_type", "infrastructure_type", "device_type", "location_id", "action",
+    "primary_contact_id", "escalation_contact_id",
+)
+# Adds the linked location/contact display text, resolved live via JOIN,
+# under the same keys the rest of the app has always used.
+HYPERVIEW_RUNBOOK_COLUMNS = (
+    "id", "device_name", "alert_type", "infrastructure_type", "device_type", "location_id", "action",
+    "primary_contact_id", "escalation_contact_id", "ignore_incomplete", "updated_at", "updated_by",
+    "location", "address", "primary_name", "primary_phone", "escalation_name", "escalation_phone",
+)
+HYPERVIEW_RUNBOOK_SELECT = """
+    SELECT hyperview_runbook.id, device_name, alert_type, infrastructure_type, device_type, location_id, action,
+           primary_contact_id, escalation_contact_id, ignore_incomplete, updated_at, updated_by,
+           COALESCE(loc.name, ''), COALESCE(loc.address, ''), COALESCE(pc.name, ''), COALESCE(pc.phone, ''),
+           COALESCE(ec.name, ''), COALESCE(ec.phone, '')
+    FROM hyperview_runbook
+    LEFT JOIN runbook_locations loc ON loc.id = hyperview_runbook.location_id
+    LEFT JOIN runbook_contacts pc ON pc.id = hyperview_runbook.primary_contact_id
+    LEFT JOIN runbook_contacts ec ON ec.id = hyperview_runbook.escalation_contact_id
+"""
+
+
+RUNBOOK_SORT_COLUMNS = ("device_name", "alert_type", "location")
+RUNBOOK_SORT_COLUMN_SQL = {"device_name": "device_name", "alert_type": "alert_type", "location": "loc.name"}
+
+
+def _hyperview_runbook_entries(q=None, location=None, infra_type=None, device_type=None,
+                                sort_by="device_name", sort_dir="asc"):
+    if sort_by not in RUNBOOK_SORT_COLUMNS:
+        sort_by = "device_name"
+    sort_dir_sql = "DESC" if sort_dir == "desc" else "ASC"
+    where, params = [], []
+    if location:
+        where.append("loc.name = ? COLLATE NOCASE")
+        params.append(location)
+    if infra_type:
+        where.append("infrastructure_type = ? COLLATE NOCASE")
+        params.append(infra_type)
+    if device_type:
+        where.append("device_type = ? COLLATE NOCASE")
+        params.append(device_type)
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    sort_col_sql = RUNBOOK_SORT_COLUMN_SQL[sort_by]
+    conn = _runbook_db()
+    try:
+        rows = conn.execute(
+            f"{HYPERVIEW_RUNBOOK_SELECT} {where_sql} "
+            f"ORDER BY {sort_col_sql} COLLATE NOCASE {sort_dir_sql}, device_name COLLATE NOCASE, alert_type COLLATE NOCASE",
+            params,
+        ).fetchall()
+    finally:
+        conn.close()
+    entries = [dict(zip(HYPERVIEW_RUNBOOK_COLUMNS, r)) for r in rows]
+    if q:
+        q = q.strip().lower()
+        search_cols = (
+            "device_name", "alert_type", "action", "primary_name", "primary_phone",
+            "escalation_name", "escalation_phone",
+        )
+        entries = [
+            e for e in entries
+            if any(q in (e[col] or "").lower() for col in search_cols)
+        ]
+    return entries
+
+
+def _hyperview_runbook_filter_options():
+    conn = _runbook_db()
+    try:
+        def distinct(col):
+            return [r[0] for r in conn.execute(
+                f"SELECT DISTINCT {col} FROM hyperview_runbook WHERE {col} IS NOT NULL AND {col} != '' "
+                f"ORDER BY {col} COLLATE NOCASE"
+            )]
+        locations = [r[0] for r in conn.execute("SELECT name FROM runbook_locations ORDER BY name COLLATE NOCASE")]
+        return locations, distinct("infrastructure_type"), distinct("device_type")
+    finally:
+        conn.close()
+
+
+def _hyperview_runbook_devices():
+    """Distinct device names with how many alert-type entries each has -
+    used by the clone-device tool and the Add-entry auto-fill dropdown."""
+    conn = _runbook_db()
+    try:
+        return conn.execute(
+            "SELECT device_name, COUNT(*) FROM hyperview_runbook "
+            "GROUP BY device_name COLLATE NOCASE ORDER BY device_name COLLATE NOCASE"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def _hyperview_runbook_entries_for_device(device_name):
+    conn = _runbook_db()
+    try:
+        rows = conn.execute(
+            f"{HYPERVIEW_RUNBOOK_SELECT} WHERE device_name = ? COLLATE NOCASE ORDER BY alert_type COLLATE NOCASE",
+            (device_name,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(zip(HYPERVIEW_RUNBOOK_COLUMNS, r)) for r in rows]
+
+
+ALERT_TYPE_FUZZY_MATCH_THRESHOLD = 0.90
+
+
+def _alert_type_match_ratio(alert_type, alarm_text):
+    """1.0 for an exact (normalized) substring match, else the best
+    character-similarity ratio between alert_type and any same-length
+    window of alarm_text - catches wording drift (extra punctuation, a
+    typo, slightly different phrasing) without matching on totally
+    different alert types just because they share a couple of words."""
+    needle = _normalize_site_name(alert_type or "")
+    haystack = _normalize_site_name(alarm_text or "")
+    if not needle or not haystack:
+        return 0.0
+    if needle in haystack:
+        return 1.0
+    n = len(needle)
+    if n < 2 or n > len(haystack):
+        return 0.0
+    best = 0.0
+    for start in range(len(haystack) - n + 1):
+        ratio = difflib.SequenceMatcher(None, needle, haystack[start:start + n]).ratio()
+        if ratio > best:
+            best = ratio
+    return best
+
+
+def _hyperview_runbook_hint_for(device_name, alarm_text=None):
+    """Prefers the entry whose alert_type matches the alarm's own message -
+    exactly, or fuzzily at ALERT_TYPE_FUZZY_MATCH_THRESHOLD or better (typo,
+    stray punctuation, slightly different wording). When nothing clears that
+    bar and the device has more than one entry, there's no way to know which
+    one applies - still return the first one (better than nothing) but flag
+    it 'matched: False' so the caller can mark it as an unconfirmed guess
+    rather than showing it with the same confidence as a real match. None if
+    the device has no runbook entry."""
+    entries = _hyperview_runbook_entries_for_device(device_name)
+    if not entries:
+        return None
+    best_entry, best_ratio = None, 0.0
+    for e in entries:
+        ratio = _alert_type_match_ratio(e.get("alert_type"), alarm_text)
+        if ratio > best_ratio:
+            best_ratio, best_entry = ratio, e
+    matched = best_ratio >= ALERT_TYPE_FUZZY_MATCH_THRESHOLD
+    match = best_entry if matched else entries[0]
+    return {
+        "action": (match.get("action") or "").strip(),
+        "contact": match.get("primary_name") or match.get("escalation_name") or "",
+        "phone": match.get("primary_phone") or match.get("escalation_phone") or "",
+        "matched": matched or len(entries) == 1,
+    }
+
+
+def _hyperview_runbook_hint_html(device_name, alarm_text=None):
+    hint = _hyperview_runbook_hint_for(device_name, alarm_text)
+    if not hint:
+        return ""
+    parts = []
+    if hint["action"]:
+        parts.append(_esc(hint["action"]))
+    if hint["contact"]:
+        contact_txt = _esc(hint["contact"])
+        if hint["phone"]:
+            contact_txt += f" ({_esc(hint['phone'])})"
+        parts.append(contact_txt)
+    if not parts:
+        return ""
+    if hint["matched"]:
+        return f'<span class="runbook-hint">&#128214; {" &middot; ".join(parts)}</span>'
+    return (
+        f'<span class="runbook-hint runbook-hint-unconfirmed">&#9888; No exact alert match - '
+        f'showing this device\'s general entry, verify before acting: {" &middot; ".join(parts)}</span>'
+    )
+
+
+def _hyperview_runbook_gaps_from_alarms(alarms):
+    """Pure computation half of coverage-gap detection - no_entry: the
+    device has no runbook entry at all; no_exact_match: entries exist but
+    none matched this alarm's type - the two ways an on-call responder
+    could hit a dead end or a wrong answer during a real incident. Split
+    out from the live fetch so _hyperview_status_tick can reuse the alarms
+    it already just fetched instead of a second round-trip."""
+    gaps = []
+    for a in alarms:
+        device = a.get("device")
+        if not device:
+            continue
+        hint = _hyperview_runbook_hint_for(device, a.get("alarm"))
+        if hint is None:
+            gaps.append({"device": device, "alarm": a.get("alarm") or "", "location": a.get("location") or "",
+                         "gap": "no_entry"})
+        elif not hint["matched"]:
+            gaps.append({"device": device, "alarm": a.get("alarm") or "", "location": a.get("location") or "",
+                         "gap": "no_exact_match"})
+    return gaps
+
+
+def _hyperview_runbook_coverage_gaps():
+    """Currently-active gaps only, fetched live - used where "right now"
+    matters more than a fast/always-available read (not by Runbook
+    Management's own coverage section any more, which reads the persisted
+    table instead so it keeps showing gaps after the alarm that revealed
+    them clears, and still works when Hyperview itself is unreachable).
+    None if the alarm feed is unreachable."""
+    try:
+        resp = _parallel_get(HYPERVIEW_BASE_URL, ["/active-alarm-log"])
+        resp["/active-alarm-log"].raise_for_status()
+        alarms = resp["/active-alarm-log"].json()
+    except (requests.RequestException, ValueError, KeyError, FuturesTimeoutError):
+        return None
+    return _hyperview_runbook_gaps_from_alarms(alarms)
+
+
+def _record_runbook_coverage_gaps(gaps):
+    """Upserts freshly-observed gaps into the persisted table so they
+    survive the underlying alarm clearing - a coverage gap is a fact about
+    the runbook, not about whether something happens to be alarming at this
+    exact moment. no_entry gaps are deduped per device (any alarm on an
+    undocumented device is the same underlying problem: "document this
+    device"); no_exact_match gaps are deduped per device+alert-type, reusing
+    the same fuzzy match used to build the hint itself, so minor wording
+    differences between occurrences of the same alert don't each spawn a
+    new row."""
+    if not gaps:
+        return
+    now = int(time.time())
+    conn = _runbook_db()
+    try:
+        open_rows = conn.execute(
+            "SELECT id, device, alarm, gap_type FROM runbook_coverage_gaps WHERE resolved_at IS NULL"
+        ).fetchall()
+        for g in gaps:
+            match_id = None
+            for row_id, row_device, row_alarm, row_gap_type in open_rows:
+                if row_device != g["device"] or row_gap_type != g["gap"]:
+                    continue
+                if g["gap"] == "no_entry" or _alert_type_match_ratio(row_alarm, g["alarm"]) >= ALERT_TYPE_FUZZY_MATCH_THRESHOLD:
+                    match_id = row_id
+                    break
+            if match_id is not None:
+                conn.execute(
+                    "UPDATE runbook_coverage_gaps SET last_seen_ts = ?, alarm = ?, location = ? WHERE id = ?",
+                    (now, g["alarm"], g["location"], match_id),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO runbook_coverage_gaps (device, alarm, location, gap_type, first_seen_ts, last_seen_ts) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (g["device"], g["alarm"], g["location"], g["gap"], now, now),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _sweep_resolved_runbook_gaps():
+    """Re-checks every open persisted gap against the runbook as it stands
+    right now (a pure DB lookup, independent of whether the alarm that
+    first revealed it is still active) and closes it out the moment a real
+    matching entry exists - so fixing the runbook is what closes a gap,
+    not the alarm happening to clear on its own."""
+    conn = _runbook_db()
+    try:
+        open_rows = conn.execute(
+            "SELECT id, device, alarm, gap_type FROM runbook_coverage_gaps WHERE resolved_at IS NULL"
+        ).fetchall()
+        now = int(time.time())
+        for row_id, device, alarm, gap_type in open_rows:
+            hint = _hyperview_runbook_hint_for(device, alarm)
+            if hint is not None and hint["matched"]:
+                conn.execute("UPDATE runbook_coverage_gaps SET resolved_at = ? WHERE id = ?", (now, row_id))
+            elif hint is not None and gap_type == "no_entry":
+                # An entry now exists for this device, just not a confident
+                # match for this particular alert yet - still a real gap,
+                # just a narrower one than "nothing documented at all".
+                conn.execute("UPDATE runbook_coverage_gaps SET gap_type = 'no_exact_match' WHERE id = ?", (row_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _persisted_runbook_coverage_gaps():
+    conn = _runbook_db()
+    try:
+        rows = conn.execute(
+            "SELECT id, device, alarm, location, gap_type, first_seen_ts, last_seen_ts "
+            "FROM runbook_coverage_gaps WHERE resolved_at IS NULL ORDER BY last_seen_ts DESC"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {"id": r[0], "device": r[1], "alarm": r[2], "location": r[3], "gap": r[4],
+         "first_seen_ts": r[5], "last_seen_ts": r[6]}
+        for r in rows
+    ]
+
+
+def _dismiss_runbook_coverage_gap(gap_id):
+    conn = _runbook_db()
+    try:
+        conn.execute(
+            "UPDATE runbook_coverage_gaps SET resolved_at = ? WHERE id = ? AND resolved_at IS NULL",
+            (int(time.time()), gap_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _hyperview_runbook_get(entry_id):
+    conn = _runbook_db()
+    try:
+        row = conn.execute(f"{HYPERVIEW_RUNBOOK_SELECT} WHERE hyperview_runbook.id = ?", (entry_id,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    return dict(zip(HYPERVIEW_RUNBOOK_COLUMNS, row))
+
+
+def _hyperview_runbook_duplicate_exists(device_name, alert_type, exclude_id=None):
+    conn = _runbook_db()
+    try:
+        row = conn.execute(
+            "SELECT id FROM hyperview_runbook WHERE device_name = ? COLLATE NOCASE AND alert_type = ? COLLATE NOCASE",
+            (device_name, alert_type),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return False
+    return exclude_id is None or row[0] != exclude_id
+
+
+def _save_hyperview_runbook_entry(entry_id, fields, set_by, ignore_incomplete=False):
+    conn = _runbook_db()
+    try:
+        if entry_id:
+            conn.execute(
+                f"UPDATE hyperview_runbook SET {', '.join(f'{c} = ?' for c in HYPERVIEW_RUNBOOK_FIELDS)}, "
+                f"ignore_incomplete = ?, updated_at = ?, updated_by = ? WHERE id = ?",
+                [fields[c] for c in HYPERVIEW_RUNBOOK_FIELDS] + [1 if ignore_incomplete else 0, int(time.time()), set_by, entry_id],
+            )
+        else:
+            conn.execute(
+                f"INSERT INTO hyperview_runbook ({', '.join(HYPERVIEW_RUNBOOK_FIELDS)}, ignore_incomplete, updated_at, updated_by) "
+                f"VALUES ({', '.join('?' for _ in HYPERVIEW_RUNBOOK_FIELDS)}, ?, ?, ?)",
+                [fields[c] for c in HYPERVIEW_RUNBOOK_FIELDS] + [1 if ignore_incomplete else 0, int(time.time()), set_by],
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _delete_hyperview_runbook_entry(entry_id):
+    conn = _runbook_db()
+    try:
+        conn.execute("DELETE FROM hyperview_runbook WHERE id = ?", (entry_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _runbook_locations():
+    """Every managed location with how many runbook entries currently
+    point at it - the usage count is what the Locations page uses to
+    block deleting one still in use."""
+    conn = _runbook_db()
+    try:
+        rows = conn.execute("""
+            SELECT rl.id, rl.name, rl.address, COUNT(hr.id)
+            FROM runbook_locations rl
+            LEFT JOIN hyperview_runbook hr ON hr.location_id = rl.id
+            GROUP BY rl.id ORDER BY rl.name COLLATE NOCASE
+        """).fetchall()
+    finally:
+        conn.close()
+    return [{"id": r[0], "name": r[1], "address": r[2], "usage_count": r[3]} for r in rows]
+
+
+def _runbook_distinct_values(column):
+    """Every distinct non-blank value already used for this free-text
+    column (infrastructure_type/device_type) across existing entries -
+    backs a datalist so the form suggests what's already in use instead of
+    everyone inventing their own spelling of "Power", but still allows
+    typing a genuinely new category, unlike a closed dropdown would."""
+    if column not in ("infrastructure_type", "device_type"):
+        raise ValueError(f"unexpected column: {column!r}")
+    conn = _runbook_db()
+    try:
+        rows = conn.execute(
+            f"SELECT DISTINCT {column} FROM hyperview_runbook WHERE TRIM(COALESCE({column}, '')) != '' "
+            f"ORDER BY {column} COLLATE NOCASE"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [r[0] for r in rows]
+
+
+def _runbook_location_get(location_id):
+    conn = _runbook_db()
+    try:
+        row = conn.execute("SELECT id, name, address FROM runbook_locations WHERE id = ?", (location_id,)).fetchone()
+    finally:
+        conn.close()
+    return {"id": row[0], "name": row[1], "address": row[2]} if row else None
+
+
+def _save_runbook_location(location_id, name, address):
+    conn = _runbook_db()
+    try:
+        if location_id:
+            conn.execute("UPDATE runbook_locations SET name = ?, address = ? WHERE id = ?", (name, address, location_id))
+        else:
+            cur = conn.execute("INSERT INTO runbook_locations (name, address) VALUES (?, ?)", (name, address))
+            location_id = cur.lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+    return location_id
+
+
+def _delete_runbook_location(location_id):
+    """Refuses (returns the count instead of deleting) when any runbook
+    entry still points at this location - reassign or delete those first,
+    via the bulk-update tool, rather than silently orphaning them."""
+    conn = _runbook_db()
+    try:
+        in_use = conn.execute("SELECT COUNT(*) FROM hyperview_runbook WHERE location_id = ?", (location_id,)).fetchone()[0]
+        if in_use:
+            return in_use
+        conn.execute("DELETE FROM runbook_locations WHERE id = ?", (location_id,))
+        conn.commit()
+        return 0
+    finally:
+        conn.close()
+
+
+def _runbook_contacts():
+    """Every managed contact with how many runbook entries reference it,
+    counting BOTH the primary and escalation role - a contact used in
+    either slot anywhere is "in use" for delete-blocking purposes."""
+    conn = _runbook_db()
+    try:
+        rows = conn.execute("""
+            SELECT rc.id, rc.name, rc.phone,
+                   (SELECT COUNT(*) FROM hyperview_runbook WHERE primary_contact_id = rc.id) +
+                   (SELECT COUNT(*) FROM hyperview_runbook WHERE escalation_contact_id = rc.id)
+            FROM runbook_contacts rc ORDER BY rc.name COLLATE NOCASE
+        """).fetchall()
+    finally:
+        conn.close()
+    return [{"id": r[0], "name": r[1], "phone": r[2], "usage_count": r[3]} for r in rows]
+
+
+def _runbook_contact_get(contact_id):
+    conn = _runbook_db()
+    try:
+        row = conn.execute("SELECT id, name, phone FROM runbook_contacts WHERE id = ?", (contact_id,)).fetchone()
+    finally:
+        conn.close()
+    return {"id": row[0], "name": row[1], "phone": row[2]} if row else None
+
+
+def _save_runbook_contact(contact_id, name, phone):
+    conn = _runbook_db()
+    try:
+        if contact_id:
+            conn.execute("UPDATE runbook_contacts SET name = ?, phone = ? WHERE id = ?", (name, phone, contact_id))
+        else:
+            cur = conn.execute("INSERT INTO runbook_contacts (name, phone) VALUES (?, ?)", (name, phone))
+            contact_id = cur.lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+    return contact_id
+
+
+def _delete_runbook_contact(contact_id):
+    conn = _runbook_db()
+    try:
+        in_use = conn.execute(
+            "SELECT COUNT(*) FROM hyperview_runbook WHERE primary_contact_id = ? OR escalation_contact_id = ?",
+            (contact_id, contact_id),
+        ).fetchone()[0]
+        if in_use:
+            return in_use
+        conn.execute("DELETE FROM runbook_contacts WHERE id = ?", (contact_id,))
+        conn.commit()
+        return 0
+    finally:
+        conn.close()
+
+
+def _runbook_url(base_path, state, **overrides):
+    merged = dict(state)
+    merged.update(overrides)
+    parts = []
+    for key in ("q", "location", "infra", "device", "attn", "sort", "dir", "page"):
+        value = merged.get(key)
+        if key == "page" and value in (None, 1):
+            continue
+        if key == "dir" and value in (None, "asc"):
+            continue
+        if key == "sort" and value in (None, "device_name"):
+            continue
+        if key == "attn" and value in (None, "0"):
+            continue
+        if not value:
+            continue
+        parts.append(f"{key}={quote(str(value))}")
+    qs = "&".join(parts)
+    return base_path + (f"?{qs}" if qs else "")
+
+
+def _runbook_entry_raw_issues(e):
+    """What's missing on this entry, in plain language, ignoring whether
+    it's been marked as an intentional exception."""
+    issues = []
+    if not e["action"].strip():
+        issues.append("no action text")
+    has_primary = e["primary_name"].strip() or e["primary_phone"].strip()
+    if not has_primary:
+        issues.append("no primary contact")
+    elif e["primary_name"].strip() and not e["primary_phone"].strip():
+        issues.append("primary contact has no phone number")
+    has_escalation = e["escalation_name"].strip() or e["escalation_phone"].strip()
+    if not has_escalation:
+        issues.append("no escalation contact")
+    elif e["escalation_name"].strip() and not e["escalation_phone"].strip():
+        issues.append("escalation contact has no phone number")
+    return issues
+
+
+def _runbook_entry_issues(e):
+    """Issues that count toward "needs attention" - empty if complete, or
+    if marked as an intentional exception (e.g. "Multiple Vendors")."""
+    if e.get("ignore_incomplete"):
+        return []
+    return _runbook_entry_raw_issues(e)
+
+
+def _runbook_contact_html(name, phone):
+    if name and phone:
+        return f'{_esc(name)} &middot; {_esc(phone)}'
+    if name or phone:
+        return f'{_esc(name or phone)}'
+    return '<span class="dash-mark">&mdash;</span>'
+
+
+def _hyperview_runbook_alert_row_html(e, with_actions, show_completeness=True):
+    ignored = bool(e.get("ignore_incomplete"))
+    raw_issues = _runbook_entry_raw_issues(e) if show_completeness else []
+    if raw_issues and ignored:
+        dot = (
+            f'<span title="Missing info, marked OK: {_esc(", ".join(raw_issues))}" '
+            f'style="display:inline-block; width:8px; height:8px; border-radius:50%; '
+            f'background:var(--text-faint); margin-right:6px; vertical-align:middle;"></span>'
+        )
+    elif raw_issues:
+        dot = (
+            f'<span title="Needs attention: {_esc(", ".join(raw_issues))}" '
+            f'style="display:inline-block; width:8px; height:8px; border-radius:50%; '
+            f'background:var(--danger); margin-right:6px; vertical-align:middle;"></span>'
+        )
+    else:
+        dot = ""
+    actions = ""
+    if with_actions:
+        toggle_label = "Un-ignore" if ignored else "Ignore"
+        toggle_btn = (
+            f'<form method="post" action="/hyperview/runbook/manage/{e["id"]}/toggle-ignore" '
+            f'style="display:inline; margin-left:6px;">'
+            f'<button type="submit" class="ghost" title="Mark missing info on this entry as intentional">{toggle_label}</button></form>'
+            if raw_issues else ""
+        )
+        actions = (
+            f'<a class="ghost" href="/hyperview/runbook/manage/{e["id"]}/edit">Edit</a>'
+            f'{toggle_btn}'
+            f'<form method="post" action="/hyperview/runbook/manage/{e["id"]}/delete" style="display:inline; margin-left:6px;" '
+            f'onsubmit="return confirm(\'Remove the runbook entry for {_esc(e["device_name"])} / {_esc(e["alert_type"])}?\')">'
+            f'<button type="submit" class="cancel-btn">Remove</button></form>'
+        )
+    return f"""
+    <tr>
+      <td style="white-space:nowrap;">{dot}{_esc(e["alert_type"])}</td>
+      <td style="max-width:320px; white-space:pre-line;">{_esc(e["action"]) or '<span class="dash-mark">&mdash;</span>'}</td>
+      <td>{_runbook_contact_html(e["primary_name"], e["primary_phone"])}</td>
+      <td>{_runbook_contact_html(e["escalation_name"], e["escalation_phone"])}</td>
+      {f'<td style="white-space:nowrap;">{actions}</td>' if with_actions else ''}
+    </tr>"""
+
+
+def _runbook_device_card_html(device_name, entries, with_actions, show_completeness=True):
+    first = entries[0]
+    location = first["location"]
+    infra, dev = first["infrastructure_type"], first["device_type"]
+    if infra and dev:
+        type_html = f'{_esc(infra)} &middot; {_esc(dev)}'
+    else:
+        type_html = _esc(infra or dev)
+
+    badge = ""
+    if show_completeness:
+        issue_count = sum(1 for e in entries if _runbook_entry_issues(e))
+        if issue_count == 0:
+            badge = '<span class="msg ok" style="display:inline-block; padding:2px 10px; margin:0; font-size:11px; box-shadow:none;">&#10003; Complete</span>'
+        else:
+            entry_word = "entry needs" if issue_count == 1 else "entries need"
+            badge = f'<span class="msg err" style="display:inline-block; padding:2px 10px; margin:0; font-size:11px; box-shadow:none;">&#9888; {issue_count} {entry_word} info</span>'
+
+    add_link = (
+        f'<a class="ghost" href="/hyperview/runbook/manage/new?like={quote(device_name)}">+ Add alert type</a>'
+        if with_actions else ""
+    )
+    rows_html = "".join(_hyperview_runbook_alert_row_html(e, with_actions, show_completeness) for e in entries)
+    subtitle = " &middot; ".join(p for p in (_esc(location) if location else "", type_html) if p)
+
+    return f"""
+    <div class="card" style="margin-bottom:14px;">
+      <div class="panel-head" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; padding:0 0 10px;">
+        <div>
+          <strong style="font-size:15px;">{_esc(device_name)}</strong>
+          {f'<span class="sub" style="margin-left:8px;">{subtitle}</span>' if subtitle else ""}
+        </div>
+        <div style="display:flex; align-items:center; gap:8px;">
+          {badge}
+          {add_link}
+        </div>
+      </div>
+      <div class="table-scroll"><table>
+        <tr><th>Alert Type</th><th>Action</th><th>Primary</th><th>Escalation</th>{'<th></th>' if with_actions else ''}</tr>
+        {rows_html}
+      </table></div>
+    </div>"""
+
+
+RUNBOOK_DEVICES_PER_PAGE = 20
+
+
+def _runbook_browse(base_path, show_completeness=True):
+    """Shared search/filter/sort/pagination engine for the view and manage
+    pages, grouped and paginated by device. show_completeness gates the
+    completeness badges/filter, a data-quality concern read-only viewers
+    don't need."""
+    q = request.args.get("q", "").strip()
+    location = request.args.get("location", "").strip()
+    infra = request.args.get("infra", "").strip()
+    device = request.args.get("device", "").strip()
+    attention_only = show_completeness and request.args.get("attn") == "1"
+    sort_by = request.args.get("sort", "device_name").strip()
+    if sort_by not in RUNBOOK_SORT_COLUMNS:
+        sort_by = "device_name"
+    sort_dir = request.args.get("dir", "asc").strip()
+    if sort_dir not in ("asc", "desc"):
+        sort_dir = "asc"
+    try:
+        page = max(1, int(request.args.get("page", "1")))
+    except ValueError:
+        page = 1
+
+    all_entries = _hyperview_runbook_entries(q or None, location or None, infra or None, device or None, sort_by, sort_dir)
+    total_entries = len(all_entries)
+    issue_count = sum(1 for e in all_entries if _runbook_entry_issues(e))
+    if attention_only:
+        all_entries = [e for e in all_entries if _runbook_entry_issues(e)]
+
+    groups, order = {}, []
+    for e in all_entries:
+        key = e["device_name"]
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(e)
+    total_devices = len(order)
+
+    total_pages = max(1, -(-total_devices // RUNBOOK_DEVICES_PER_PAGE))
+    page = min(page, total_pages)
+    start = (page - 1) * RUNBOOK_DEVICES_PER_PAGE
+    page_devices = order[start:start + RUNBOOK_DEVICES_PER_PAGE]
+    device_groups = [(name, groups[name]) for name in page_devices]
+
+    state = {"q": q, "location": location, "infra": infra, "device": device, "sort": sort_by, "dir": sort_dir, "page": page}
+    if attention_only:
+        state["attn"] = "1"
+
+    def sort_link(col, label):
+        new_dir = "desc" if sort_by == col and sort_dir == "asc" else "asc"
+        arrow = "" if sort_by != col else (" &uarr;" if sort_dir == "asc" else " &darr;")
+        return f'<a href="{_runbook_url(base_path, state, sort=col, dir=new_dir, page=1)}">{_esc(label)}{arrow}</a>'
+
+    locations, infra_types, device_types = _hyperview_runbook_filter_options()
+
+    def options_html(values, current):
+        opts = ''.join(
+            f'<option value="{_esc(v)}"{" selected" if v == current else ""}>{_esc(v)}</option>' for v in values
+        )
+        return f'<option value="">All</option>{opts}'
+
+    if total_devices == 0:
+        range_note = "No devices"
+    else:
+        range_note = f"Devices {start + 1}-{min(start + RUNBOOK_DEVICES_PER_PAGE, total_devices)} of {total_devices}"
+    pager_nav = f"""
+      <div class="radio-row" style="gap:6px;">
+        {f'<a class="ghost" href="{_runbook_url(base_path, state, page=page - 1)}">&larr; Prev</a>' if page > 1 else '<span class="ghost" style="opacity:.4;">&larr; Prev</span>'}
+        <span class="sub" style="margin:0;">Page {page} of {total_pages}</span>
+        {f'<a class="ghost" href="{_runbook_url(base_path, state, page=page + 1)}">Next &rarr;</a>' if page < total_pages else '<span class="ghost" style="opacity:.4;">Next &rarr;</span>'}
+      </div>""" if total_pages > 1 else ""
+    summary_line = f"{range_note} &middot; {total_entries} entr{'y' if total_entries == 1 else 'ies'}"
+    if show_completeness:
+        summary_line += f", {issue_count} need{'s' if issue_count == 1 else ''} attention"
+    pager_html = f"""
+    <div class="radio-row" style="align-items:center; justify-content:space-between; margin-top:10px;">
+      <span class="sub" style="margin:0;">{summary_line}</span>
+      {pager_nav}
+    </div>"""
+
+    attn_toggle = ""
+    if show_completeness:
+        attn_toggle = (
+            f'<a class="ghost" href="{_runbook_url(base_path, state, attn="0", page=1)}">Show all</a>'
+            if attention_only else
+            f'<a class="ghost" href="{_runbook_url(base_path, state, attn="1", page=1)}">'
+            f'&#9888; Needs attention only{f" ({issue_count})" if issue_count else ""}</a>'
+        )
+
+    filter_form_html = f"""
+    <div class="card">
+      <form method="GET" action="{base_path}" class="radio-row" style="flex-wrap:wrap; align-items:center; gap:10px;">
+        <input type="hidden" name="sort" value="{_esc(sort_by)}">
+        <input type="hidden" name="dir" value="{_esc(sort_dir)}">
+        <input type="text" name="q" value="{_esc(q)}" placeholder="Search device, alert type, instruction, or contact..." style="flex:1; min-width:200px;">
+        <label style="display:flex; align-items:center; gap:6px; margin:0;">Location
+          <select name="location">{options_html(locations, location)}</select>
+        </label>
+        <label style="display:flex; align-items:center; gap:6px; margin:0;">Infra
+          <select name="infra">{options_html(infra_types, infra)}</select>
+        </label>
+        <label style="display:flex; align-items:center; gap:6px; margin:0;">Device
+          <select name="device">{options_html(device_types, device)}</select>
+        </label>
+        <button type="submit" class="ghost">Filter</button>
+        {f'<a class="ghost" href="{base_path}">Clear all</a>' if (q or location or infra or device) else ''}
+      </form>
+      <div class="radio-row" style="margin-top:10px; gap:10px; align-items:center;">
+        {sort_link("device_name", "Sort: Device")}
+        <span class="sub" style="margin:0;">&middot;</span>
+        {sort_link("location", "Sort: Location")}
+        {f'<span class="sub" style="margin:0;">&middot;</span>{attn_toggle}' if show_completeness else ''}
+      </div>
+    </div>"""
+
+    if total_devices == 0:
+        if attention_only:
+            empty_note = "Nothing needs attention right now"
+        elif q or location or infra or device:
+            empty_note = "No runbook entries match the current search/filters"
+        else:
+            empty_note = "No runbook entries yet"
+    else:
+        empty_note = ""
+
+    return {
+        "device_groups": device_groups, "total_entries": total_entries, "total_devices": total_devices,
+        "issue_count": issue_count, "filter_form_html": filter_form_html, "pager_html": pager_html,
+        "empty_note": empty_note,
+    }
+
+
+def _runbook_contact_option_label(c):
+    return f'{c["name"]} ({c["phone"]})' if c["name"] and c["phone"] else (c["name"] or c["phone"] or f"Contact #{c['id']}")
+
+
+def _runbook_form_html(e, action, heading, submit_label, cancel_href, locations, contacts, extra_top_html="", entry_id=""):
+    def location_options():
+        current = str(e.get("location_id") or "")
+        opts = "".join(
+            f'<option value="{loc["id"]}"{" selected" if str(loc["id"]) == current else ""}>{_esc(loc["name"])}</option>'
+            for loc in locations
+        )
+        return f'<option value="">No location</option>{opts}'
+
+    def contact_options(field):
+        current = str(e.get(field) or "")
+        opts = "".join(
+            f'<option value="{c["id"]}"{" selected" if str(c["id"]) == current else ""}>{_esc(_runbook_contact_option_label(c))}</option>'
+            for c in contacts
+        )
+        return f'<option value="">None</option>{opts}'
+
+    return f"""
+    <div class="page-header">
+      <div><h1>{_esc(heading)}</h1></div>
+    </div>
+    {_msg_html()}
+    {extra_top_html}
+    <div class="card">
+      <form method="post" action="{action}" id="rb-form" data-entry-id="{_esc(entry_id)}">
+        <label>Device Name</label>
+        <input type="text" name="device_name" id="rb-device-name" value="{_esc(e['device_name'])}" required>
+        <label>Alert Type</label>
+        <input type="text" name="alert_type" id="rb-alert-type" value="{_esc(e['alert_type'])}" required>
+        <div id="rb-dupe-warning" class="msg err" style="display:none; margin:-8px 0 12px;">
+          An entry already exists for this device + alert type.
+        </div>
+        <label>Infrastructure Type</label>
+        <input type="text" name="infrastructure_type" value="{_esc(e['infrastructure_type'])}" list="rb-infra-type-list" autocomplete="off">
+        <datalist id="rb-infra-type-list">{"".join(f'<option value="{_esc(v)}">' for v in _runbook_distinct_values("infrastructure_type"))}</datalist>
+        <label>Device Type</label>
+        <input type="text" name="device_type" value="{_esc(e['device_type'])}" list="rb-device-type-list" autocomplete="off">
+        <datalist id="rb-device-type-list">{"".join(f'<option value="{_esc(v)}">' for v in _runbook_distinct_values("device_type"))}</datalist>
+        <label>Location</label>
+        <select name="location_id">{location_options()}</select>
+        <p class="sub" style="margin:2px 0 10px;"><a href="/hyperview/runbook/locations/new" target="_blank">+ Add a new location</a></p>
+        <label>Action</label>
+        <textarea name="action" id="rb-action" rows="4" style="width:100%; max-width:520px; overflow:hidden; resize:vertical;">{_esc(e['action'])}</textarea>
+        <label>Primary contact</label>
+        <select name="primary_contact_id">{contact_options('primary_contact_id')}</select>
+        <label>Escalation contact</label>
+        <select name="escalation_contact_id">{contact_options('escalation_contact_id')}</select>
+        <p class="sub" style="margin:2px 0 10px;"><a href="/hyperview/runbook/contacts/new" target="_blank">+ Add a new contact</a></p>
+        <label style="display:flex; align-items:center; gap:8px; margin-top:10px;">
+          <input type="checkbox" name="ignore_incomplete" value="1"{' checked' if e.get('ignore_incomplete') else ''}>
+          Don't flag this entry as incomplete (missing info here is intentional)
+        </label>
+        <div style="margin-top:10px; display:flex; gap:8px;">
+          <button type="submit">{_esc(submit_label)}</button>
+          <a class="ghost" href="{cancel_href}">Cancel</a>
+        </div>
+      </form>
+    </div>
+    <script>
+    (function () {{
+      var actionEl = document.getElementById('rb-action');
+      function autoGrow() {{
+        actionEl.style.height = 'auto';
+        actionEl.style.height = actionEl.scrollHeight + 'px';
+      }}
+      if (actionEl) {{
+        actionEl.addEventListener('input', autoGrow);
+        autoGrow();
+      }}
+
+      var form = document.getElementById('rb-form');
+      var deviceEl = document.getElementById('rb-device-name');
+      var alertEl = document.getElementById('rb-alert-type');
+      var warningEl = document.getElementById('rb-dupe-warning');
+      var entryId = form.getAttribute('data-entry-id') || '';
+      var checkTimer = null;
+      function checkDuplicate() {{
+        var device = deviceEl.value.trim();
+        var alertType = alertEl.value.trim();
+        if (!device || !alertType) {{ warningEl.style.display = 'none'; return; }}
+        var url = '/hyperview/runbook/manage/check-duplicate?device_name=' + encodeURIComponent(device) +
+          '&alert_type=' + encodeURIComponent(alertType) + '&exclude_id=' + encodeURIComponent(entryId);
+        fetch(url).then(function (r) {{ return r.json(); }}).then(function (data) {{
+          warningEl.style.display = data.duplicate ? 'block' : 'none';
+        }}).catch(function () {{}});
+      }}
+      function scheduleCheck() {{
+        clearTimeout(checkTimer);
+        checkTimer = setTimeout(checkDuplicate, 300);
+      }}
+      if (deviceEl && alertEl && warningEl) {{
+        deviceEl.addEventListener('input', scheduleCheck);
+        alertEl.addEventListener('input', scheduleCheck);
+      }}
+    }})();
+    </script>"""
+
+
+@app.route("/hyperview/runbook/hints")
+@require_login
+def hyperview_runbook_hints(username):
+    """JSON map of device_name -> runbook entries (alert_type/action/
+    contact/phone) for the live Hyperview board's inline hints."""
+    if "hyperview" not in _user_systems(username):
+        return Response("Your account does not have access to Hyperview", 403)
+    hints = {}
+    for name, _count in _hyperview_runbook_devices():
+        entries = _hyperview_runbook_entries_for_device(name)
+        hints[name] = [
+            {
+                "alert_type": e.get("alert_type") or "",
+                "action": e.get("action") or "",
+                "contact": e.get("primary_name") or e.get("escalation_name") or "",
+                "phone": e.get("primary_phone") or e.get("escalation_phone") or "",
+            }
+            for e in entries
+        ]
+    return Response(json.dumps(hints), mimetype="application/json")
+
+
+@app.route("/hyperview/runbook/lookup-data", methods=["GET"])
+@require_login
+def hyperview_runbook_lookup_data(username):
+    """Full per-device/alert-type data for the Quick Lookup panel, with
+    primary/escalation contacts kept separate. Gated like the Runbook page
+    itself, not by Hyperview system access, since Operations-only accounts
+    reach this page too."""
+    is_admin = _is_admin(username)
+    if not is_admin and not _user_has_operations(username):
+        return Response("Your account does not have the Operations permission needed for the Runbook", 403)
+    data = {}
+    for name, _count in _hyperview_runbook_devices():
+        entries = _hyperview_runbook_entries_for_device(name)
+        data[name] = [
+            {
+                "alert_type": e.get("alert_type") or "",
+                "location": e.get("location") or "",
+                "address": e.get("address") or "",
+                "action": e.get("action") or "",
+                "primary_name": e.get("primary_name") or "",
+                "primary_phone": e.get("primary_phone") or "",
+                "escalation_name": e.get("escalation_name") or "",
+                "escalation_phone": e.get("escalation_phone") or "",
+            }
+            for e in entries
+        ]
+    return Response(json.dumps(data), mimetype="application/json")
+
+
+def _runbook_lookup_html(devices, is_admin):
+    device_options = "".join(f'<option value="{_esc(d)}">{_esc(d)}</option>' for d, _n in devices)
+    return f"""
+    <div class="card">
+      <div class="radio-row" style="flex-wrap:wrap; gap:24px; align-items:flex-start;">
+        <div style="flex:1; min-width:220px;">
+          <label>Device Name</label>
+          <input type="text" id="rb-lu-device" list="rb-lu-device-datalist" style="width:100%;"
+                 placeholder="Start typing a device name..." autocomplete="off">
+          <datalist id="rb-lu-device-datalist">{device_options}</datalist>
+        </div>
+        <div style="flex:1; min-width:220px;">
+          <label>Alert Type</label>
+          <select id="rb-lu-alert" style="width:100%;" disabled>
+            <option value="">Choose a device first...</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div class="card" id="rb-lu-empty">
+      <p class="empty">Pick a device and alert type to see the required action.</p>
+    </div>
+    <div class="card" id="rb-lu-result" style="display:none;">
+      <div class="radio-row" style="flex-wrap:wrap; gap:24px; align-items:flex-start;">
+        <div style="flex:1; min-width:200px;">
+          <label>Location</label>
+          <div id="rb-lu-location" style="font-size:14px;"></div>
+        </div>
+        <div style="flex:1; min-width:200px;">
+          <label>Address</label>
+          <div id="rb-lu-address" style="font-size:14px;"></div>
+        </div>
+      </div>
+      <label style="margin-top:14px;">Action</label>
+      <div id="rb-lu-action" style="font-size:14px; white-space:pre-wrap; padding:10px 0;"></div>
+      <div class="radio-row" style="flex-wrap:wrap; gap:24px; align-items:flex-start; border-top:1px solid var(--border); padding-top:12px;">
+        <div style="flex:1; min-width:200px;">
+          <label>Primary</label>
+          <div id="rb-lu-primary" style="font-size:14px;"></div>
+        </div>
+        <div style="flex:1; min-width:200px;">
+          <label>Escalation</label>
+          <div id="rb-lu-escalation" style="font-size:14px;"></div>
+        </div>
+      </div>
+    </div>
+    <script>
+    (function () {{
+      var deviceEl = document.getElementById('rb-lu-device');
+      var alertEl = document.getElementById('rb-lu-alert');
+      var emptyEl = document.getElementById('rb-lu-empty');
+      var resultEl = document.getElementById('rb-lu-result');
+      var data = {{}};
+
+      function dash(v) {{ return v ? v : '\\u2014'; }}
+      function contactHtml(name, phone) {{
+        if (!name && !phone) return dash('');
+        return escapeHtml(name) + (phone ? ' &middot; ' + escapeHtml(phone) : '');
+      }}
+      function escapeHtml(s) {{
+        var d = document.createElement('div');
+        d.textContent = s || '';
+        return d.innerHTML;
+      }}
+
+      function showEntry(entry) {{
+        if (!entry) {{
+          resultEl.style.display = 'none';
+          emptyEl.style.display = '';
+          return;
+        }}
+        document.getElementById('rb-lu-location').textContent = entry.location || '\\u2014';
+        document.getElementById('rb-lu-address').textContent = entry.address || '\\u2014';
+        document.getElementById('rb-lu-action').textContent = entry.action || '\\u2014';
+        document.getElementById('rb-lu-primary').innerHTML = contactHtml(entry.primary_name, entry.primary_phone);
+        document.getElementById('rb-lu-escalation').innerHTML = contactHtml(entry.escalation_name, entry.escalation_phone);
+        emptyEl.style.display = 'none';
+        resultEl.style.display = '';
+      }}
+
+      function onDeviceChange() {{
+        var device = deviceEl.value;
+        var entries = data[device] || [];
+        alertEl.innerHTML = '<option value="">Choose an alert type...</option>' +
+          entries.map(function (e) {{ return '<option value="' + escapeHtml(e.alert_type) + '">' + escapeHtml(e.alert_type) + '</option>'; }}).join('');
+        alertEl.disabled = entries.length === 0;
+        showEntry(null);
+        if (entries.length === 1) {{
+          alertEl.value = entries[0].alert_type;
+          showEntry(entries[0]);
+        }}
+      }}
+
+      function onAlertChange() {{
+        var device = deviceEl.value;
+        var entries = data[device] || [];
+        var match = entries.filter(function (e) {{ return e.alert_type === alertEl.value; }})[0];
+        showEntry(match || null);
+      }}
+
+      deviceEl.addEventListener('input', onDeviceChange);
+      deviceEl.addEventListener('change', onDeviceChange);
+      alertEl.addEventListener('change', onAlertChange);
+
+      fetch('/hyperview/runbook/lookup-data').then(function (r) {{ return r.json(); }}).then(function (json) {{
+        data = json;
+      }}).catch(function () {{}});
+    }})();
+    </script>"""
+
+
+@app.route("/hyperview/runbook", methods=["GET"])
+@require_login
+def hyperview_runbook_page(username):
+    is_admin = _is_admin(username)
+    if not is_admin and not _user_has_operations(username):
+        return _error_page(username, "Your account does not have the Operations permission needed for the Runbook")
+
+    manage_link = (
+        '<a class="ghost page-action" href="/hyperview/runbook/manage">Manage entries &rarr;</a>' if is_admin else ""
+    )
+    view_mode = request.args.get("view", "lookup").strip()
+    if view_mode not in ("lookup", "browse"):
+        view_mode = "lookup"
+
+    if view_mode == "browse":
+        ctx = _runbook_browse("/hyperview/runbook", show_completeness=is_admin)
+        cards_html = "".join(
+            _runbook_device_card_html(name, entries, with_actions=False, show_completeness=is_admin)
+            for name, entries in ctx["device_groups"]
+        )
+        toggle_link = '<a class="ghost page-action" href="/hyperview/runbook?view=lookup">Quick lookup</a>'
+        content_html = f"""
+        {ctx['filter_form_html']}
+        {cards_html or f'<div class="card"><p class="empty">{ctx["empty_note"]}.</p></div>'}
+        {ctx['pager_html'] if ctx['device_groups'] else ''}
+        """
+    else:
+        toggle_link = '<a class="ghost page-action" href="/hyperview/runbook?view=browse">Browse all entries</a>'
+        content_html = _runbook_lookup_html(_hyperview_runbook_devices(), is_admin)
+
+    body = f"""
+    <div class="page-header">
+      <div>
+        <h1>Runbook</h1>
+        <p class="sub">Device + alert type &rarr; what to do about it.{'' if is_admin else ' Read-only.'}</p>
+      </div>
+      <div style="display:flex; gap:8px;">
+        {toggle_link}
+        {manage_link}
+      </div>
+    </div>
+    {_msg_html()}
+    {content_html}
+    """
+    return Response(render_shell("Runbook", body, "runbook-view", username), mimetype="text/html")
+
+
+@app.route("/hyperview/runbook/manage/check-duplicate", methods=["GET"])
+@require_login
+@require_admin
+def hyperview_runbook_check_duplicate(username):
+    device_name = request.args.get("device_name", "").strip()
+    alert_type = request.args.get("alert_type", "").strip()
+    exclude_id_raw = request.args.get("exclude_id", "").strip()
+    exclude_id = int(exclude_id_raw) if exclude_id_raw.isdigit() else None
+    if not device_name or not alert_type:
+        return Response(json.dumps({"duplicate": False}), mimetype="application/json")
+    duplicate = _hyperview_runbook_duplicate_exists(device_name, alert_type, exclude_id)
+    return Response(json.dumps({"duplicate": duplicate}), mimetype="application/json")
+
+
+def _parse_runbook_form_fields(form):
+    """Builds the HYPERVIEW_RUNBOOK_FIELDS payload from a submitted form -
+    the FK fields parse to an int or None, not saved as text."""
+    def fk(name):
+        raw = form.get(name, "").strip()
+        return int(raw) if raw.isdigit() else None
+    return {
+        "device_name": form.get("device_name", "").strip(),
+        "alert_type": form.get("alert_type", "").strip(),
+        "infrastructure_type": form.get("infrastructure_type", "").strip(),
+        "device_type": form.get("device_type", "").strip(),
+        "location_id": fk("location_id"),
+        "action": form.get("action", "").strip(),
+        "primary_contact_id": fk("primary_contact_id"),
+        "escalation_contact_id": fk("escalation_contact_id"),
+    }
+
+
+def _runbook_coverage_section_html():
+    """Every Hyperview alarm ever seen with no matching runbook entry (or
+    only an unconfirmed guess), folded into Runbook Management so gaps show
+    up right where they're fixed. Reads the persisted table, not a live
+    fetch - a gap is a fact about the runbook's completeness, not about
+    whether the alarm that first revealed it happens to still be active, so
+    it stays listed (and keeps working even if Hyperview itself is
+    unreachable right now) until either a real matching entry is added or
+    someone dismisses it."""
+    gaps = _persisted_runbook_coverage_gaps()
+    if not gaps:
+        return ""
+
+    def row_html(g):
+        gap_label = "No runbook entry" if g["gap"] == "no_entry" else "No exact alert match"
+        gap_tone = "danger" if g["gap"] == "no_entry" else "warn"
+        first_seen = datetime.fromtimestamp(g["first_seen_ts"]).strftime("%Y-%m-%d %I:%M %p")
+        last_seen = datetime.fromtimestamp(g["last_seen_ts"]).strftime("%Y-%m-%d %I:%M %p")
+        still_recent = (time.time() - g["last_seen_ts"]) < 2 * HYPERVIEW_STATUS_POLL_SECONDS
+        last_seen_html = (
+            f'<span class="tag" style="background:var(--danger-tint,transparent); color:var(--danger);">Active now</span>'
+            if still_recent else _esc(last_seen)
+        )
+        add_entry_href = (
+            f"/hyperview/runbook/manage/new?device={quote(g['device'])}"
+            f"&alert_type={quote(g['alarm'])}&location={quote(g['location'])}"
+        )
+        return (
+            f'<tr><td>{_esc(g["device"])}</td><td>{_esc(g["location"])}</td><td>{_esc(g["alarm"])}</td>'
+            f'<td><span class="tag" style="background:var(--{gap_tone}-tint,transparent); color:var(--{gap_tone});">'
+            f'{_esc(gap_label)}</span></td>'
+            f'<td>{_esc(first_seen)}</td><td>{last_seen_html}</td>'
+            f'<td><div class="radio-row" style="flex-wrap:wrap; align-items:center; margin:0;">'
+            f'<a class="ghost" href="{add_entry_href}">Add entry</a>'
+            f'<form method="post" action="/hyperview/runbook/manage/coverage-gap/{g["id"]}/dismiss" style="margin:0;" '
+            f'onsubmit="return confirm(&quot;Dismiss this gap? Only do this if it genuinely does not need a runbook '
+            f'entry - it will reappear if the same undocumented alarm happens again.&quot;)">'
+            f'<button type="submit" class="cancel-btn">Dismiss</button></form></div></td></tr>'
+        )
+
+    return f"""
+    <div class="card">
+      <h3>Coverage gaps ({len(gaps)})</h3>
+      <p class="sub" style="margin-top:-4px;">Hyperview alarms with no runbook entry, or with entries but no
+      confident match - the same unconfirmed-guess flag shown on the live board. Stays listed after the alarm
+      clears until the runbook actually covers it, or you dismiss it as not needing an entry.</p>
+      <div class="table-scroll"><table>
+        <tr><th>Device</th><th>Location</th><th>Alarm</th><th>Gap</th><th>First seen</th><th>Last seen</th><th></th></tr>
+        {"".join(row_html(g) for g in gaps)}
+      </table></div>
+    </div>
+    """
+
+
+@app.route("/hyperview/runbook/manage/coverage-gap/<int:gap_id>/dismiss", methods=["POST"])
+@require_login
+@require_admin
+def hyperview_runbook_coverage_gap_dismiss(username, gap_id):
+    _dismiss_runbook_coverage_gap(gap_id)
+    return _redirect_msg("/hyperview/runbook/manage", message="Dismissed coverage gap")
+
+
+@app.route("/hyperview/runbook/manage", methods=["GET"])
+@require_login
+@require_admin
+def hyperview_runbook_manage_page(username):
+    ctx = _runbook_browse("/hyperview/runbook/manage")
+    cards_html = "".join(
+        _runbook_device_card_html(name, entries, with_actions=True) for name, entries in ctx["device_groups"]
+    )
+
+    body = f"""
+    <div class="page-header">
+      <div>
+        <h1>Runbook Management</h1>
+        <p class="sub">Add, edit, or remove runbook entries.</p>
+      </div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <a class="ghost page-action" href="/hyperview/runbook">View runbook &rarr;</a>
+        <a class="ghost page-action" href="/hyperview/runbook/locations">Locations</a>
+        <a class="ghost page-action" href="/hyperview/runbook/contacts">Contacts</a>
+        <a class="ghost page-action" href="/hyperview/runbook/manage/clone">Clone device</a>
+        <a class="ghost page-action" href="/hyperview/runbook/manage/bulk">Bulk update</a>
+        <a class="page-action" href="/hyperview/runbook/manage/new">+ Add entry</a>
+      </div>
+    </div>
+    {_msg_html()}
+    {_runbook_coverage_section_html()}
+    {ctx['filter_form_html']}
+    {cards_html or f'<div class="card"><p class="empty">{ctx["empty_note"]}.</p></div>'}
+    {ctx['pager_html'] if ctx['device_groups'] else ''}
+    """
+    return Response(render_shell("Runbook Management", body, "admin-runbook-manage", username), mimetype="text/html")
+
+
+@app.route("/hyperview/runbook/manage/new", methods=["GET", "POST"])
+@require_login
+@require_admin
+def hyperview_runbook_new(username):
+    if request.method == "POST":
+        fields = _parse_runbook_form_fields(request.form)
+        if not fields["device_name"] or not fields["alert_type"]:
+            return _redirect_msg("/hyperview/runbook/manage/new", error='Device Name and Alert Type are required')
+        ignore_incomplete = request.form.get("ignore_incomplete") == "1"
+        try:
+            _save_hyperview_runbook_entry(None, fields, username, ignore_incomplete=ignore_incomplete)
+        except sqlite3.IntegrityError:
+            return _redirect_msg("/hyperview/runbook/manage/new", error='A runbook entry already exists for that device + alert type')
+        return _redirect_msg("/hyperview/runbook/manage", message='Added runbook entry for ' + fields['device_name'])
+
+    gap_device = request.args.get("device", "").strip()
+    gap_alert_type = request.args.get("alert_type", "").strip()
+    gap_location = request.args.get("location", "").strip()
+    like_device = request.args.get("like", "").strip()
+    # Coming from a coverage gap on a device that already has OTHER entries
+    # (a no_exact_match gap, not no_entry) - default to auto-filling from
+    # its own existing entry rather than leaving the admin to notice and
+    # pick it manually. An explicit ?like= always wins if both are present.
+    implicit_like = bool(gap_device and not like_device and _hyperview_runbook_entries_for_device(gap_device))
+    effective_like = like_device or (gap_device if implicit_like else "")
+
+    e = {c: "" for c in HYPERVIEW_RUNBOOK_FIELDS}
+    e["device_name"] = gap_device
+    e["alert_type"] = gap_alert_type
+    e["ignore_incomplete"] = False
+    prefill_note = ""
+    if effective_like:
+        like_entries = _hyperview_runbook_entries_for_device(effective_like)
+        if like_entries:
+            template = like_entries[0]
+            for c in HYPERVIEW_RUNBOOK_FIELDS:
+                if c not in ("device_name", "alert_type"):
+                    e[c] = template[c]
+            prefill_note = (
+                f'<div class="msg ok">Auto-filled from {_esc(effective_like)}\'s existing entry - '
+                f'update Alert Type and Action as needed.</div>'
+                if implicit_like else
+                f'<div class="msg ok">Auto-filled from {_esc(effective_like)} - '
+                f'update Device Name, Alert Type, and Action as needed.</div>'
+            )
+    if gap_location and not e.get("location_id"):
+        stripped_location = _strip_emoji(gap_location).strip().lower()
+        for loc in _runbook_locations():
+            if loc["name"].strip().lower() == stripped_location:
+                e["location_id"] = loc["id"]
+                break
+    like_device = effective_like
+
+    devices = _hyperview_runbook_devices()
+    device_options = "".join(
+        f'<option value="/hyperview/runbook/manage/new?like={quote(d)}"{" selected" if d == like_device else ""}>'
+        f'{_esc(d)} ({n} entr{"y" if n == 1 else "ies"})</option>'
+        for d, n in devices
+    )
+    autofill_html = f"""
+    <div class="card">
+      <label>Auto-fill from an existing device</label>
+      <select onchange="if (this.value) location.href = this.value;" style="max-width:420px;">
+        <option value="">Start blank...</option>
+        {device_options}
+      </select>
+    </div>"""
+
+    body = _runbook_form_html(
+        e, "/hyperview/runbook/manage/new", "Add a runbook entry", "Add entry", "/hyperview/runbook/manage",
+        _runbook_locations(), _runbook_contacts(),
+        extra_top_html=autofill_html + prefill_note,
+    )
+    return Response(render_shell("Add Runbook Entry", body, "admin-runbook-manage", username), mimetype="text/html")
+
+
+@app.route("/hyperview/runbook/manage/<int:entry_id>/edit", methods=["GET", "POST"])
+@require_login
+@require_admin
+def hyperview_runbook_edit(username, entry_id):
+    existing = _hyperview_runbook_get(entry_id)
+    if not existing:
+        return _error_page(username, "Runbook entry not found", 404)
+
+    if request.method == "POST":
+        fields = _parse_runbook_form_fields(request.form)
+        if not fields["device_name"] or not fields["alert_type"]:
+            return _redirect_msg(f"/hyperview/runbook/manage/{entry_id}/edit", error='Device Name and Alert Type are required')
+        ignore_incomplete = request.form.get("ignore_incomplete") == "1"
+        try:
+            _save_hyperview_runbook_entry(entry_id, fields, username, ignore_incomplete=ignore_incomplete)
+        except sqlite3.IntegrityError:
+            return _redirect_msg(f"/hyperview/runbook/manage/{entry_id}/edit", error='A runbook entry already exists for that device + alert type')
+        return _redirect_msg("/hyperview/runbook/manage", message='Saved runbook entry for ' + fields['device_name'])
+
+    siblings = _hyperview_runbook_entries_for_device(existing["device_name"])
+    siblings_html = ""
+    if len(siblings) > 1:
+        def sibling_link(s):
+            if s["id"] == entry_id:
+                return (
+                    f'<span style="display:inline-block; padding:6px 12px; margin:3px; border-radius:7px; '
+                    f'background:var(--teal); color:#fff; font-size:12px; font-weight:600;">{_esc(s["alert_type"])}</span>'
+                )
+            return f'<a class="ghost" style="margin:3px;" href="/hyperview/runbook/manage/{s["id"]}/edit">{_esc(s["alert_type"])}</a>'
+        links = "".join(sibling_link(s) for s in siblings)
+        siblings_html = f"""
+        <div class="card">
+          <label>Other alert types for {_esc(existing["device_name"])}</label>
+          <div>{links}</div>
+        </div>"""
+
+    body = _runbook_form_html(
+        existing, f"/hyperview/runbook/manage/{entry_id}/edit", "Edit runbook entry", "Save changes", "/hyperview/runbook/manage",
+        _runbook_locations(), _runbook_contacts(),
+        extra_top_html=siblings_html, entry_id=str(entry_id),
+    )
+    return Response(render_shell("Edit Runbook Entry", body, "admin-runbook-manage", username), mimetype="text/html")
+
+
+@app.route("/hyperview/runbook/manage/<int:entry_id>/delete", methods=["POST"])
+@require_login
+@require_admin
+def hyperview_runbook_delete(username, entry_id):
+    _delete_hyperview_runbook_entry(entry_id)
+    return _redirect_msg("/hyperview/runbook/manage", message='Runbook entry removed')
+
+
+@app.route("/hyperview/runbook/manage/<int:entry_id>/toggle-ignore", methods=["POST"])
+@require_login
+@require_admin
+def hyperview_runbook_toggle_ignore(username, entry_id):
+    existing = _hyperview_runbook_get(entry_id)
+    if not existing:
+        return _error_page(username, "Runbook entry not found", 404)
+    fields = {c: existing[c] for c in HYPERVIEW_RUNBOOK_FIELDS}
+    new_flag = not bool(existing["ignore_incomplete"])
+    _save_hyperview_runbook_entry(entry_id, fields, username, ignore_incomplete=new_flag)
+    dest = request.referrer or "/hyperview/runbook/manage"
+    return redirect(dest)
+
+
+@app.route("/hyperview/runbook/manage/clone", methods=["GET", "POST"])
+@require_login
+@require_admin
+def hyperview_runbook_clone(username):
+    if request.method == "POST":
+        source_device = request.form.get("source_device", "").strip()
+        new_device_name = request.form.get("new_device_name", "").strip()
+        if not source_device or not new_device_name:
+            return _redirect_msg("/hyperview/runbook/manage/clone", error='Pick a source device and enter a new device name')
+        source_entries = _hyperview_runbook_entries_for_device(source_device)
+        if not source_entries:
+            return _redirect_msg("/hyperview/runbook/manage/clone", error='That source device has no runbook entries')
+        existing_alert_types = {e["alert_type"].lower() for e in _hyperview_runbook_entries_for_device(new_device_name)}
+        created, skipped = 0, []
+        for src in source_entries:
+            if src["alert_type"].lower() in existing_alert_types:
+                skipped.append(src["alert_type"])
+                continue
+            fields = {c: src[c] for c in HYPERVIEW_RUNBOOK_FIELDS}
+            fields["device_name"] = new_device_name
+            try:
+                _save_hyperview_runbook_entry(None, fields, username, ignore_incomplete=bool(src["ignore_incomplete"]))
+                created += 1
+            except sqlite3.IntegrityError:
+                skipped.append(src["alert_type"])
+        msg = f"Cloned {created} entr{'y' if created == 1 else 'ies'} from {source_device} to {new_device_name}"
+        if skipped:
+            msg += f" ({len(skipped)} skipped, already existed for {new_device_name}: {', '.join(skipped)})"
+        return _redirect_msg("/hyperview/runbook/manage", message=msg)
+
+    devices = _hyperview_runbook_devices()
+    device_options = "".join(
+        f'<option value="{_esc(d)}">{_esc(d)} ({n} entr{"y" if n == 1 else "ies"})</option>' for d, n in devices
+    )
+    body = f"""
+    <div class="page-header">
+      <div>
+        <h1>Clone a device's runbook entries</h1>
+        <p class="sub">Copies every alert type from an existing device onto a new device name - for adding a
+        like-for-like unit (e.g. another CRAC or UPS at the same site) without re-typing each entry.</p>
+      </div>
+    </div>
+    {_msg_html()}
+    <div class="card">
+      <form method="post" action="/hyperview/runbook/manage/clone">
+        <label>Copy from existing device</label>
+        <select name="source_device" required>
+          <option value="">Choose a device...</option>
+          {device_options}
+        </select>
+        <label>New device name</label>
+        <input type="text" name="new_device_name" required placeholder="e.g. CP-DC-CRAC5">
+        <div style="margin-top:10px; display:flex; gap:8px;">
+          <button type="submit">Clone entries</button>
+          <a class="ghost" href="/hyperview/runbook/manage">Cancel</a>
+        </div>
+      </form>
+    </div>
+    """
+    return Response(render_shell("Clone Runbook Device", body, "admin-runbook-manage", username), mimetype="text/html")
+
+
+RUNBOOK_BULK_FIELDS = (
+    "infrastructure_type", "device_type", "action", "location_id", "primary_contact_id", "escalation_contact_id",
+)
+RUNBOOK_BULK_FIELD_LABELS = {
+    "infrastructure_type": "Infrastructure Type", "device_type": "Device Type", "action": "Action",
+    "location_id": "Location", "primary_contact_id": "Primary contact", "escalation_contact_id": "Escalation contact",
+}
+# Picked from a dropdown, not typed as free text.
+RUNBOOK_BULK_FK_FIELDS = ("location_id", "primary_contact_id", "escalation_contact_id")
+
+
+RUNBOOK_BULK_PREVIEW_COLS = ("device_name", "alert_type", "location", "action")
+RUNBOOK_BULK_PREVIEW_LABELS = {"device_name": "Device", "alert_type": "Alert Type", "location": "Location", "action": "Action"}
+
+
+@app.route("/hyperview/runbook/manage/bulk", methods=["GET", "POST"])
+@require_login
+@require_admin
+def hyperview_runbook_bulk(username):
+    q = request.values.get("q", "").strip()
+    location = request.values.get("location", "").strip()
+    infra = request.values.get("infra", "").strip()
+    device = request.values.get("device", "").strip()
+    matches = _hyperview_runbook_entries(q or None, location or None, infra or None, device or None)
+
+    if request.method == "POST":
+        field = request.form.get("field", "").strip()
+        selected_ids = {int(i) for i in request.form.getlist("ids") if i.isdigit()}
+        if field not in RUNBOOK_BULK_FIELDS:
+            return _redirect_msg("/hyperview/runbook/manage/bulk", error='Pick a valid field to update')
+        if field in RUNBOOK_BULK_FK_FIELDS:
+            fk_input = "value_location_id" if field == "location_id" else "value_contact_id"
+            raw = request.form.get(fk_input, "").strip()
+            value = int(raw) if raw.isdigit() else None
+        else:
+            value = request.form.get("value_text", "").strip()
+        selected = [m for m in matches if m["id"] in selected_ids]
+        if not selected:
+            return _redirect_msg("/hyperview/runbook/manage/bulk", error='Check at least one entry to update')
+        for m in selected:
+            fields = {c: m[c] for c in HYPERVIEW_RUNBOOK_FIELDS}
+            fields[field] = value
+            _save_hyperview_runbook_entry(m["id"], fields, username, ignore_incomplete=bool(m["ignore_incomplete"]))
+        label = RUNBOOK_BULK_FIELD_LABELS[field]
+        msg = f"Updated {label} on {len(selected)} entr{'y' if len(selected) == 1 else 'ies'}"
+        return _redirect_msg("/hyperview/runbook/manage", message=msg)
+
+    locations, infra_types, device_types = _hyperview_runbook_filter_options()
+    all_locations, all_contacts = _runbook_locations(), _runbook_contacts()
+
+    def options_html(values, current):
+        opts = ''.join(
+            f'<option value="{_esc(v)}"{" selected" if v == current else ""}>{_esc(v)}</option>' for v in values
+        )
+        return f'<option value="">All</option>{opts}'
+
+    field_options = "".join(
+        f'<option value="{c}">{_esc(RUNBOOK_BULK_FIELD_LABELS[c])}</option>' for c in RUNBOOK_BULK_FIELDS
+    )
+    location_value_options = "".join(f'<option value="{loc["id"]}">{_esc(loc["name"])}</option>' for loc in all_locations)
+    contact_value_options = "".join(
+        f'<option value="{c["id"]}">{_esc(_runbook_contact_option_label(c))}</option>' for c in all_contacts
+    )
+
+    def preview_row(m):
+        cells = "".join(f'<td>{_esc(m[c])}</td>' for c in RUNBOOK_BULK_PREVIEW_COLS)
+        return f'<tr><td><input type="checkbox" class="runbook-bulk-check" name="ids" value="{m["id"]}" onchange="updateRunbookBulkCount()"></td>{cells}</tr>'
+
+    preview_rows = "".join(preview_row(m) for m in matches)
+    count_label = f'{len(matches)} entr{"y" if len(matches) == 1 else "ies"}'
+    header_cells = "".join(f'<th>{_esc(RUNBOOK_BULK_PREVIEW_LABELS[c])}</th>' for c in RUNBOOK_BULK_PREVIEW_COLS)
+
+    results_and_apply_html = f"""
+    <form method="post" action="/hyperview/runbook/manage/bulk" onsubmit="return submitRunbookBulk({len(matches)})">
+      <input type="hidden" name="q" value="{_esc(q)}">
+      <input type="hidden" name="location" value="{_esc(location)}">
+      <input type="hidden" name="infra" value="{_esc(infra)}">
+      <input type="hidden" name="device" value="{_esc(device)}">
+      <div class="card">
+        <p><strong>{count_label}</strong> match the current filters - check the ones you want to change.</p>
+        <div class="table-scroll"><table>
+          <tr><th><input type="checkbox" id="runbook-bulk-select-all" onchange="toggleAllRunbookBulk(this)"></th>{header_cells}</tr>
+          {preview_rows}
+        </table></div>
+      </div>
+      <div class="card">
+        <label>Field to update</label>
+        <select name="field" id="rb-bulk-field" required onchange="rbBulkFieldChanged()">
+          <option value="">Choose a field...</option>
+          {field_options}
+        </select>
+        <div id="rb-bulk-value-text">
+          <label>New value</label>
+          <textarea name="value_text" rows="3" style="width:100%; max-width:520px;"></textarea>
+        </div>
+        <div id="rb-bulk-value-location" style="display:none;">
+          <label>New location</label>
+          <select name="value_location_id">
+            <option value="">No location</option>
+            {location_value_options}
+          </select>
+        </div>
+        <div id="rb-bulk-value-contact" style="display:none;">
+          <label>New contact</label>
+          <select name="value_contact_id">
+            <option value="">None</option>
+            {contact_value_options}
+          </select>
+        </div>
+        <div style="margin-top:10px; display:flex; align-items:center; gap:8px;">
+          <button type="submit">Apply to <span id="runbook-bulk-selected-count">0</span> selected</button>
+          <a class="ghost" href="/hyperview/runbook/manage">Cancel</a>
+        </div>
+      </div>
+    </form>
+    <script>
+      function toggleAllRunbookBulk(cb) {{
+        document.querySelectorAll('.runbook-bulk-check').forEach(el => el.checked = cb.checked);
+        updateRunbookBulkCount();
+      }}
+      function updateRunbookBulkCount() {{
+        const n = document.querySelectorAll('.runbook-bulk-check:checked').length;
+        document.getElementById('runbook-bulk-selected-count').textContent = n;
+      }}
+      function rbBulkFieldChanged() {{
+        const field = document.getElementById('rb-bulk-field').value;
+        const isLocation = field === 'location_id';
+        const isContact = field === 'primary_contact_id' || field === 'escalation_contact_id';
+        document.getElementById('rb-bulk-value-text').style.display = (!isLocation && !isContact) ? '' : 'none';
+        document.getElementById('rb-bulk-value-location').style.display = isLocation ? '' : 'none';
+        document.getElementById('rb-bulk-value-contact').style.display = isContact ? '' : 'none';
+      }}
+      rbBulkFieldChanged();
+      function submitRunbookBulk(totalMatches) {{
+        const n = document.querySelectorAll('.runbook-bulk-check:checked').length;
+        if (n === 0) {{ alert('Check at least one entry to update.'); return false; }}
+        return confirm('This will overwrite the selected field on ' + n + ' of ' + totalMatches + ' entries. Continue?');
+      }}
+    </script>
+    """ if matches else '<div class="card"><p class="empty">No entries match - adjust the filters above.</p></div>'
+
+    body = f"""
+    <div class="page-header">
+      <div>
+        <h1>Bulk update runbook entries</h1>
+        <p class="sub">Filter down to a set of entries, check the ones you want, then apply one field's new value
+        to just those - e.g. rewriting one instruction everywhere it's used, without touching entries that only
+        happen to share the same device or alert type.</p>
+      </div>
+    </div>
+    {_msg_html()}
+    <div class="card">
+      <form method="GET" action="/hyperview/runbook/manage/bulk" class="radio-row" style="flex-wrap:wrap; align-items:center; gap:10px;">
+        <input type="text" name="q" value="{_esc(q)}" placeholder="Search device, alert type, instruction, or contact..." style="flex:1; min-width:200px;">
+        <label style="display:flex; align-items:center; gap:6px; margin:0;">Location
+          <select name="location">{options_html(locations, location)}</select>
+        </label>
+        <label style="display:flex; align-items:center; gap:6px; margin:0;">Infra
+          <select name="infra">{options_html(infra_types, infra)}</select>
+        </label>
+        <label style="display:flex; align-items:center; gap:6px; margin:0;">Device
+          <select name="device">{options_html(device_types, device)}</select>
+        </label>
+        <button type="submit" class="ghost">Filter</button>
+      </form>
+    </div>
+    {results_and_apply_html}
+    """
+    return Response(render_shell("Bulk Update Runbook", body, "admin-runbook-manage", username), mimetype="text/html")
+
+
+@app.route("/hyperview/runbook/locations", methods=["GET"])
+@require_login
+@require_admin
+def hyperview_runbook_locations_page(username):
+    locations = _runbook_locations()
+
+    def row(loc):
+        delete_btn = (
+            f'<button type="submit" class="ghost" style="color:var(--danger);">Delete</button>'
+            if not loc["usage_count"] else
+            f'<span class="sub" title="Reassign these entries first (Bulk update) before deleting.">'
+            f'{loc["usage_count"]} entr{"y" if loc["usage_count"] == 1 else "ies"} in use</span>'
+        )
+        delete_form = (
+            f'<form method="post" action="/hyperview/runbook/locations/{loc["id"]}/delete" style="display:inline;" '
+            f'onsubmit="return confirm(\'Delete location \\\'{_esc(loc["name"])}\\\'?\')">{delete_btn}</form>'
+            if not loc["usage_count"] else delete_btn
+        )
+        return (
+            f'<tr><td>{_esc(loc["name"])}</td><td>{_esc(loc["address"]) or "&mdash;"}</td>'
+            f'<td class="n">{loc["usage_count"]}</td>'
+            f'<td><a class="ghost" href="/hyperview/runbook/locations/{loc["id"]}/edit">Edit</a></td>'
+            f'<td>{delete_form}</td></tr>'
+        )
+
+    rows_html = "".join(row(loc) for loc in locations)
+    body = f"""
+    <div class="page-header">
+      <div>
+        <h1>Runbook Locations</h1>
+        <p class="sub">Managed separately from individual runbook entries - edit a location's name or address here
+        and every entry that points at it updates automatically.</p>
+      </div>
+      <div style="display:flex; gap:8px;">
+        <a class="ghost page-action" href="/hyperview/runbook/manage">&larr; Back to Runbook Management</a>
+        <a class="page-action" href="/hyperview/runbook/locations/new">+ Add location</a>
+      </div>
+    </div>
+    {_msg_html()}
+    <div class="card">
+      {f'''<div class="table-scroll"><table>
+        <tr><th>Name</th><th>Address</th><th>Used by</th><th></th><th></th></tr>
+        {rows_html}
+      </table></div>''' if locations else '<p class="empty">No locations yet - add one to start linking runbook entries to it.</p>'}
+    </div>
+    """
+    return Response(render_shell("Runbook Locations", body, "admin-runbook-manage", username), mimetype="text/html")
+
+
+def _runbook_location_form_html(loc, action, heading, submit_label):
+    return f"""
+    <div class="page-header"><div><h1>{_esc(heading)}</h1></div></div>
+    {_msg_html()}
+    <div class="card">
+      <form method="post" action="{action}">
+        <label>Name</label>
+        <input type="text" name="name" value="{_esc(loc['name'])}" required>
+        <label>Address</label>
+        <input type="text" name="address" value="{_esc(loc['address'])}">
+        <div style="margin-top:10px; display:flex; gap:8px;">
+          <button type="submit">{_esc(submit_label)}</button>
+          <a class="ghost" href="/hyperview/runbook/locations">Cancel</a>
+        </div>
+      </form>
+    </div>"""
+
+
+@app.route("/hyperview/runbook/locations/new", methods=["GET", "POST"])
+@require_login
+@require_admin
+def hyperview_runbook_location_new(username):
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        address = request.form.get("address", "").strip()
+        if not name:
+            return _redirect_msg("/hyperview/runbook/locations/new", error='Name is required')
+        try:
+            _save_runbook_location(None, name, address)
+        except sqlite3.IntegrityError:
+            return _redirect_msg("/hyperview/runbook/locations/new", error='A location with that name already exists')
+        return _redirect_msg("/hyperview/runbook/locations", message='Added location ' + name)
+    body = _runbook_location_form_html({"name": "", "address": ""}, "/hyperview/runbook/locations/new", "Add a location", "Add location")
+    return Response(render_shell("Add Location", body, "admin-runbook-manage", username), mimetype="text/html")
+
+
+@app.route("/hyperview/runbook/locations/<int:location_id>/edit", methods=["GET", "POST"])
+@require_login
+@require_admin
+def hyperview_runbook_location_edit(username, location_id):
+    existing = _runbook_location_get(location_id)
+    if not existing:
+        return _error_page(username, "Location not found", 404)
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        address = request.form.get("address", "").strip()
+        if not name:
+            return _redirect_msg(f"/hyperview/runbook/locations/{location_id}/edit", error='Name is required')
+        try:
+            _save_runbook_location(location_id, name, address)
+        except sqlite3.IntegrityError:
+            return _redirect_msg(f"/hyperview/runbook/locations/{location_id}/edit", error='A location with that name already exists')
+        return _redirect_msg("/hyperview/runbook/locations", message='Saved location ' + name)
+    body = _runbook_location_form_html(existing, f"/hyperview/runbook/locations/{location_id}/edit", "Edit location", "Save changes")
+    return Response(render_shell("Edit Location", body, "admin-runbook-manage", username), mimetype="text/html")
+
+
+@app.route("/hyperview/runbook/locations/<int:location_id>/delete", methods=["POST"])
+@require_login
+@require_admin
+def hyperview_runbook_location_delete(username, location_id):
+    in_use = _delete_runbook_location(location_id)
+    return _delete_with_usage_check("/hyperview/runbook/locations", in_use, "location", "Location removed")
+
+
+@app.route("/hyperview/runbook/contacts", methods=["GET"])
+@require_login
+@require_admin
+def hyperview_runbook_contacts_page(username):
+    contacts = _runbook_contacts()
+
+    def row(c):
+        delete_btn = (
+            f'<button type="submit" class="ghost" style="color:var(--danger);">Delete</button>'
+            if not c["usage_count"] else
+            f'<span class="sub" title="Reassign these entries first (Bulk update) before deleting.">'
+            f'{c["usage_count"]} entr{"y" if c["usage_count"] == 1 else "ies"} in use</span>'
+        )
+        delete_form = (
+            f'<form method="post" action="/hyperview/runbook/contacts/{c["id"]}/delete" style="display:inline;" '
+            f'onsubmit="return confirm(\'Delete contact \\\'{_esc(c["name"])}\\\'?\')">{delete_btn}</form>'
+            if not c["usage_count"] else delete_btn
+        )
+        return (
+            f'<tr><td>{_esc(c["name"]) or "&mdash;"}</td><td>{_esc(c["phone"]) or "&mdash;"}</td>'
+            f'<td class="n">{c["usage_count"]}</td>'
+            f'<td><a class="ghost" href="/hyperview/runbook/contacts/{c["id"]}/edit">Edit</a></td>'
+            f'<td>{delete_form}</td></tr>'
+        )
+
+    rows_html = "".join(row(c) for c in contacts)
+    body = f"""
+    <div class="page-header">
+      <div>
+        <h1>Runbook Contacts</h1>
+        <p class="sub">Managed separately from individual runbook entries - edit a contact's phone number here
+        and every entry that references them (as primary or escalation) updates automatically.</p>
+      </div>
+      <div style="display:flex; gap:8px;">
+        <a class="ghost page-action" href="/hyperview/runbook/manage">&larr; Back to Runbook Management</a>
+        <a class="page-action" href="/hyperview/runbook/contacts/new">+ Add contact</a>
+      </div>
+    </div>
+    {_msg_html()}
+    <div class="card">
+      {f'''<div class="table-scroll"><table>
+        <tr><th>Name</th><th>Phone</th><th>Used by</th><th></th><th></th></tr>
+        {rows_html}
+      </table></div>''' if contacts else '<p class="empty">No contacts yet - add one to start linking runbook entries to it.</p>'}
+    </div>
+    """
+    return Response(render_shell("Runbook Contacts", body, "admin-runbook-manage", username), mimetype="text/html")
+
+
+def _runbook_contact_form_html(c, action, heading, submit_label):
+    return f"""
+    <div class="page-header"><div><h1>{_esc(heading)}</h1></div></div>
+    {_msg_html()}
+    <div class="card">
+      <form method="post" action="{action}">
+        <label>Name</label>
+        <input type="text" name="name" value="{_esc(c['name'])}">
+        <label>Phone</label>
+        <input type="text" name="phone" value="{_esc(c['phone'])}">
+        <div style="margin-top:10px; display:flex; gap:8px;">
+          <button type="submit">{_esc(submit_label)}</button>
+          <a class="ghost" href="/hyperview/runbook/contacts">Cancel</a>
+        </div>
+      </form>
+    </div>"""
+
+
+@app.route("/hyperview/runbook/contacts/new", methods=["GET", "POST"])
+@require_login
+@require_admin
+def hyperview_runbook_contact_new(username):
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        phone = request.form.get("phone", "").strip()
+        if not name and not phone:
+            return _redirect_msg("/hyperview/runbook/contacts/new", error='Enter a name or phone number')
+        _save_runbook_contact(None, name, phone)
+        return _redirect_msg("/hyperview/runbook/contacts", message='Added contact ' + (name or phone))
+    body = _runbook_contact_form_html({"name": "", "phone": ""}, "/hyperview/runbook/contacts/new", "Add a contact", "Add contact")
+    return Response(render_shell("Add Contact", body, "admin-runbook-manage", username), mimetype="text/html")
+
+
+@app.route("/hyperview/runbook/contacts/<int:contact_id>/edit", methods=["GET", "POST"])
+@require_login
+@require_admin
+def hyperview_runbook_contact_edit(username, contact_id):
+    existing = _runbook_contact_get(contact_id)
+    if not existing:
+        return _error_page(username, "Contact not found", 404)
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        phone = request.form.get("phone", "").strip()
+        if not name and not phone:
+            return _redirect_msg(f"/hyperview/runbook/contacts/{contact_id}/edit", error='Enter a name or phone number')
+        _save_runbook_contact(contact_id, name, phone)
+        return _redirect_msg("/hyperview/runbook/contacts", message='Saved contact ' + (name or phone))
+    body = _runbook_contact_form_html(existing, f"/hyperview/runbook/contacts/{contact_id}/edit", "Edit contact", "Save changes")
+    return Response(render_shell("Edit Contact", body, "admin-runbook-manage", username), mimetype="text/html")
+
+
+@app.route("/hyperview/runbook/contacts/<int:contact_id>/delete", methods=["POST"])
+@require_login
+@require_admin
+def hyperview_runbook_contact_delete(username, contact_id):
+    in_use = _delete_runbook_contact(contact_id)
+    return _delete_with_usage_check("/hyperview/runbook/contacts", in_use, "contact", "Contact removed")
+
+
+DOWNTIME_CSS = """
+  .downtime-wrap { max-width: none; }
+  .downtime-attention { background: var(--panel); border: 1px solid var(--danger);
+    border-radius: var(--radius, 10px); box-shadow: var(--shadow-sm); margin-bottom: 16px; overflow: hidden; }
+  .downtime-attention.downtime-all-ok { border-color: var(--ok); }
+  .downtime-attention-row { display: flex; align-items: center; gap: 12px; padding: 9px 16px;
+    border-bottom: 1px solid var(--border); font-size: 13px; }
+  .downtime-attention-row:last-child { border-bottom: none; }
+  .downtime-attention-row .downtime-dot { width: 8px; height: 8px; border-radius: 50%;
+    background: var(--danger); flex-shrink: 0; }
+  .downtime-attention-row .downtime-host { font-weight: 700; color: var(--teal-dark); min-width: 90px; }
+  .downtime-attention-row .downtime-grp { color: var(--text-faint); font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.03em; min-width: 110px; white-space: nowrap; }
+  .downtime-attention-row .downtime-desc { flex: 1; color: var(--text-dim); overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .downtime-attention-row .downtime-hours { color: var(--danger); font-weight: 600; white-space: nowrap; }
+
+  .downtime-ping-status { font-size: 10.5px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.03em; padding: 2px 7px; border-radius: 4px; white-space: nowrap; }
+  .downtime-ping-status-down-service { background: var(--warn-tint, rgba(230,126,34,.15)); color: var(--warn); }
+  .downtime-ping-status-offline { background: var(--danger-tint); color: var(--danger); }
+  .downtime-ping-status-unknown { background: var(--panel-raised); color: var(--text-faint); }
+  .downtime-dot-down-service { background: var(--warn) !important; }
+  .downtime-dot-offline { background: var(--danger) !important; }
+  .downtime-dot-unknown { background: var(--text-faint) !important; }
+  .downtime-attention-row .downtime-row-msg { font-size: 11.5px; color: var(--text-faint); white-space: nowrap; }
+  .downtime-attention-row button { margin: 0; padding: 5px 12px; font-size: 12px; flex-shrink: 0; }
+  .downtime-restart-all-msg { font-size: 12px; color: var(--text-faint); padding: 0 16px; }
+  .downtime-restart-all-msg:not(:empty) { padding: 8px 16px; border-bottom: 1px solid var(--border); }
+  .downtime-restart-unavailable { font-size: 11px; color: var(--text-faint); font-style: italic;
+    flex-shrink: 0; white-space: nowrap; }
+  .downtime-all-ok-msg { display: flex; align-items: center; gap: 10px; padding: 14px 16px;
+    color: var(--teal-dark); font-weight: 600; font-size: 13.5px; }
+
+  .downtime-dot-acked { background: var(--text-faint) !important; }
+  .downtime-acked-badge { font-size: 10.5px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.03em; padding: 2px 7px; border-radius: 4px;
+    background: var(--panel-raised); color: var(--text-faint); white-space: nowrap; }
+
+  .downtime-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 14px; }
+  .downtime-card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius, 10px);
+    box-shadow: var(--shadow-sm); padding: 16px 18px; display: flex; flex-direction: column; gap: 7px;
+    text-align: left; cursor: pointer; font-family: inherit;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.1s ease; }
+  .downtime-card:hover { border-color: var(--teal); box-shadow: var(--shadow-md); transform: translateY(-1px); }
+  .downtime-card.downtime-card-alert { border-color: var(--danger); box-shadow: inset 0 0 0 1px var(--danger); }
+  .downtime-card.downtime-card-acked { border-color: var(--text-faint); box-shadow: inset 0 0 0 1px var(--text-faint); }
+  .downtime-card h3 { margin: 0; font-size: 14px; color: var(--teal); text-transform: uppercase;
+    letter-spacing: 0.03em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .downtime-card-count { font-size: 26px; font-weight: 700; color: var(--ok); line-height: 1.1; }
+  .downtime-card-count.downtime-card-alert-count { color: var(--danger); }
+  .downtime-card-count.downtime-card-acked-count { color: var(--text-faint); }
+  .downtime-card-sub { font-size: 12px; color: var(--text-faint); }
+  .downtime-card-bar { height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; margin-top: 2px; }
+  .downtime-card-bar-fill { height: 100%; background: var(--ok); }
+  .downtime-card.downtime-card-alert .downtime-card-bar-fill { background: var(--danger); }
+  .downtime-card.downtime-card-acked .downtime-card-bar-fill { background: var(--text-faint); }
+
+  .downtime-tile { flex: 1 1 calc(50% - 3px); min-width: 76px; display: flex; align-items: center;
+    justify-content: center; gap: 5px; border: none; border-radius: 6px; padding: 6px 4px;
+    font-size: 11px; font-weight: 700; cursor: pointer; color: #fff;
+    background: var(--ok); font-family: inherit; transition: opacity 0.1s ease; }
+  .downtime-tile:hover { opacity: 0.82; }
+  .downtime-tile.downtime-alert { background: var(--danger); }
+  .downtime-tile.downtime-alert.downtime-tile-acked { background: var(--text-faint); }
+  .downtime-badge { background: rgba(0,0,0,0.35); border-radius: 4px; padding: 0 5px; font-size: 10px; }
+  .downtime-group-panel { display: none; }
+  .downtime-group-body { display: flex; flex-wrap: wrap; gap: 6px; max-height: 60vh; overflow-y: auto; padding: 2px; }
+
+  .downtime-modal { position: fixed; inset: 0; z-index: 50; background: rgba(0,0,0,0.4);
+    display: none; align-items: center; justify-content: center; padding: 16px; }
+  .downtime-modal-card { background: var(--panel); border-radius: var(--radius, 10px); width: 100%;
+    max-width: 420px; box-shadow: var(--shadow-md); padding: 18px 20px; }
+  .downtime-modal-card.downtime-modal-wide { max-width: 560px; }
+  .downtime-modal-card h3 { margin: 0 0 12px; color: var(--teal); }
+  .downtime-modal-row { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0;
+    border-bottom: 1px solid var(--border); font-size: 13px; }
+  .downtime-modal-row span:first-child { color: var(--text-dim); }
+  .downtime-detail-msg { font-size: 13px; margin-top: 10px; min-height: 18px; }
+  .downtime-detail-msg.ok { color: var(--teal-dark); }
+  .downtime-detail-msg.err { color: var(--danger); }
+  .downtime-modal-actions { display: flex; gap: 10px; margin-top: 14px; }
+  .downtime-detail-history-link {
+    display: inline-flex; align-items: center; justify-content: center;
+    font-family: inherit; font-weight: 600; font-size: 12px; padding: 8px 14px;
+    border-radius: 8px; border: 1.5px solid var(--border-bright); background: #fff;
+    color: var(--text-dim); text-decoration: none; cursor: pointer;
+  }
+  .downtime-detail-history-link:hover { border-color: var(--teal); color: var(--teal); }
+
+  @media (max-width: 720px) {
+    .downtime-attention-row { flex-wrap: wrap; row-gap: 6px; }
+    .downtime-attention-row .downtime-desc { flex: 1 1 100%; order: 5; overflow: visible; white-space: normal; }
+    .downtime-attention-row .downtime-hours { order: 6; }
+    .downtime-attention-row .downtime-row-msg { order: 7; flex: 1 1 100%; white-space: normal; }
+    .downtime-attention-row button, .downtime-attention-row .downtime-restart-unavailable { order: 8; margin-left: auto; }
+    .downtime-modal-actions { flex-wrap: wrap; }
+    .downtime-modal-actions button { flex: 1 1 100%; }
+  }
+"""
+
+DOWNTIME_SCRIPT = """
+<script>
+(function () {
+  var detailModal = document.getElementById('downtime-detail-modal');
+  var groupModal = document.getElementById('downtime-group-modal');
+
+  function openDetail(d) {
+    document.getElementById('downtime-detail-host').textContent = d.hostname;
+    document.getElementById('downtime-detail-desc').textContent = d.desc || '(no description)';
+    document.getElementById('downtime-detail-checkin').textContent = d.lastcheckin + ' (' + d.hoursold + 'h ago)';
+    var statusText = d.alert === '1' ? (d.pingstatus || 'Not reporting') : 'Reporting normally';
+    if (d.alert === '1' && d.acked === '1') {
+      statusText += ' (acknowledged';
+      statusText += d.incident ? ', Incident #' + d.incident + ')' : ')';
+    }
+    document.getElementById('downtime-detail-status').textContent = statusText;
+    document.getElementById('downtime-detail-history').href = '/device/downtime/' + encodeURIComponent(d.hostname);
+    var msgEl = document.getElementById('downtime-detail-msg');
+    msgEl.textContent = '';
+    msgEl.className = 'downtime-detail-msg';
+    var restartBtn = document.getElementById('downtime-detail-restart');
+    restartBtn.hidden = d.pingstatus === 'PC Not Responding';
+    detailModal.dataset.hostname = d.hostname;
+    detailModal.style.display = 'flex';
+  }
+
+  function doRestart(hostname, msgEl) {
+    if (!confirm('Restart the downtime reporting service on ' + hostname + '? This briefly interrupts reporting on that workstation.')) return;
+    msgEl.textContent = 'Restarting...';
+    msgEl.className = msgEl.className.replace(/ (ok|err)\\b/g, '');
+    fetch('/downtime/restart', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'hostname=' + encodeURIComponent(hostname),
+    })
+    .then(function (r) { return r.json().then(function (data) { return {ok: r.ok, data: data}; }); })
+    .then(function (result) {
+      msgEl.textContent = result.data.message || result.data.error || 'Unknown response';
+      msgEl.className += ' ' + (result.ok ? 'ok' : 'err');
+    })
+    .catch(function (e) {
+      msgEl.textContent = 'Request failed: ' + e;
+      msgEl.className += ' err';
+    });
+  }
+
+  document.querySelectorAll('.downtime-attention-row').forEach(function (row) {
+    var msgEl = row.querySelector('.downtime-row-msg');
+    var restartBtn = row.querySelector('.downtime-restart-btn');
+    if (restartBtn) restartBtn.addEventListener('click', function () { doRestart(row.dataset.hostname, msgEl); });
+  });
+
+  var restartAllBtn = document.getElementById('downtime-restart-all-btn');
+  if (restartAllBtn) {
+    restartAllBtn.addEventListener('click', function () {
+      var count = restartAllBtn.textContent.match(/\\((\\d+)\\)/);
+      count = count ? count[1] : 'these';
+      if (!confirm('Restart the downtime reporting service on ' + count + ' workstation(s) currently down? ' +
+        'Workstations not responding to ping are skipped. This runs in the background - you can keep using InfraWatch while it works.')) return;
+      restartAllBtn.disabled = true;
+      var summaryEl = document.getElementById('downtime-restart-all-msg');
+      summaryEl.textContent = 'Starting bulk restart...';
+      fetch('/downtime/restart/bulk', { method: 'POST' })
+        .then(function (r) { return r.json().then(function (data) { return {ok: r.ok, data: data}; }); })
+        .then(function (result) {
+          if (!result.ok) {
+            summaryEl.textContent = result.data.error || 'Could not start bulk restart';
+            restartAllBtn.disabled = false;
+            return;
+          }
+          var hosts = result.data.hosts;
+          var skipped = result.data.skipped_ping || [];
+          var skippedNote = skipped.length ? (' (' + skipped.length + ' skipped, not responding to ping)') : '';
+          summaryEl.textContent = 'Restarting ' + hosts.length + ' workstation(s) in the background' + skippedNote + '...';
+          hosts.forEach(function (h) {
+            var row = document.querySelector('.downtime-attention-row[data-hostname="' + CSS.escape(h) + '"]');
+            var m = row && row.querySelector('.downtime-row-msg');
+            if (m) { m.textContent = 'Queued...'; m.className = 'downtime-row-msg'; }
+          });
+          function poll() {
+            fetch('/downtime/restart/bulk/' + result.data.job_id + '/status')
+              .then(function (r) { return r.json(); })
+              .then(function (job) {
+                var doneCount = 0;
+                (job.results || []).forEach(function (res) {
+                  var row = document.querySelector('.downtime-attention-row[data-hostname="' + CSS.escape(res.hostname) + '"]');
+                  var m = row && row.querySelector('.downtime-row-msg');
+                  if (res.status === 'pending') return;
+                  doneCount++;
+                  if (!m) return;
+                  m.textContent = res.detail || res.status;
+                  m.className = 'downtime-row-msg ' + (res.status === 'success' ? 'ok' : 'err');
+                });
+                if (job.status === 'done') {
+                  summaryEl.textContent = 'Bulk restart finished - ' + doneCount + ' of ' + hosts.length + ' processed' + skippedNote + '.';
+                  restartAllBtn.disabled = false;
+                } else {
+                  summaryEl.textContent = 'Restarting in the background: ' + doneCount + ' of ' + hosts.length + ' done' + skippedNote + '...';
+                  setTimeout(poll, 2000);
+                }
+              })
+              .catch(function () { setTimeout(poll, 3000); });
+          }
+          poll();
+        })
+        .catch(function (e) {
+          summaryEl.textContent = 'Request failed: ' + e;
+          restartAllBtn.disabled = false;
+        });
+    });
+  }
+
+  document.querySelectorAll('.downtime-card').forEach(function (card) {
+    card.addEventListener('click', function () {
+      var panel = document.getElementById('downtime-group-panel-' + card.dataset.group);
+      if (!panel) return;
+      document.getElementById('downtime-group-modal-title').textContent = card.dataset.groupName;
+      document.getElementById('downtime-group-modal-body').innerHTML = panel.innerHTML;
+      groupModal.style.display = 'flex';
+    });
+  });
+  document.getElementById('downtime-group-modal-close').addEventListener('click', function () {
+    groupModal.style.display = 'none';
+  });
+  groupModal.addEventListener('click', function (e) {
+    if (e.target === groupModal) { groupModal.style.display = 'none'; }
+  });
+  document.getElementById('downtime-group-modal-body').addEventListener('click', function (e) {
+    var tile = e.target.closest('.downtime-tile');
+    if (tile) { openDetail(tile.dataset); }
+  });
+
+  document.getElementById('downtime-detail-close').addEventListener('click', function () {
+    detailModal.style.display = 'none';
+  });
+  detailModal.addEventListener('click', function (e) {
+    if (e.target === detailModal) { detailModal.style.display = 'none'; }
+  });
+  document.getElementById('downtime-detail-restart').addEventListener('click', function () {
+    doRestart(detailModal.dataset.hostname, document.getElementById('downtime-detail-msg'));
+  });
+
+  (function () {
+    var host = new URLSearchParams(location.search).get('host');
+    if (!host) return;
+    var tile = document.querySelector('.downtime-group-panel [data-hostname="' + CSS.escape(host) + '"]');
+    if (!tile) return;
+    var panel = tile.closest('.downtime-group-panel');
+    var slug = panel.id.replace('downtime-group-panel-', '');
+    var card = document.querySelector('.downtime-card[data-group="' + CSS.escape(slug) + '"]');
+    if (card) card.click();
+    openDetail(tile.dataset);
+  })();
+})();
+</script>
+"""
+
+DOWNTIME_DETAIL_MODAL_HTML = """
+<div id="downtime-detail-modal" class="downtime-modal" style="z-index:60;">
+  <div class="downtime-modal-card">
+    <h3 id="downtime-detail-host"></h3>
+    <div class="downtime-modal-row"><span>Description</span><span id="downtime-detail-desc"></span></div>
+    <div class="downtime-modal-row"><span>Last check-in</span><span id="downtime-detail-checkin"></span></div>
+    <div class="downtime-modal-row"><span>Status</span><span id="downtime-detail-status"></span></div>
+    <div id="downtime-detail-msg" class="downtime-detail-msg"></div>
+    <div class="downtime-modal-actions">
+      <button type="button" id="downtime-detail-restart">Restart Downtime Service</button>
+      <a id="downtime-detail-history" class="downtime-detail-history-link" href="#">View History</a>
+      <button type="button" id="downtime-detail-close" class="ghost">Close</button>
+    </div>
+  </div>
+</div>
+<div id="downtime-group-modal" class="downtime-modal">
+  <div class="downtime-modal-card downtime-modal-wide">
+    <h3 id="downtime-group-modal-title"></h3>
+    <div id="downtime-group-modal-body" class="downtime-group-body"></div>
+    <div class="downtime-modal-actions">
+      <button type="button" id="downtime-group-modal-close" class="ghost">Close</button>
+    </div>
+  </div>
+</div>
+"""
+
+
+def _downtime_slug(group):
+    return re.sub(r"[^a-zA-Z0-9]+", "-", group).strip("-").lower() or "group"
+
+
+def _ping_host(hostname, timeout_seconds=2):
+    try:
+        result = subprocess.run(
+            ["ping", "-c", "1", "-W", str(timeout_seconds), hostname],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout_seconds + 2,
+        )
+        return result.returncode == 0
+    except FileNotFoundError:
+        return None
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+def _ping_hosts(hostnames):
+    hostnames = list(dict.fromkeys(hostnames))
+    if not hostnames:
+        return {}
+    with ThreadPoolExecutor(max_workers=min(16, len(hostnames))) as pool:
+        results = list(pool.map(_ping_host, hostnames))
+    return dict(zip(hostnames, results))
+
+
+def _downtime_ping_status(alive):
+    if alive is True:
+        return "Down Service", "down-service"
+    if alive is False:
+        return "PC Not Responding", "offline"
+    return "Ping unavailable", "unknown"
+
+
+def _downtime_tile_html(row, ping_results=None, acks=None):
+    alive = ping_results.get(row.get("strhostname")) if ping_results is not None else None
+    is_alert = _downtime_row_is_issue(row, alive)
+    undelivered = row.get("intpackageundelivered") or 0
+    badge = f'<span class="downtime-badge">{undelivered}</span>' if undelivered else ""
+    ping_label = ""
+    if is_alert and ping_results is not None:
+        ping_label, _ = _downtime_ping_status(ping_results.get(row.get("strhostname")))
+    ack = (acks or {}).get(row.get("strhostname")) if is_alert else None
+    is_acked = bool(ack)
+    incident_number = (ack or {}).get("incident_number") or ""
+    tile_cls = "downtime-tile"
+    if is_alert:
+        tile_cls += " downtime-alert"
+        if is_acked:
+            tile_cls += " downtime-tile-acked"
+    return (
+        f'<button type="button" class="{tile_cls}" '
+        f'data-hostname="{_esc(row.get("strhostname"))}" data-desc="{_esc(row.get("strhostdesc"))}" '
+        f'data-lastcheckin="{_esc(row.get("strlastcheckin"))}" '
+        f'data-hoursold="{_esc(row.get("intlastcheckin_hoursold"))}" data-alert="{1 if is_alert else 0}" '
+        f'data-pingstatus="{_esc(ping_label)}" data-acked="{1 if is_acked else 0}" '
+        f'data-incident="{_esc(incident_number)}">'
+        f'{_esc(row.get("strhostname"))}{badge}</button>'
+    )
+
+
+def _downtime_attention_html(rows, ping_results, acks):
+    alerting = sorted(
+        _downtime_issue_rows(rows, ping_results),
+        key=lambda r: -(r.get("intlastcheckin_hoursold") or 0),
+    )
+    if not alerting:
+        return '<div class="downtime-attention downtime-all-ok"><div class="downtime-all-ok-msg">&#10003; All workstations reporting normally</div></div>'
+
+    def attention_row(r):
+        hostname = r.get("strhostname")
+        ack = acks.get(hostname)
+        alive = ping_results.get(hostname)
+        if ack:
+            cls = "acked"
+            incident_txt = f' &middot; Incident #{_esc(ack["incident_number"])}' if ack.get("incident_number") else ""
+            status_html = f'<span class="downtime-acked-badge">Acknowledged by {_esc(ack["set_by"])}{incident_txt}</span>'
+        else:
+            label, cls = _downtime_ping_status(alive)
+            status_html = f'<span class="downtime-ping-status downtime-ping-status-{cls}">{_esc(label)}</span>'
+        restart_html = (
+            '<span class="downtime-restart-unavailable" title="This PC is not responding to ping - a service restart would not reach it.">Restart unavailable</span>'
+            if alive is False else
+            '<button type="button" class="ghost downtime-restart-btn">Service Restart</button>'
+        )
+        return f"""
+      <div class="downtime-attention-row" data-hostname="{_esc(hostname)}">
+        <span class="downtime-dot downtime-dot-{cls}"></span>
+        <span class="downtime-host">{_esc(hostname)}</span>
+        <span class="downtime-grp">{_esc(r.get('strgroupname'))}</span>
+        {status_html}
+        <span class="downtime-desc">{_esc(r.get('strhostdesc'))}</span>
+        <span class="downtime-hours">{_esc(r.get('intlastcheckin_hoursold'))}h since check-in</span>
+        <span class="downtime-row-msg"></span>
+        {restart_html}
+      </div>"""
+
+    rows_html = "".join(attention_row(r) for r in alerting)
+    restartable = sum(1 for r in alerting if ping_results.get(r.get("strhostname")) is not False)
+    restart_all_html = (
+        f'<button type="button" class="ghost" id="downtime-restart-all-btn">Restart all down ({restartable})</button>'
+        if restartable else ""
+    )
+    return f"""
+    <div class="downtime-attention">
+      <div class="panel-head">
+        <h2>Needs Attention</h2>
+        <div style="display:flex; align-items:center; gap:12px;">
+          <span class="count-note">{len(alerting)} workstation(s)</span>
+          {restart_all_html}
+        </div>
+      </div>
+      <div id="downtime-restart-all-msg" class="downtime-restart-all-msg"></div>
+      {rows_html}
+    </div>"""
+
+
+def _downtime_cards_html(rows, ping_results, acks):
+    groups = {}
+    for r in rows:
+        groups.setdefault(r.get("strgroupname", ""), []).append(r)
+
+    def sort_key(item):
+        group, items = item
+        alerts = len(_downtime_issue_rows(items, ping_results))
+        return (0 if alerts else 1, -alerts, group)
+
+    cards, panels = [], []
+    for group, items in sorted(groups.items(), key=sort_key):
+        issue_items = _downtime_issue_rows(items, ping_results)
+        alerts = len(issue_items)
+        unacked_alerts = sum(1 for r in issue_items if r.get("strhostname") not in acks)
+        ok_count = len(items) - alerts
+        pct = round(100 * ok_count / len(items)) if items else 100
+        if unacked_alerts:
+            state_cls = " downtime-card-alert"
+            count_cls = " downtime-card-alert-count"
+        elif alerts:
+            state_cls = " downtime-card-acked"
+            count_cls = " downtime-card-acked-count"
+        else:
+            state_cls = ""
+            count_cls = ""
+        slug = _downtime_slug(group)
+        cards.append(f"""
+        <button type="button" class="downtime-card{state_cls}" data-group="{slug}" data-group-name="{_esc(group)}">
+          <h3>{_esc(group)}</h3>
+          <div class="downtime-card-count{count_cls}">{ok_count}/{len(items)}</div>
+          <div class="downtime-card-sub">reporting normally</div>
+          <div class="downtime-card-bar"><div class="downtime-card-bar-fill" style="width:{pct}%;"></div></div>
+        </button>""")
+        tiles = "".join(
+            _downtime_tile_html(r, ping_results, acks) for r in sorted(items, key=lambda r: r.get("strhostname") or "")
+        )
+        panels.append(f'<div class="downtime-group-panel" id="downtime-group-panel-{slug}">{tiles}</div>')
+
+    empty_html = '<p class="empty">No workstations reported.</p>'
+    return f'<div class="downtime-grid">{"".join(cards) or empty_html}</div>{"".join(panels)}'
+
+
+def _downtime_alert_state(rows, acks=None, ping_results=None):
+    if acks is None:
+        acks = _active_downtime_acks()
+    candidates = [r for r in rows if r.get("strclassname") == "cssDeviceAlert"]
+    if ping_results is None:
+        ping_results = _ping_hosts([r.get("strhostname") for r in candidates])
+    alerting = _downtime_issue_rows(candidates, ping_results)
+    unacked = [r for r in alerting if r.get("strhostname") not in acks]
+    return bool(unacked), bool(alerting) and not unacked
+
+
+def _downtime_board_html(rows):
+    alerting_hosts = [r.get("strhostname") for r in rows if r.get("strclassname") == "cssDeviceAlert"]
+    ping_results = _ping_hosts(alerting_hosts)
+    acks = _active_downtime_acks()
+    return (
+        f'<div class="downtime-wrap">'
+        f'{_downtime_attention_html(rows, ping_results, acks)}'
+        f'{_downtime_cards_html(rows, ping_results, acks)}'
+        f'</div>'
+    )
+
+
+class _PypsexecNotConfigured(Exception):
+    pass
+
+
+def _restart_downtime_service(hostname, upn, password):
+    try:
+        from pypsexec.client import Client
+    except ImportError:
+        raise _PypsexecNotConfigured(
+            "The 'pypsexec' package isn't installed in this Python environment. Install it with: pip install pypsexec"
+        )
+
+    def _process_running(client):
+        stdout, _, _ = client.run_executable(
+            "C:\\Windows\\System32\\tasklist.exe",
+            arguments=f'/FI "IMAGENAME eq {DOWNTIME_SERVICE_PROCESS}" /FO CSV /NH',
+            timeout_seconds=30,
+        )
+        return DOWNTIME_SERVICE_PROCESS.lower() in (stdout or b"").decode("utf-8", "ignore").lower()
+
+    client = Client(hostname, username=upn, password=password, encrypt=True)
+    client.connect()
+    try:
+        client.create_service()
+        try:
+            client.run_executable(
+                "C:\\Windows\\System32\\taskkill.exe",
+                arguments=f'/F /FI "imagename eq {DOWNTIME_SERVICE_PROCESS}"',
+                timeout_seconds=30,
+                use_system_account=True,
+            )
+            if _process_running(client):
+                raise RuntimeError(
+                    f"Could not stop the existing {DOWNTIME_SERVICE_PROCESS} process on {hostname} - "
+                    "it's still running after taskkill. It may be running under a different account "
+                    "or be protected against termination; the workstation needs to be checked directly."
+                )
+            exe_dir = ntpath.dirname(DOWNTIME_SERVICE_EXE) or None
+            client.run_executable(
+                DOWNTIME_SERVICE_EXE, asynchronous=True, working_dir=exe_dir, use_system_account=True,
+            )
+            time.sleep(DOWNTIME_RESTART_VERIFY_DELAY_SECONDS)
+            return _process_running(client)
+        finally:
+            client.remove_service()
+    finally:
+        client.disconnect()
+
+
+@app.route("/downtime")
+@require_login
+def downtime_page(username):
+    if "downtime" not in _user_systems(username):
+        return _error_page(username, "Your account does not have access to Downtime Workstations")
+    rows = _fetch_downtime_data()
+    board = _bridge_unreachable_html("Downtime Workstations", DOWNTIME_FEED_URL) if rows is None else _downtime_board_html(rows)
+    body = f"""
+    <div class="page-header">
+      <div>
+        <h1>Downtime Workstations</h1>
+        <p class="sub">Live reporting status for every downtime workstation.</p>
+      </div>
+    </div>
+    <style>{DOWNTIME_CSS}</style>
+    {board}
+    {DOWNTIME_DETAIL_MODAL_HTML}
+    {DOWNTIME_SCRIPT}
+    {DASHBOARD_AUTO_REFRESH_SCRIPT}
+    """
+    return Response(render_shell("Downtime Workstations", body, "downtime", username), mimetype="text/html")
+
+
+@app.route("/downtime/restart", methods=["POST"])
+@require_login
+def downtime_restart(username):
+    if "downtime" not in _user_systems(username):
+        return Response(json.dumps({"error": "Your account does not have access to 'downtime'"}),
+                         403, content_type="application/json")
+    if session.get("auth_source") != "ldap":
+        return Response(
+            json.dumps({"error": "Downtime restart runs as your own domain account, so it needs a session "
+                                  "signed in via LDAP - this session authenticated as a local account instead."}),
+            400, content_type="application/json",
+        )
+    password = _get_ldap_credential(session.get("cred_token"))
+    if not password:
+        return Response(
+            json.dumps({"error": "Your login session doesn't have a cached credential for this - log out and back in, then try again."}),
+            401, content_type="application/json",
+        )
+    hostname = request.form.get("hostname", "").strip()
+    if not hostname:
+        return Response(json.dumps({"error": "Missing hostname"}), 400, content_type="application/json")
+    known_rows = _fetch_downtime_data()
+    known_hosts = {r.get("strhostname") for r in (known_rows or [])}
+    if hostname not in known_hosts:
+        return Response(json.dumps({"error": f"Unknown workstation: {hostname}"}), 400, content_type="application/json")
+    try:
+        confirmed = _restart_downtime_service(hostname, f"{username}@{_ldap_domain()}", password)
+    except _PypsexecNotConfigured as e:
+        return Response(json.dumps({"error": str(e)}), 500, content_type="application/json")
+    except Exception as e:
+        return Response(json.dumps({"error": f"Could not restart on {hostname}: {e}"}), 502, content_type="application/json")
+    try:
+        _log_maintenance_action(
+            "downtime", "restarted", hostname, "workstation",
+            "Downtime service restart" if confirmed else "Downtime service restart (process not confirmed running afterward)",
+            username,
+        )
+    except Exception:
+        pass
+    if not confirmed:
+        return Response(
+            json.dumps({"error": f"Restart command sent to {hostname}, but {DOWNTIME_SERVICE_PROCESS} "
+                                  f"wasn't running there {DOWNTIME_RESTART_VERIFY_DELAY_SECONDS}s later - it "
+                                  f"may have failed to start. Check the workstation directly."}),
+            502, content_type="application/json",
+        )
+    return Response(json.dumps({"message": f"Restart triggered on {hostname} - process confirmed running."}),
+                     200, content_type="application/json")
+
+
+_bulk_restart_jobs_lock = threading.Lock()
+_bulk_restart_jobs = {}
+
+
+def _run_bulk_downtime_restart(job_id, hostnames, upn, password, started_by):
+    for hostname in hostnames:
+        try:
+            confirmed = _restart_downtime_service(hostname, upn, password)
+            status = "success" if confirmed else "failed"
+            detail = (
+                "Restart confirmed" if confirmed
+                else f"{DOWNTIME_SERVICE_PROCESS} wasn't running there afterward - may have failed to start"
+            )
+        except Exception as e:
+            status, detail = "failed", str(e)
+        with _bulk_restart_jobs_lock:
+            job = _bulk_restart_jobs.get(job_id)
+            if job is None:
+                return
+            for r in job["results"]:
+                if r["hostname"] == hostname:
+                    r["status"], r["detail"] = status, detail
+                    break
+        try:
+            _log_maintenance_action(
+                "downtime", "restarted", hostname, "workstation",
+                "Bulk downtime service restart" if status == "success" else f"Bulk downtime service restart ({detail})",
+                started_by,
+            )
+        except Exception:
+            pass
+    with _bulk_restart_jobs_lock:
+        job = _bulk_restart_jobs.get(job_id)
+        if job:
+            job["status"] = "done"
+
+
+@app.route("/downtime/restart/bulk", methods=["POST"])
+@require_login
+def downtime_restart_bulk_start(username):
+    if "downtime" not in _user_systems(username):
+        return Response(json.dumps({"error": "Your account does not have access to 'downtime'"}),
+                         403, content_type="application/json")
+    if session.get("auth_source") != "ldap":
+        return Response(
+            json.dumps({"error": "Downtime restart runs as your own domain account, so it needs a session "
+                                  "signed in via LDAP - this session authenticated as a local account instead."}),
+            400, content_type="application/json",
+        )
+    password = _get_ldap_credential(session.get("cred_token"))
+    if not password:
+        return Response(
+            json.dumps({"error": "Your login session doesn't have a cached credential for this - log out and back in, then try again."}),
+            401, content_type="application/json",
+        )
+    rows = _fetch_downtime_data()
+    if rows is None:
+        return Response(json.dumps({"error": "Could not reach the downtime feed"}), 502, content_type="application/json")
+    candidates = [r for r in rows if r.get("strclassname") == "cssDeviceAlert"]
+    ping_results = _ping_hosts([r.get("strhostname") for r in candidates])
+    alerting = _downtime_issue_rows(candidates, ping_results)
+    skipped_ping = [r.get("strhostname") for r in alerting if ping_results.get(r.get("strhostname")) is False]
+    hostnames = [r.get("strhostname") for r in alerting if ping_results.get(r.get("strhostname")) is not False]
+    if not hostnames:
+        return Response(
+            json.dumps({"error": "Nothing to restart - no workstations are currently down with a reachable ping."}),
+            400, content_type="application/json",
+        )
+
+    job_id = secrets.token_hex(16)
+    with _bulk_restart_jobs_lock:
+        _bulk_restart_jobs[job_id] = {
+            "started_by": username,
+            "status": "running",
+            "results": [{"hostname": h, "status": "pending", "detail": ""} for h in hostnames],
+        }
+    thread = threading.Thread(
+        target=_run_bulk_downtime_restart,
+        args=(job_id, hostnames, f"{username}@{_ldap_domain()}", password, username),
+        daemon=True,
+    )
+    thread.start()
+    return Response(
+        json.dumps({"job_id": job_id, "hosts": hostnames, "skipped_ping": skipped_ping}),
+        200, content_type="application/json",
+    )
+
+
+@app.route("/downtime/restart/bulk/<job_id>/status")
+@require_login
+def downtime_restart_bulk_status(username, job_id):
+    if "downtime" not in _user_systems(username):
+        return Response(json.dumps({"error": "Your account does not have access to 'downtime'"}),
+                         403, content_type="application/json")
+    with _bulk_restart_jobs_lock:
+        job = _bulk_restart_jobs.get(job_id)
+        if not job or job["started_by"] != username:
+            return Response(json.dumps({"error": "Unknown job"}), 404, content_type="application/json")
+        payload = {"status": job["status"], "results": list(job["results"])}
+    return Response(json.dumps(payload), 200, content_type="application/json")
+
+
+AUTO_RESTART_SET_BY = "auto-restart"
+# Every automated actor that can appear as set_by, across every system -
+# never a human, so never counted as a responder in User Activity or
+# Leadership's workload/responder-credit views. Kept as one set so a new
+# automated actor only needs adding here, not re-discovered independently
+# at each place that filters people from processes.
+#
+# "system" isn't one of InfraWatch's own generated markers like the other
+# three - it's a real logged-in account name (LDAP or local) used as a
+# shared/service login rather than by one individual, so actions performed
+# under it get excluded the same way. If another shared/non-human account
+# name shows up in this view, add it here too.
+NON_HUMAN_SET_BY_VALUES = {ALARM_MONITOR_SET_BY, AUTO_RESTART_SET_BY, HYPERVIEW_UPSTREAM_ACK_SET_BY, "system"}
+AUTO_RESTART_DOWNTIME_SETTING_KEY = "downtime_auto_restart_enabled"
+AUTO_RESTART_DOWNTIME_CHECK_INTERVAL_SECONDS = int(os.environ.get("AUTO_RESTART_DOWNTIME_CHECK_INTERVAL_SECONDS", "300"))
+AUTO_RESTART_DOWNTIME_MAX_ATTEMPTS = int(os.environ.get("AUTO_RESTART_DOWNTIME_MAX_ATTEMPTS", "2"))
+AUTO_RESTART_DOWNTIME_COOLDOWN_SECONDS = int(os.environ.get("AUTO_RESTART_DOWNTIME_COOLDOWN_SECONDS", str(4 * 3600)))
+# A restart just triggered - by a human or by this same automation - needs a
+# little time to actually bring the service back up and clear the host from
+# the down list. Without this, a host a human JUST restarted (set_by is
+# their username, not AUTO_RESTART_SET_BY, so the attempt-count check below
+# never sees it) still shows as down on the very next tick and gets an
+# automatic restart piled on top of the one that just ran. Deliberately
+# shorter than AUTO_RESTART_DOWNTIME_CHECK_INTERVAL_SECONDS (the gap between
+# ticks) so this never blocks the automation's own legitimate next attempt -
+# it only guards against restarting something within the same tick's window
+# of an action that hasn't had a chance to take effect yet.
+AUTO_RESTART_RECENT_RESTART_GRACE_SECONDS = int(os.environ.get("AUTO_RESTART_RECENT_RESTART_GRACE_SECONDS", "180"))
+
+# Identifies this process for the process_locks table below - if the app is
+# deployed with more than one worker process, each one runs its own copy of
+# the auto-restart loop, so a lease lock keeps restarts to a single instance.
+_AUTO_RESTART_INSTANCE_ID = secrets.token_hex(8)
+AUTO_RESTART_LOCK_NAME = "downtime_auto_restart"
+AUTO_RESTART_LOCK_LEASE_SECONDS = max(AUTO_RESTART_DOWNTIME_CHECK_INTERVAL_SECONDS * 2, 60)
+
+
+def _auto_restart_downtime_enabled():
+    return _get_app_setting(AUTO_RESTART_DOWNTIME_SETTING_KEY, "0") == "1"
+
+
+def _set_auto_restart_downtime_enabled(enabled):
+    _set_app_setting(AUTO_RESTART_DOWNTIME_SETTING_KEY, "1" if enabled else "0")
+
+
+def _try_acquire_process_lock(name, owner, lease_seconds):
+    now = int(time.time())
+    conn = _maintenance_log_db()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO process_locks (name, owner, expires_at) VALUES (?, '', 0)",
+            (name,),
+        )
+        cur = conn.execute(
+            "UPDATE process_locks SET owner = ?, expires_at = ? "
+            "WHERE name = ? AND (owner = ? OR expires_at < ?)",
+            (owner, now + lease_seconds, name, owner, now),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def _recent_auto_restart_attempt_count(hostname, since_ts):
+    conn = _maintenance_log_db()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM maintenance_actions "
+            "WHERE system = 'downtime' AND action = 'restarted' AND target = ? AND set_by = ? AND ts >= ?",
+            (hostname, AUTO_RESTART_SET_BY, since_ts),
+        ).fetchone()
+        return row[0] if row else 0
+    finally:
+        conn.close()
+
+
+def _recent_restart_count_any_actor(hostname, since_ts):
+    """Restarts of this host by anyone - human or automatic - since since_ts.
+    Used as a short grace check so auto-restart doesn't pile onto a restart
+    that just ran (by a human or by itself) before it's had time to take
+    effect, distinct from _recent_auto_restart_attempt_count's longer-window
+    'give up after N automatic tries' cap."""
+    conn = _maintenance_log_db()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM maintenance_actions "
+            "WHERE system = 'downtime' AND action = 'restarted' AND target = ? AND ts >= ?",
+            (hostname, since_ts),
+        ).fetchone()
+        return row[0] if row else 0
+    finally:
+        conn.close()
+
+
+_auto_restart_status_lock = threading.Lock()
+_auto_restart_status = {
+    "last_tick_ts": None,
+    "credential_username": None,
+    "pending_hosts": [],
+    "capped_hosts": [],
+    "recently_restarted_hosts": [],
+    "last_error": None,
+    "lock_owner": None,
+}
+
+
+def _auto_restart_downtime_tick():
+    cred = _auto_restart_credential()
+    with _auto_restart_status_lock:
+        _auto_restart_status["last_tick_ts"] = int(time.time())
+        _auto_restart_status["credential_username"] = cred[0] if cred else None
+        _auto_restart_status["pending_hosts"] = []
+        _auto_restart_status["capped_hosts"] = []
+        _auto_restart_status["recently_restarted_hosts"] = []
+        _auto_restart_status["last_error"] = None
+        _auto_restart_status["lock_owner"] = _AUTO_RESTART_INSTANCE_ID
+
+    if not _auto_restart_downtime_enabled():
+        return
+    # Only one process at a time actually restarts hosts, so a multi-worker
+    # deployment doesn't double up on the same down workstation.
+    if not _try_acquire_process_lock(AUTO_RESTART_LOCK_NAME, _AUTO_RESTART_INSTANCE_ID, AUTO_RESTART_LOCK_LEASE_SECONDS):
+        return
+    rows = _fetch_downtime_data()
+    if not rows:
+        with _auto_restart_status_lock:
+            _auto_restart_status["last_error"] = "Could not reach the downtime feed"
+        return
+    candidates = [r for r in rows if r.get("strclassname") == "cssDeviceAlert"]
+    ping_results = _ping_hosts([r.get("strhostname") for r in candidates])
+    alerting = _downtime_issue_rows(candidates, ping_results)
+    hostnames = [r.get("strhostname") for r in alerting if ping_results.get(r.get("strhostname")) is not False]
+    if not hostnames:
+        return
+
+    now = int(time.time())
+    cutoff = now - AUTO_RESTART_DOWNTIME_COOLDOWN_SECONDS
+    recent_cutoff = now - AUTO_RESTART_RECENT_RESTART_GRACE_SECONDS
+    eligible, capped, recently_restarted = [], [], []
+    for hostname in hostnames:
+        # A restart just ran - by a human or by this automation - and needs
+        # a few minutes to take effect before it's fair to call this host
+        # still down. Checked first and independent of set_by, so it also
+        # catches a human's restart that this automation's own
+        # AUTO_RESTART_SET_BY-only attempt count would otherwise miss.
+        if AUTO_RESTART_RECENT_RESTART_GRACE_SECONDS > 0 and _recent_restart_count_any_actor(hostname, recent_cutoff) > 0:
+            recently_restarted.append(hostname)
+        elif _recent_auto_restart_attempt_count(hostname, cutoff) >= AUTO_RESTART_DOWNTIME_MAX_ATTEMPTS:
+            capped.append(hostname)
+        else:
+            eligible.append(hostname)
+    with _auto_restart_status_lock:
+        _auto_restart_status["pending_hosts"] = list(eligible)
+        _auto_restart_status["capped_hosts"] = list(capped)
+        _auto_restart_status["recently_restarted_hosts"] = list(recently_restarted)
+    if not eligible:
+        return
+
+    if cred is None:
+        with _auto_restart_status_lock:
+            _auto_restart_status["last_error"] = (
+                "Workstations are down and eligible for auto-restart, but no admin with 'downtime' access "
+                "has an active LDAP-signed-in session to borrow a credential from."
+            )
+        return
+    cred_username, password = cred
+
+    for hostname in eligible:
+        if not _auto_restart_downtime_enabled():
+            break
+        try:
+            confirmed = _restart_downtime_service(hostname, f"{cred_username}@{_ldap_domain()}", password)
+            detail = (
+                f"Automatic restart (ran using {cred_username}'s cached credentials) - confirmed running" if confirmed
+                else f"Automatic restart (ran using {cred_username}'s cached credentials) - "
+                     f"{DOWNTIME_SERVICE_PROCESS} wasn't running there afterward"
+            )
+        except Exception as e:
+            detail = f"Automatic restart (ran using {cred_username}'s cached credentials) failed: {e}"
+        try:
+            _log_maintenance_action("downtime", "restarted", hostname, "workstation", detail, AUTO_RESTART_SET_BY)
+        except Exception:
+            pass
+
+
+def _run_auto_restart_downtime_loop():
+    while True:
+        try:
+            _auto_restart_downtime_tick()
+        except Exception as e:
+            with _auto_restart_status_lock:
+                _auto_restart_status["last_error"] = str(e)
+        time.sleep(AUTO_RESTART_DOWNTIME_CHECK_INTERVAL_SECONDS)
+
+
+threading.Thread(target=_run_auto_restart_downtime_loop, daemon=True).start()
+
+
+@app.route("/admin/config/auto-restart", methods=["POST"])
+@require_login
+@require_admin
+def admin_config_auto_restart(username):
+    enabled = request.form.get("enabled") == "1"
+    _set_auto_restart_downtime_enabled(enabled)
+    return redirect("/admin/config")
+
+
+DASHBOARD_VIDEOWALL_SHELL = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{title} - Kiosk</title>
+<link rel="icon" type="image/png" href="data:image/png;base64,{favicon_b64}">
+<title>{title} - Videowall</title>
 <style>
   :root {{
-    --bg: #060b0d; --panel: #0e181b; --panel-raised: #122024; --border: #223338;
-    --text: #f2f6f6; --text-dim: #a9bcbc; --text-faint: #7d9494;
-    --teal: #6cb2ef; --teal-dark: #8fc0ef; --teal-tint: #163049;
+    --bg: #070c10; --panel: #101a20; --panel-raised: #142129; --border: #22323c;
+    --text: #f2f6f8; --text-dim: #a9bcc4; --text-faint: #7c919a;
+    --teal: #6cb2ef; --teal-dark: #8fc0ef; --teal-tint: #16324d;
     --danger: #ff5d80; --danger-dark: #ff5d80; --danger-tint: #401323;
     --warn: #f2b447; --ok: #57d999;
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+    --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.35);
+    --radius: 10px;
   }}
   * {{ box-sizing: border-box; }}
+
+  html, body {{ height: 100%; overflow: hidden; }}
   body {{
     margin: 0; background: var(--bg); color: var(--text);
     font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, Arial, sans-serif;
-    padding: 28px 34px 40px; font-size: 16px;
+
+    padding: 28px 34px 40px; font-size: 18px; -webkit-font-smoothing: antialiased;
   }}
-  .kiosk-header {{ display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 20px; }}
-  .kiosk-header h1 {{ margin: 0; font-size: 26px; }}
-  .kiosk-header .kiosk-subtitle {{ margin-top: 2px; font-size: 15px; color: var(--text-dim); }}
-  .kiosk-header .clock {{ font-size: 22px; font-weight: 700; color: var(--text-dim); font-variant-numeric: tabular-nums; }}
+  #videowall-fit {{ transform-origin: top left; }}
+  .videowall-header {{ display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 20px; }}
+  .videowall-header h1 {{ margin: 0; font-size: 26px; }}
+  .videowall-header .videowall-subtitle {{ margin-top: 2px; font-size: 15px; color: var(--text-dim); }}
+  .videowall-header .clock {{ font-size: 22px; font-weight: 700; color: var(--text-dim); font-variant-numeric: tabular-nums; }}
   {component_css}
   .panel-head h2 {{ font-size: 18px; color: var(--text); }}
   table.matrix, table.summary, table.alarmlog {{ font-size: 15px; }}
   table.matrix thead th, table.summary thead th, table.alarmlog thead th {{ font-size: 12px; }}
   .clear-mark {{ font-size: 17px; }}
-  .gauge-score-num {{ font-size: 40px; }}
+  .health-medallion {{ width: 76px; height: 76px; }}
+  .health-medallion svg {{ width: 38px; height: 38px; }}
+  .health-state {{ font-size: 22px; }}
+  .health-detail {{ font-size: 15px; }}
   .status-banner {{ font-size: 17px; }}
   @media (prefers-reduced-motion: no-preference) {{
-    .sev-dot {{ animation: kiosk-pulse 2.4s ease-in-out infinite; }}
+    .sev-dot {{ animation: videowall-pulse 2.4s ease-in-out infinite; }}
   }}
-  @keyframes kiosk-pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.45; }} }}
-  .kiosk-rotate-badge {{
+  @keyframes videowall-pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.45; }} }}
+  .videowall-rotate-badge {{
     position: fixed; bottom: 18px; right: 22px; background: var(--panel);
     border: 1px solid var(--border); border-radius: 999px; padding: 8px 16px;
-    font-size: 13px; color: var(--text-dim); box-shadow: 0 4px 14px rgba(0,0,0,0.35);
+    font-size: 13px; color: var(--text-dim); box-shadow: var(--shadow-md);
   }}
-  .kiosk-rotate-badge a {{ color: var(--teal); text-decoration: none; margin-left: 6px; }}
-  .kiosk-rotate-badge a:hover {{ text-decoration: underline; }}
-  /* Unattended wall display, so a color change alone isn't enough - this
-     is what kioskCriticalCue() below turns on when the current dashboard
-     has any Critical item, a pulsing red vignette around the whole
-     screen that reads from across a room even before anyone's close
-     enough to read the table it's tied to. */
-  body.kiosk-alert::after {{
+  .videowall-rotate-badge a {{ color: var(--teal); text-decoration: none; margin-left: 6px; }}
+  .videowall-rotate-badge a:hover {{ text-decoration: underline; }}
+  .videowall-mute-btn {{
+    font-family: inherit; font-size: 13px; font-weight: 600; color: var(--text-dim);
+    background: var(--panel); border: 1px solid var(--border); border-radius: 999px;
+    padding: 6px 14px; cursor: pointer; transition: border-color 0.12s ease, color 0.12s ease;
+  }}
+  .videowall-mute-btn:hover {{ border-color: var(--teal); color: var(--teal); }}
+  .videowall-mute-btn.muted {{ color: var(--danger); border-color: var(--danger); }}
+
+  .videowall-exit-btn {{
+    font-family: inherit; font-size: 13px; font-weight: 600; color: var(--text-dim);
+    background: var(--panel); border: 1px solid var(--border); border-radius: 999px;
+    padding: 6px 14px; text-decoration: none; transition: border-color 0.12s ease, color 0.12s ease;
+  }}
+  .videowall-exit-btn:hover {{ border-color: var(--teal); color: var(--teal); }}
+
+  body.videowall-alert::after {{
     content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 9999;
-    animation: kiosk-critical-pulse 1.6s ease-in-out infinite;
+    animation: videowall-critical-pulse 1.6s ease-in-out infinite;
   }}
-  @keyframes kiosk-critical-pulse {{
-    0%, 100% {{ box-shadow: inset 0 0 0 0 rgba(255, 93, 128, 0); }}
-    50% {{ box-shadow: inset 0 0 0 14px rgba(255, 93, 128, 0.55); }}
+  body.videowall-alert.tone-warn {{ --alert-color: var(--warn); }}
+  body.videowall-alert.tone-danger {{ --alert-color: var(--danger); }}
+  @keyframes videowall-critical-pulse {{
+    0%, 100% {{ box-shadow: inset 0 0 0 0 color-mix(in srgb, var(--alert-color, var(--danger)) 0%, transparent); }}
+    50% {{ box-shadow: inset 0 0 0 14px color-mix(in srgb, var(--alert-color, var(--danger)) 55%, transparent); }}
   }}
+  body.videowall-alert-solid::after {{
+    content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 9999;
+    box-shadow: inset 0 0 0 8px color-mix(in srgb, var(--alert-color, var(--warn)) 40%, transparent);
+  }}
+  body.videowall-alert-solid.tone-warn {{ --alert-color: var(--warn); }}
+  body.videowall-alert-solid.tone-danger {{ --alert-color: var(--danger); }}
 </style>
 </head>
 <body>
   <script>
-    // Shared by every /kiosk page (see kioskCriticalCue call sites in
-    // HYPERVIEW_SCRIPT and the ipro/ooma kiosk routes below) - one place
-    // that owns the flash + beep so a future dashboard's kiosk route
-    // just calls window.kioskCriticalCue(true/false) too, nothing new to
-    // wire up here. Wrapped in try/catch because WebAudio can throw if
-    // the browser is blocking autoplay before any user gesture on this
-    // page - common for a kiosk browser depending on how it's launched;
-    // the CSS flash still applies either way, only the beep is at risk.
     (function () {{
       var audioCtx = null;
-      var wasCritical = false;
-      window.kioskCriticalCue = function (hasCritical) {{
+      var nagIntervalId = null;
+      var muted = false;
+      try {{ muted = localStorage.getItem('videowallMuted') === '1'; }} catch (e) {{}}
+
+      function renderMuteBtn(btn) {{
+        btn.textContent = muted ? 'Sound Off' : 'Sound On';
+        btn.classList.toggle('muted', muted);
+      }}
+      document.addEventListener('DOMContentLoaded', function () {{
+        var muteBtn = document.getElementById('videowall-mute-btn');
+        if (!muteBtn) return;
+        renderMuteBtn(muteBtn);
+        muteBtn.addEventListener('click', function () {{
+          muted = !muted;
+          try {{ localStorage.setItem('videowallMuted', muted ? '1' : '0'); }} catch (e) {{}}
+          renderMuteBtn(muteBtn);
+        }});
+      }});
+
+      function playNagBeep() {{
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        var t0 = audioCtx.currentTime;
+        [0, 0.22].forEach(function (offset) {{
+          var osc = audioCtx.createOscillator();
+          var gain = audioCtx.createGain();
+          osc.type = 'square';
+          osc.frequency.value = 1046.5;
+          gain.gain.setValueAtTime(0.0001, t0 + offset);
+          gain.gain.exponentialRampToValueAtTime(0.18, t0 + offset + 0.02);
+          gain.gain.exponentialRampToValueAtTime(0.0001, t0 + offset + 0.18);
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start(t0 + offset);
+          osc.stop(t0 + offset + 0.2);
+        }});
+      }}
+
+      window.videowallCriticalCue = function (hasUnacked, hasAckedOnly, tone) {{
         try {{
-          document.body.classList.toggle('kiosk-alert', !!hasCritical);
-          if (hasCritical && !wasCritical) {{
-            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-            var osc = audioCtx.createOscillator();
-            var gain = audioCtx.createGain();
-            osc.frequency.value = 880;
-            gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
-            gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.5);
-            osc.connect(gain);
-            gain.connect(audioCtx.destination);
-            osc.start();
-            osc.stop(audioCtx.currentTime + 0.5);
+          document.body.classList.toggle('videowall-alert', !!hasUnacked);
+          document.body.classList.toggle('videowall-alert-solid', !hasUnacked && !!hasAckedOnly);
+          var isDanger = tone !== 'warn';
+          var anyAlert = !!hasUnacked || !!hasAckedOnly;
+          document.body.classList.toggle('tone-danger', anyAlert && isDanger);
+          document.body.classList.toggle('tone-warn', anyAlert && !isDanger);
+          if (hasUnacked) {{
+            if (!nagIntervalId) {{
+              if (!muted) playNagBeep();
+              nagIntervalId = setInterval(function () {{ if (!muted) playNagBeep(); }}, 4000);
+            }}
+          }} else if (nagIntervalId) {{
+            clearInterval(nagIntervalId);
+            nagIntervalId = null;
           }}
-          wasCritical = !!hasCritical;
-        }} catch (e) {{ /* autoplay blocked or WebAudio unsupported - flash still ran above */ }}
+        }} catch (e) {{}}
       }};
     }})();
   </script>
-  <div class="kiosk-header">
-    <div>
-      <h1>Covenant Health &middot; Facility Systems</h1>
-      <div class="kiosk-subtitle">{title}</div>
+  <div id="videowall-fit">
+    <div class="videowall-header">
+      <div>
+        <h1>Covenant Health &middot; Facility Systems</h1>
+        <div class="videowall-subtitle">{title}</div>
+      </div>
+      <div style="display:flex; align-items:center; gap:16px;">
+        {exit_link}
+        <button id="videowall-mute-btn" class="videowall-mute-btn" type="button">Sound On</button>
+        <div class="clock" id="videowall-clock">--:--:--</div>
+      </div>
     </div>
-    <div class="clock" id="kiosk-clock">--:--:--</div>
+    {board}
   </div>
-  {board}
   {script}
+  <script>
+    (function () {{
+      var el = document.getElementById('videowall-fit');
+      if (!el) return;
+      var pending = false;
+      function fit() {{
+        el.style.zoom = 1;
+        var bodyStyle = getComputedStyle(document.body);
+        var vPad = parseFloat(bodyStyle.paddingTop) + parseFloat(bodyStyle.paddingBottom);
+        var hPad = parseFloat(bodyStyle.paddingLeft) + parseFloat(bodyStyle.paddingRight);
+        var availHeight = window.innerHeight - vPad;
+        var availWidth = window.innerWidth - hPad;
+        var factor = Math.min(availHeight / el.scrollHeight, availWidth / el.scrollWidth, 1 / 0.98) * 0.98;
+        if (isFinite(factor) && factor > 0) el.style.zoom = factor;
+      }}
+      function scheduleFit() {{
+        if (pending) return;
+        pending = true;
+        requestAnimationFrame(function () {{ pending = false; fit(); }});
+      }}
+      window.addEventListener('load', scheduleFit);
+      window.addEventListener('resize', scheduleFit);
+      if (window.MutationObserver) {{
+        new MutationObserver(scheduleFit).observe(el, {{childList: true, subtree: true, characterData: true}});
+      }}
+      setTimeout(scheduleFit, 400);
+      setTimeout(scheduleFit, 1500);
+    }})();
+  </script>
   {rotate}
 </body>
 </html>"""
 
-# Order a wall display cycles through when auto-rotating (see
-# _kiosk_rotate_html) and what /kiosk itself starts on - a future
-# dashboard's own /<name>/kiosk route just gets appended to both of these
-# to join the rotation, nothing else below needs to change.
-KIOSK_CYCLE = ["/hyperview/kiosk", "/ipro/kiosk", "/ooma/kiosk"]
-KIOSK_LABELS = {
-    "/hyperview/kiosk": "Hyperview",
-    "/ipro/kiosk": "iPRO Cameras",
-    "/ooma/kiosk": "Ooma AirDial",
+VIDEOWALL_CYCLE = ["/hyperview/videowall", "/ipro/videowall", "/ooma/videowall", "/downtime/videowall"]
+VIDEOWALL_LABELS = {
+    "/hyperview/videowall": "Hyperview",
+    "/ipro/videowall": "iPRO Cameras",
+    "/ooma/videowall": "Ooma AirDial",
+    "/downtime/videowall": "Downtime Workstations",
 }
-KIOSK_ROTATE_SECONDS = 30
+VIDEOWALL_ROTATE_SECONDS = 30
 
 
-def _kiosk_rotate_html(current_path):
-    """Renders the bottom-right badge on a /kiosk page. Stateless by
-    design - there's no server-side timer keeping the rotation going,
-    just a per-page setTimeout that navigates to the next dashboard in
-    KIOSK_CYCLE with ?rotate=1 still attached, so each hop re-arms the
-    same countdown on the next page. Landing on any kiosk URL WITHOUT
-    ?rotate=1 (typing it directly, or clicking Pause) just stays parked
-    there - only /kiosk and links carrying ?rotate=1 start the cycle."""
-    idx = KIOSK_CYCLE.index(current_path)
-    next_path = KIOSK_CYCLE[(idx + 1) % len(KIOSK_CYCLE)]
+def _videowall_cycle_for(username):
+    allowed = _user_systems(username)
+    return [p for p in VIDEOWALL_CYCLE if p.split("/")[1] in allowed]
+
+
+def _videowall_exit_html():
+    if request.args.get("grid") == "1":
+        return ""
+    return '<a href="/overview" class="videowall-exit-btn">&larr; Exit to Overview</a>'
+
+
+def _videowall_rotate_html(current_path, cycle):
+    if request.args.get("grid") == "1":
+        return ""
+    if len(cycle) < 2:
+        return ""
+    idx = cycle.index(current_path)
+    next_path = cycle[(idx + 1) % len(cycle)]
     if request.args.get("rotate") != "1":
-        return (f'<div class="kiosk-rotate-badge">'
+        return (f'<div class="videowall-rotate-badge">'
                  f'<a href="{current_path}?rotate=1">&#9654; Start rotating</a></div>')
     next_url = f"{next_path}?rotate=1"
     return f"""
-    <div class="kiosk-rotate-badge">
-      <span id="kiosk-rotate-countdown">{KIOSK_ROTATE_SECONDS}</span>s &middot;
-      next: {_esc(KIOSK_LABELS[next_path])}
+    <div class="videowall-rotate-badge">
+      <span id="videowall-rotate-countdown">{VIDEOWALL_ROTATE_SECONDS}</span>s &middot;
+      next: {_esc(VIDEOWALL_LABELS[next_path])}
       &middot; <a href="{current_path}">Pause</a>
     </div>
     <script>
       (function () {{
-        var remaining = {KIOSK_ROTATE_SECONDS};
-        var el = document.getElementById('kiosk-rotate-countdown');
+        var remaining = {VIDEOWALL_ROTATE_SECONDS};
+        var el = document.getElementById('videowall-rotate-countdown');
         var timer = setInterval(function () {{
           remaining -= 1;
           if (remaining <= 0) {{ clearInterval(timer); return; }}
           if (el) el.textContent = remaining;
         }}, 1000);
-        setTimeout(function () {{ location.href = {json.dumps(next_url)}; }}, {KIOSK_ROTATE_SECONDS * 1000});
+        setTimeout(function () {{ location.href = {json.dumps(next_url)}; }}, {VIDEOWALL_ROTATE_SECONDS * 1000});
       }})();
     </script>
     """
 
 
-# iPRO/Ooma kiosk pages render server-side from a fresh
-# _fetch_ipro_dashboard()/_fetch_ooma_dashboard() call on every page load,
-# rather than live-fetching client-side like Hyperview's HYPERVIEW_SCRIPT
-# does, so they need their own clock tick and - only when NOT
-# auto-rotating, since rotating already re-fetches this page fresh on
-# every lap - a periodic reload to pick up any change since the page
-# loaded.
-KIOSK_CLOCK_SCRIPT = """
+VIDEOWALL_CLOCK_SCRIPT = """
 <script>
 (function () {
   function tickClock() {
-    var el = document.getElementById('kiosk-clock');
+    var el = document.getElementById('videowall-clock');
     if (el) el.textContent = new Date().toLocaleTimeString([], { hour12: false });
   }
   tickClock();
@@ -1993,156 +10176,1618 @@ KIOSK_CLOCK_SCRIPT = """
   if (!location.search.includes('rotate=1')) {
     setTimeout(function () { location.reload(); }, 30000);
   }
+
+  // Keep an unattended, wall-mounted display from letting the screen sleep.
+  // Wake locks are released whenever the tab goes hidden, so re-request one
+  // the moment it becomes visible again.
+  if ('wakeLock' in navigator) {
+    var wakeLock = null;
+    var requestWakeLock = function () {
+      navigator.wakeLock.request('screen').then(function (lock) {
+        wakeLock = lock;
+      }).catch(function () {});
+    };
+    requestWakeLock();
+    document.addEventListener('visibilitychange', function () {
+      if (wakeLock === null && document.visibilityState === 'visible') requestWakeLock();
+    });
+  }
 })();
 </script>
 """
 
 
-def _kiosk_critical_script(has_critical):
-    """iPRO/Ooma kiosk counterpart to the Hyperview refreshAll() call
-    into kioskCriticalCue() - their data is fetched fresh server-side
-    once per page load rather than polled client-side, so this just
-    calls it once on load with whatever that fetch found, instead of on
-    every poll like Hyperview does."""
-    return f"<script>if (window.kioskCriticalCue) window.kioskCriticalCue({'true' if has_critical else 'false'});</script>"
+def _videowall_critical_script(has_unacked, has_acked_only, tone="danger"):
+    return (
+        f"<script>if (window.videowallCriticalCue) "
+        f"window.videowallCriticalCue({'true' if has_unacked else 'false'}, "
+        f"{'true' if has_acked_only else 'false'}, {json.dumps(tone)});</script>"
+    )
 
 
-@app.route("/hyperview/kiosk")
-def hyperview_kiosk():
-    path = "/hyperview/kiosk"
+@app.route("/hyperview/videowall")
+@require_login
+def hyperview_videowall(username):
+    if "hyperview" not in _user_systems(username):
+        return Response("Your account does not have access to Hyperview", 403)
+    path = "/hyperview/videowall"
     return Response(
-        DASHBOARD_KIOSK_SHELL.format(
+        DASHBOARD_VIDEOWALL_SHELL.format(
             title="Hyperview",
+            favicon_b64=FAVICON_PNG_B64,
             component_css=HYPERVIEW_COMPONENT_CSS + DASHBOARD_EXTRA_CSS,
             board=_hyperview_board_html(),
             script=HYPERVIEW_SCRIPT % {'auto_refresh_ms': 30000},
-            rotate=_kiosk_rotate_html(path),
+            rotate=_videowall_rotate_html(path, _videowall_cycle_for(username)),
+            exit_link=_videowall_exit_html(),
         ),
         mimetype="text/html",
     )
 
 
-@app.route("/ipro/kiosk")
-def ipro_kiosk():
-    path = "/ipro/kiosk"
+@app.route("/ipro/videowall")
+@require_login
+def ipro_videowall(username):
+    denied = _forbidden_or_unknown(username, "ipro")
+    if denied:
+        return denied
+    path = "/ipro/videowall"
     data = _fetch_ipro_dashboard()
     if data is None:
         board = _bridge_unreachable_html("iPRO Cameras", SYSTEMS["ipro"]["base_url"])
-        has_critical = False
+        has_unacked, has_acked_only, tone = False, False, "danger"
     else:
         board = _ipro_board_html(data)
-        has_critical = any(d["status"] in ("Offline", "Infrastructure Issue") for d in data["devices"])
+        has_unacked, has_acked_only, tone = _alert_state_from_summary(data)
     return Response(
-        DASHBOARD_KIOSK_SHELL.format(
+        DASHBOARD_VIDEOWALL_SHELL.format(
             title="iPRO Cameras",
+            favicon_b64=FAVICON_PNG_B64,
             component_css=HYPERVIEW_COMPONENT_CSS + DASHBOARD_EXTRA_CSS,
             board=board,
-            script=KIOSK_CLOCK_SCRIPT + _kiosk_critical_script(has_critical),
-            rotate=_kiosk_rotate_html(path),
+            script=VIDEOWALL_CLOCK_SCRIPT + _videowall_critical_script(has_unacked, has_acked_only, tone),
+            rotate=_videowall_rotate_html(path, _videowall_cycle_for(username)),
+            exit_link=_videowall_exit_html(),
         ),
         mimetype="text/html",
     )
 
 
-@app.route("/ooma/kiosk")
-def ooma_kiosk():
-    path = "/ooma/kiosk"
+@app.route("/ooma/videowall")
+@require_login
+def ooma_videowall(username):
+    denied = _forbidden_or_unknown(username, "ooma")
+    if denied:
+        return denied
+    path = "/ooma/videowall"
     data = _fetch_ooma_dashboard()
     if data is None:
         board = _bridge_unreachable_html("Ooma AirDial", SYSTEMS["ooma"]["base_url"])
-        has_critical = False
+        has_unacked, has_acked_only, tone = False, False, "danger"
     else:
         board = _ooma_board_html(data)
-        has_critical = any(a["severity"].lower() == "critical" for a in data["issues"])
+        has_unacked, has_acked_only, tone = _alert_state_from_summary(data)
     return Response(
-        DASHBOARD_KIOSK_SHELL.format(
+        DASHBOARD_VIDEOWALL_SHELL.format(
             title="Ooma AirDial",
+            favicon_b64=FAVICON_PNG_B64,
             component_css=HYPERVIEW_COMPONENT_CSS + DASHBOARD_EXTRA_CSS,
             board=board,
-            script=KIOSK_CLOCK_SCRIPT + _kiosk_critical_script(has_critical),
-            rotate=_kiosk_rotate_html(path),
+            script=VIDEOWALL_CLOCK_SCRIPT + _videowall_critical_script(has_unacked, has_acked_only, tone),
+            rotate=_videowall_rotate_html(path, _videowall_cycle_for(username)),
+            exit_link=_videowall_exit_html(),
         ),
         mimetype="text/html",
     )
 
 
-@app.route("/kiosk")
-def kiosk_menu():
-    """Landing page for a wall display - unauthenticated, same as every
-    /*/kiosk route it links to. Lists each dashboard's kiosk view
-    individually (for parking a display on just one, same as visiting
-    its own /kiosk URL directly) plus a button that starts the
-    auto-rotating cycle across all of KIOSK_CYCLE. Bookmark this instead
-    of any one dashboard's own /kiosk route - it's the one URL that
-    doesn't change as dashboards are added or reordered."""
+@app.route("/downtime/videowall")
+@require_login
+def downtime_videowall(username):
+    if "downtime" not in _user_systems(username):
+        return Response("Your account does not have access to Downtime Workstations", 403)
+    path = "/downtime/videowall"
+    rows = _fetch_downtime_data()
+    if rows is None:
+        board = _bridge_unreachable_html("Downtime Workstations", DOWNTIME_FEED_URL)
+        has_unacked, has_acked_only = False, False
+    else:
+        board = _downtime_board_html(rows)
+        has_unacked, has_acked_only = _downtime_alert_state(rows)
+    return Response(
+        DASHBOARD_VIDEOWALL_SHELL.format(
+            title="Downtime Workstations",
+            favicon_b64=FAVICON_PNG_B64,
+            component_css=DOWNTIME_CSS,
+            board=board,
+            script=(
+                VIDEOWALL_CLOCK_SCRIPT + _videowall_critical_script(has_unacked, has_acked_only, "danger")
+                + DOWNTIME_DETAIL_MODAL_HTML + DOWNTIME_SCRIPT
+            ),
+            rotate=_videowall_rotate_html(path, _videowall_cycle_for(username)),
+            exit_link=_videowall_exit_html(),
+        ),
+        mimetype="text/html",
+    )
+
+
+@app.route("/videowall")
+@require_login
+def videowall_menu(username):
+    my_cycle = _videowall_cycle_for(username)
+    if not my_cycle:
+        return Response("Your account has no systems assigned - nothing to show on the videowall.", 403)
     items_html = "".join(
-        f'<a class="kiosk-menu-item" href="{path}">{_esc(KIOSK_LABELS[path])}</a>'
-        for path in KIOSK_CYCLE
+        f'<a class="videowall-menu-item" href="{path}">{_esc(VIDEOWALL_LABELS[path])}</a>'
+        for path in my_cycle
     )
     return Response(f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Kiosk</title>
+<link rel="icon" type="image/png" href="data:image/png;base64,{FAVICON_PNG_B64}">
+<title>Videowall</title>
 <style>
   :root {{
     --bg: #060b0d; --panel: #0e181b; --border: #223338;
     --text: #f2f6f6; --text-dim: #a9bcbc; --teal: #6cb2ef; --teal-dark: #8fc0ef;
   }}
   * {{ box-sizing: border-box; }}
+
+  html {{ font-size: 107.5%; }}
   body {{
     margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
     font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, Arial, sans-serif;
     display: flex; align-items: center; justify-content: center; padding: 2rem;
   }}
-  .kiosk-menu {{ width: 100%; max-width: 420px; display: flex; flex-direction: column; gap: 0.7rem; text-align: center; }}
-  .kiosk-menu h1 {{ margin: 0 0 0.3rem; font-size: 1.6rem; }}
-  .kiosk-menu .sub {{ margin: 0 0 1rem; color: var(--text-dim); font-size: 0.9rem; }}
-  .kiosk-menu-item, .kiosk-menu-rotate {{
+  .videowall-menu {{ width: 100%; max-width: 420px; display: flex; flex-direction: column; gap: 0.7rem; text-align: center; }}
+  .videowall-menu h1 {{ margin: 0 0 0.3rem; font-size: 1.6rem; }}
+  .videowall-menu .sub {{ margin: 0 0 1rem; color: var(--text-dim); font-size: 0.9rem; }}
+  .videowall-menu-item, .videowall-menu-rotate {{
     display: block; padding: 0.9rem; border-radius: 10px; border: 1px solid var(--border);
     background: var(--panel); color: var(--text); text-decoration: none; font-weight: 600;
     transition: border-color 0.15s ease;
   }}
-  .kiosk-menu-item:hover {{ border-color: var(--teal); }}
-  .kiosk-menu-rotate {{ background: var(--teal-dark); color: #06121c; border-color: var(--teal-dark); margin-top: 0.5rem; }}
-  .kiosk-menu-rotate:hover {{ opacity: 0.92; }}
+  .videowall-menu-item:hover {{ border-color: var(--teal); }}
+  .videowall-menu-rotate {{ background: var(--teal-dark); color: #06121c; border-color: var(--teal-dark); margin-top: 0.5rem; }}
+  .videowall-menu-rotate:hover {{ opacity: 0.92; }}
 </style>
 </head>
 <body>
-  <div class="kiosk-menu">
+  <div class="videowall-menu">
     <div>
       <h1>Covenant Health &middot; Facility Systems</h1>
-      <p class="sub">Pick a dashboard to park on, or auto-rotate through all {len(KIOSK_CYCLE)}.</p>
     </div>
     {items_html}
-    <a class="kiosk-menu-rotate" href="{KIOSK_CYCLE[0]}?rotate=1">&#9654; Start rotating (every {KIOSK_ROTATE_SECONDS}s)</a>
+    {f'<a class="videowall-menu-rotate" href="{my_cycle[0]}?rotate=1">&#9654; Start rotating (every {VIDEOWALL_ROTATE_SECONDS}s)</a>' if len(my_cycle) > 1 else ''}
+    {f'<a class="videowall-menu-item" href="/videowall/unified">&#9638; Unified view (all {len(my_cycle)} systems, one board)</a>' if len(my_cycle) > 1 else ''}
   </div>
 </body>
 </html>""", mimetype="text/html")
 
 
+def _unified_videowall_board_html(username):
+    wanted = [key for key in ("hyperview", "ipro", "ooma", "downtime") if key in _user_systems(username)]
+    pool = ThreadPoolExecutor(max_workers=max(1, len(wanted)))
+    try:
+        card_futures = {key: pool.submit(_OVERVIEW_CARD_BUILDERS[key]) for key in wanted}
+        result_timeout = REQUEST_TIMEOUT + 15
+        cards = {key: card_futures[key].result(timeout=result_timeout) for key in wanted}
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    reachable_cards = [cards[key] for key in wanted if cards[key]["open"] is not None]
+    total_open = sum(c["open"] for c in reachable_cards)
+    total_ack = sum(c["ack"] for c in reachable_cards)
+    all_site_names = _merge_cross_system_site_names(c["site_names"] for c in reachable_cards if c["site_names"])
+    all_site_names_affected = _merge_cross_system_site_names(
+        c["site_names_affected"] for c in reachable_cards if c["site_names_affected"]
+    )
+    unreachable = [cards[key]["name"] for key in wanted if cards[key]["open"] is None]
+    systems_critical = sum(1 for key in wanted if cards[key]["tone"] == "danger")
+    dash = '<span class="dash-mark">&mdash;</span>'
+    stats_html = f"""
+    <div class="panel videowall-stats-panel">
+      <div class="stat-row">
+        <div class="stat-tile{' unhealthy' if reachable_cards and total_open else ''}">
+          <div class="stat-num">{total_open if reachable_cards else dash}</div>
+          <div class="stat-lbl">Needs Acknowledgment</div>
+        </div>
+        <div class="stat-tile">
+          <div class="stat-num">{total_ack if reachable_cards else dash}</div>
+          <div class="stat-lbl">Acknowledged</div>
+        </div>
+        <div class="stat-tile{' unhealthy' if reachable_cards and all_site_names_affected else ''}">
+          <div class="stat-num">{f'{len(all_site_names_affected)} / {len(all_site_names)}' if reachable_cards else dash}</div>
+          <div class="stat-lbl">Sites Affected</div>
+        </div>
+        <div class="stat-tile{' unhealthy' if systems_critical else ''}">
+          <div class="stat-num">{systems_critical if reachable_cards else dash} / {len(reachable_cards) or len(wanted)}</div>
+          <div class="stat-lbl">Systems Critical</div>
+        </div>
+        <div class="stat-tile{' unhealthy' if unreachable else ''}">
+          <div class="stat-num">{len(unreachable)} / {len(wanted)}</div>
+          <div class="stat-lbl">Unreachable</div>
+        </div>
+      </div>
+    </div>"""
+
+    sorted_cards = sorted((cards[key] for key in wanted), key=_status_card_sort_key)
+    sys_cards_html = "".join(_status_card_html(c) for c in sorted_cards)
+
+    board = f"""
+    <div class="videowall-board">
+    {stats_html}
+    <div class="status-grid videowall-status-grid">{sys_cards_html}</div>
+    </div>"""
+
+    urgent_cards = [cards[key] for key in wanted if _card_urgency(cards[key]) == "urgent"]
+    calm_cards = [cards[key] for key in wanted if _card_urgency(cards[key]) == "resolved"]
+    has_critical = bool(urgent_cards)
+    has_acked_only = (not has_critical) and bool(calm_cards)
+    alert_tone_cards = urgent_cards if has_critical else calm_cards
+    tone = "danger" if any(c["tone"] == "danger" for c in alert_tone_cards) else "warn"
+    return board, has_critical, has_acked_only, tone
+
+
+UNIFIED_VIDEOWALL_CSS = """
+  .videowall-stats-panel .stat-row { padding: 4px 0; }
+  .videowall-board {
+    display: flex;
+    flex-direction: column;
+    height: calc(100vh - 130px);
+  }
+  .videowall-status-grid {
+    margin: 18px 0 0;
+    grid-template-columns: repeat(2, 1fr);
+    grid-template-rows: repeat(2, 1fr);
+    gap: 20px;
+    flex: 1;
+    min-height: 0;
+  }
+  .videowall-status-grid .status-panel {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    height: 100%;
+    padding: 40px 44px;
+  }
+  .videowall-status-grid .status-id { margin-bottom: 6px; }
+  .videowall-status-grid .status-id h2 { font-size: 2rem; }
+  .videowall-status-grid .status-state { font-size: 1.2rem; }
+  .videowall-status-grid .status-dot { width: 20px; height: 20px; }
+  .videowall-status-grid .status-stats { margin-top: 18px; }
+  .videowall-status-grid .status-stat-num { font-size: 3.4rem; }
+  .videowall-status-grid .status-stat-lbl { font-size: 1rem; }
+  .videowall-status-grid .status-unreachable { font-size: 1.6rem; }
+  .videowall-status-grid .status-updated { font-size: 1rem; margin-top: 14px; }
+
+  .videowall-status-grid .status-panel.status-alert {
+    animation: videowall-card-pulse 1.4s ease-in-out infinite;
+  }
+  .videowall-status-grid .status-panel.status-alert.tone-warn { --alert-color: var(--warn); }
+  .videowall-status-grid .status-panel.status-alert.tone-danger { --alert-color: var(--danger); }
+  @keyframes videowall-card-pulse {
+    0%, 100% {
+      box-shadow: 0 0 0 0 color-mix(in srgb, var(--alert-color, var(--danger)) 0%, transparent),
+                  inset 0 0 0 3px transparent;
+      border-color: var(--border);
+    }
+    50% {
+      box-shadow: 0 0 44px 10px color-mix(in srgb, var(--alert-color, var(--danger)) 65%, transparent),
+                  inset 0 0 0 3px var(--alert-color, var(--danger));
+      border-color: var(--alert-color, var(--danger));
+    }
+  }
+  .videowall-status-grid .status-panel.status-solid {
+    box-shadow: 0 0 26px 6px color-mix(in srgb, var(--alert-color, var(--warn)) 45%, transparent),
+                inset 0 0 0 3px color-mix(in srgb, var(--alert-color, var(--warn)) 40%, transparent);
+    border-color: var(--alert-color, var(--warn));
+  }
+  .videowall-status-grid .status-panel.status-solid.tone-warn { --alert-color: var(--warn); }
+  .videowall-status-grid .status-panel.status-solid.tone-danger { --alert-color: var(--danger); }
+
+  @media (max-width: 900px) {
+    .videowall-board { height: auto; }
+    .videowall-status-grid { grid-template-columns: 1fr; grid-template-rows: none; }
+  }
+"""
+
+
+@app.route("/videowall/unified")
+@require_login
+def videowall_unified(username):
+    my_cycle = _videowall_cycle_for(username)
+    if not my_cycle:
+        return Response("Your account has no systems assigned - nothing to show on the videowall.", 403)
+    board, has_unacked, has_acked_only, tone = _unified_videowall_board_html(username)
+    return Response(
+        DASHBOARD_VIDEOWALL_SHELL.format(
+            title="Unified View",
+            favicon_b64=FAVICON_PNG_B64,
+            component_css=HYPERVIEW_COMPONENT_CSS + DASHBOARD_EXTRA_CSS + UNIFIED_VIDEOWALL_CSS,
+            board=board,
+            script=VIDEOWALL_CLOCK_SCRIPT + _videowall_critical_script(has_unacked, has_acked_only, tone),
+            rotate="",
+            exit_link=_videowall_exit_html(),
+        ),
+        mimetype="text/html",
+    )
+
+
+def _redirect_preserving_query(target):
+    qs = request.query_string.decode()
+    return redirect(f"{target}?{qs}" if qs else target)
+
+
+@app.route("/kiosk")
+def videowall_redirect():
+    return _redirect_preserving_query("/videowall")
+
+
+@app.route("/<system>/kiosk")
+def system_videowall_redirect(system):
+    return _redirect_preserving_query(f"/{system}/videowall")
+
+
+LDAP_MODULE_LABELS = {
+    "hyperview": "Hyperview", "ipro": "iPRO Cameras", "ooma": "Ooma AirDial", "downtime": "Downtime Workstations",
+}
+
+
+def _system_tier_from_grants(system, granted_systems):
+    if f"{system}_full" in granted_systems:
+        return "full"
+    if system in granted_systems:
+        return "view"
+    return "none"
+
+
+def _module_checkboxes_html(checked_systems):
+    """Per-system tier selects (None/View/Full) plus one Operations
+    checkbox (Runbook read-only + Shift Handoff)."""
+    tier_selects = "".join(f'''
+      <label class="tier-select-label">{_esc(label)}
+        <select name="tier_{key}">
+          <option value="none"{" selected" if _system_tier_from_grants(key, checked_systems) == "none" else ""}>No access</option>
+          <option value="view"{" selected" if _system_tier_from_grants(key, checked_systems) == "view" else ""}>View only</option>
+          <option value="full"{" selected" if _system_tier_from_grants(key, checked_systems) == "full" else ""}>Full control</option>
+        </select>
+      </label>'''
+        for key, label in LDAP_MODULE_LABELS.items()
+    )
+    operations_checkbox = (
+        f'<label><input type="checkbox" name="operations" value="1"'
+        f'{" checked" if "operations" in checked_systems else ""}> Operations (Runbook + Handoff)</label>'
+    )
+    return tier_selects + operations_checkbox
+
+
+def _systems_from_tier_form(form):
+    systems = set()
+    for key in LDAP_MODULE_LABELS:
+        tier = form.get(f"tier_{key}", "none")
+        if tier == "full":
+            systems.add(f"{key}_full")
+        elif tier == "view":
+            systems.add(key)
+    if form.get("operations") == "1":
+        systems.add("operations")
+    return systems
+
+
+@app.route("/admin/access")
+@require_login
+@require_admin
+def admin_access_page(username):
+    group_access = _ldap_group_access()
+    group_rows = "".join(f"""
+    <tr>
+      <td>{_esc(dn)}</td>
+      <td>
+        <div class="radio-row" style="flex-wrap:wrap; align-items:center;">
+          <form method="post" action="/admin/access/ldap-group" class="radio-row" style="flex-wrap:wrap; margin:0; align-items:center;">
+            <input type="hidden" name="group_dn" value="{_esc(dn)}">
+            {_module_checkboxes_html(cfg['systems'])}
+            <label><input type="checkbox" name="is_admin" value="1"{' checked' if cfg['is_admin'] else ''}> Admin</label>
+            <button type="submit" class="ghost">Save</button>
+          </form>
+          <form method="post" action="/admin/access/ldap-group/delete" style="margin:0;"
+            onsubmit="return confirm('Remove this group\\'s access entirely?')">
+            <input type="hidden" name="group_dn" value="{_esc(dn)}">
+            <button type="submit" class="cancel-btn">Remove</button>
+          </form>
+        </div>
+      </td>
+    </tr>""" for dn, cfg in sorted(group_access.items()))
+
+    ldap_html = f"""
+    <div class="card">
+      <h3>LDAP groups &rarr; modules</h3>
+      <p class="sub" style="margin:0 0 10px;">Tried first on every login when AUTH_BACKEND=ldap. Any group
+      listed here grants its members the selected access the moment they next log in - existing sessions
+      keep whatever access they logged in with until they sign in again. Each system has two tiers: View
+      only sees that system's dashboard, and Full control adds Trends, Acknowledge, and Event Search for
+      that system. Operations combines the old Runbook (read-only) grant with Shift Handoff access.
+      Checking Admin gives that group's members the Admin menu too, but it's separate from module
+      access - they still need at least View on a system (here or via another group) to open its
+      dashboard.</p>
+      <div class="table-scroll"><table><tr><th>Group DN</th><th>Grants</th></tr>
+      {group_rows or '<tr><td colspan="2" class="empty">No groups configured - add one below.</td></tr>'}
+      </table></div>
+    </div>
+    <div class="card">
+      <h3>Add a group</h3>
+      <form method="post" action="/admin/access/ldap-group">
+        <label>Group DN</label>
+        <input type="text" name="group_dn" placeholder="CN=Some Group,OU=Distribution,OU=Groups,OU=Enterprise,DC=covhlth,DC=net" required>
+        <label>Grants</label>
+        <div class="radio-row" style="flex-wrap:wrap;">{_module_checkboxes_html(set())}</div>
+        <label><input type="checkbox" name="is_admin" value="1"> Admin</label>
+        <button type="submit">Add group</button>
+      </form>
+    </div>"""
+
+    ldap_user_access = _ldap_user_access()
+    ldap_user_rows = "".join(f"""
+    <tr>
+      <td>{_esc(uname)}</td>
+      <td>
+        <div class="radio-row" style="flex-wrap:wrap; align-items:center;">
+          <form method="post" action="/admin/access/ldap-user" class="radio-row" style="flex-wrap:wrap; margin:0; align-items:center;">
+            <input type="hidden" name="username" value="{_esc(uname)}">
+            {_module_checkboxes_html(cfg['systems'])}
+            <label><input type="checkbox" name="is_admin" value="1"{' checked' if cfg['is_admin'] else ''}> Admin</label>
+            <button type="submit" class="ghost">Save</button>
+          </form>
+          <form method="post" action="/admin/access/ldap-user/delete" style="margin:0;"
+            onsubmit="return confirm('Remove this user\\'s individual access?')">
+            <input type="hidden" name="username" value="{_esc(uname)}">
+            <button type="submit" class="cancel-btn">Remove</button>
+          </form>
+        </div>
+      </td>
+    </tr>""" for uname, cfg in sorted(ldap_user_access.items()))
+
+    ldap_user_html = f"""
+    <div class="card">
+      <h3>Individual AD users &rarr; modules</h3>
+      <p class="sub" style="margin:0 0 10px;">Grants a specific AD account access on top of whatever their AD
+      group memberships already give them - for someone who needs access but isn't (or can't easily be put)
+      in the right AD group. Username is the sAMAccountName looked up by LDAP_USER_SEARCH_FILTER, not an
+      email or display name. Same tiers as LDAP groups above, and takes effect the same way: next login,
+      not the current session.</p>
+      <div class="table-scroll"><table><tr><th>Username</th><th>Grants</th></tr>
+      {ldap_user_rows or '<tr><td colspan="2" class="empty">No individual users configured - add one below.</td></tr>'}
+      </table></div>
+    </div>
+    <div class="card">
+      <h3>Add an individual AD user</h3>
+      <form method="post" action="/admin/access/ldap-user">
+        <label>Username</label>
+        <input type="text" name="username" placeholder="jsmith" required autocomplete="off">
+        <label>Grants</label>
+        <div class="radio-row" style="flex-wrap:wrap;">{_module_checkboxes_html(set())}</div>
+        <label><input type="checkbox" name="is_admin" value="1"> Admin</label>
+        <button type="submit">Add user</button>
+      </form>
+    </div>"""
+
+    local_users = _local_users()
+
+    def user_row(uname, u):
+        self_note = " <span class=\"tag\">you</span>" if uname == username else ""
+        remove_form = (
+            ""
+            if uname == username else
+            f'<form method="post" action="/admin/access/local-user/delete" style="margin:0;" '
+            f'onsubmit="return confirm(\'Remove local account {_esc(uname)}?\')">'
+            f'<input type="hidden" name="username" value="{_esc(uname)}">'
+            f'<button type="submit" class="cancel-btn">Remove</button></form>'
+        )
+        return f"""
+    <tr>
+      <td>{_esc(uname)}{self_note}</td>
+      <td>
+        <div class="radio-row" style="flex-wrap:wrap; align-items:center;">
+          <form method="post" action="/admin/access/local-user" class="radio-row" style="flex-wrap:wrap; margin:0; align-items:center;">
+            <input type="hidden" name="username" value="{_esc(uname)}">
+            {_module_checkboxes_html(u['systems'])}
+            <label><input type="checkbox" name="is_admin" value="1"{' checked' if u['is_admin'] else ''}> Admin</label>
+            <input type="password" name="password" placeholder="New password (leave blank to keep)" autocomplete="new-password" style="width:220px;">
+            <button type="submit" class="ghost">Save</button>
+          </form>
+          {remove_form}
+        </div>
+      </td>
+    </tr>"""
+
+    user_rows = "".join(user_row(u, cfg) for u, cfg in sorted(local_users.items()))
+    local_html = f"""
+    <div class="card">
+      <h3>Local accounts</h3>
+      <p class="sub" style="margin:0 0 10px;">Checked whenever LDAP isn't tried at all (AUTH_BACKEND=local),
+      or as an automatic fallback when it is tried but doesn't succeed - directory unreachable, or the
+      account simply isn't in AD. You can't remove your own account from this page.</p>
+      <div class="table-scroll"><table><tr><th>Username</th><th>Grants / password</th></tr>
+      {user_rows}
+      </table></div>
+    </div>
+    <div class="card">
+      <h3>Add a local account</h3>
+      <form method="post" action="/admin/access/local-user">
+        <label>Username</label>
+        <input type="text" name="username" required autocomplete="off">
+        <label>Password</label>
+        <input type="password" name="password" required autocomplete="new-password">
+        <label>Grants</label>
+        <div class="radio-row" style="flex-wrap:wrap;">{_module_checkboxes_html(set())}</div>
+        <label><input type="checkbox" name="is_admin" value="1"> Admin</label>
+        <button type="submit" style="margin-top:8px;">Add account</button>
+      </form>
+    </div>"""
+
+    access_levels_html = """
+    <div class="card">
+      <h3>What each access level grants</h3>
+      <div class="table-scroll"><table>
+        <tr><th>Level</th><th>Grants</th></tr>
+        <tr><td>View only <span class="sub">(per system)</span></td>
+          <td>That system's dashboard - nothing else for it.</td></tr>
+        <tr><td>Full control <span class="sub">(per system)</span></td>
+          <td>View, plus Trends, Acknowledge, and Event Search for that system.</td></tr>
+        <tr><td>Operations</td>
+          <td>Shift Handoff and Runbook (read-only) - independent of any per-system grant, so an
+          account can have this with no system access at all.</td></tr>
+        <tr><td>Admin</td>
+          <td>The Admin menu (Access Management, Config, Logs, Leadership, Runbook Management, Locations,
+          Contacts) plus the Device Reliability section on Trends. Still needs View or Full on a system to
+          open that system's own dashboard - Admin alone doesn't imply it.</td></tr>
+      </table></div>
+      <p class="sub" style="margin:10px 0 0;">One exception worth knowing: Downtime's acknowledgment length
+      is set automatically by the on-call schedule, not chosen by whoever acknowledges.</p>
+    </div>"""
+
+    body = f"""
+    <div class="page-header">
+      <div>
+        <h1>Access Management</h1>
+        <p class="sub">AUTH_BACKEND is currently <strong>{_esc(AUTH_BACKEND)}</strong> - {
+          'LDAP is tried first on every login, with local accounts below as a fallback.'
+          if AUTH_BACKEND == 'ldap' else
+          'LDAP is not attempted at all; only local accounts below can sign in.'
+        }</p>
+      </div>
+    </div>
+    {_msg_html()}
+    {access_levels_html}
+    {ldap_html}
+    {ldap_user_html}
+    {local_html}
+    """
+    return Response(render_shell("Admin - Access Management", body, "admin-access", username), mimetype="text/html")
+
+
+@app.route("/admin/access/ldap-group", methods=["POST"])
+@require_login
+@require_admin
+def admin_access_ldap_group_save(username):
+    group_dn = request.form.get("group_dn", "").strip()
+    if not group_dn:
+        return _redirect_msg("/admin/access", error='Group DN is required')
+    systems = _systems_from_tier_form(request.form)
+    is_admin = request.form.get("is_admin") == "1"
+    _set_ldap_group_access(group_dn, systems, is_admin)
+    return _redirect_msg("/admin/access", message='Saved access for ' + group_dn)
+
+
+@app.route("/admin/access/ldap-group/delete", methods=["POST"])
+@require_login
+@require_admin
+def admin_access_ldap_group_delete(username):
+    group_dn = request.form.get("group_dn", "").strip()
+    if group_dn:
+        _delete_ldap_group_access(group_dn)
+    return _redirect_msg("/admin/access", message='Removed ' + group_dn)
+
+
+@app.route("/admin/access/ldap-user", methods=["POST"])
+@require_login
+@require_admin
+def admin_access_ldap_user_save(username):
+    target = request.form.get("username", "").strip()
+    if not target:
+        return _redirect_msg("/admin/access", error='Username is required')
+    systems = _systems_from_tier_form(request.form)
+    is_admin = request.form.get("is_admin") == "1"
+    _set_ldap_user_access(target, systems, is_admin)
+    return _redirect_msg("/admin/access", message='Saved individual access for ' + target)
+
+
+@app.route("/admin/access/ldap-user/delete", methods=["POST"])
+@require_login
+@require_admin
+def admin_access_ldap_user_delete(username):
+    target = request.form.get("username", "").strip()
+    if target:
+        _delete_ldap_user_access(target)
+    return _redirect_msg("/admin/access", message='Removed ' + target)
+
+
+@app.route("/admin/rack-audit-scope")
+@require_login
+@require_admin
+def admin_rack_audit_scope_page(username):
+    scope = _rack_audit_group_scope()
+    rows_html = "".join(
+        f"""<tr>
+          <td>{_esc(dn)}</td><td>{_esc(", ".join(sorted(sites)))}</td>
+          <td><form method="POST" action="/admin/rack-audit-scope/delete" style="margin:0;" onsubmit="return confirm(&quot;Remove this group&#39;s site scope?&quot;)">
+            <input type="hidden" name="group_dn" value="{_esc(dn)}">
+            <button class="ghost" type="submit">Remove</button>
+          </form></td>
+        </tr>"""
+        for dn, sites in sorted(scope.items())
+    )
+    body = f"""
+    <div class="page-header"><div><h1>Rack Audit - Shift Scope</h1>
+      <p class="sub">Which sites each AD group's members are responsible for auditing. A group not listed here
+      isn't restricted - its members see every site as eligible (the 1st-shift catch-all).</p></div></div>
+    {_msg_html()}
+    <div class="card">
+      <h3>AD group &rarr; sites</h3>
+      <table><tr><th>Group DN</th><th>Sites</th><th></th></tr>
+        {rows_html or '<tr><td colspan="3" class="empty">No groups scoped yet - everyone sees every site.</td></tr>'}
+      </table>
+    </div>
+    <div class="card">
+      <h3>Add / update a group's scope</h3>
+      <form method="POST" action="/admin/rack-audit-scope">
+        <label>Group DN<input type="text" name="group_dn" placeholder="cn=ops-2ndshift,ou=groups,dc=covhlth,dc=net" required></label>
+        <label>Sites (comma-separated)<input type="text" name="sites" placeholder="Centerpoint, Fort Hill" required></label>
+        <button type="submit">Save</button>
+      </form>
+    </div>
+    """
+    return Response(render_shell("Rack Audit - Shift Scope", body, "admin-rack-audit-scope", username), mimetype="text/html")
+
+
+@app.route("/admin/rack-audit-scope", methods=["POST"])
+@require_login
+@require_admin
+def admin_rack_audit_scope_save(username):
+    group_dn = request.form.get("group_dn", "").strip()
+    sites_raw = request.form.get("sites", "")
+    if not group_dn:
+        return _redirect_msg("/admin/rack-audit-scope", error="Group DN is required")
+    sites = [s.strip() for s in sites_raw.split(",") if s.strip()]
+    if not sites:
+        return _redirect_msg("/admin/rack-audit-scope", error="At least one site is required")
+    _set_rack_audit_group_scope(group_dn, sites)
+    return _redirect_msg("/admin/rack-audit-scope", message=f"Saved scope for {group_dn}")
+
+
+@app.route("/admin/rack-audit-scope/delete", methods=["POST"])
+@require_login
+@require_admin
+def admin_rack_audit_scope_delete(username):
+    group_dn = request.form.get("group_dn", "").strip()
+    if group_dn:
+        _delete_rack_audit_group_scope(group_dn)
+    return _redirect_msg("/admin/rack-audit-scope", message=f"Removed {group_dn}")
+
+
+@app.route("/admin/access/local-user", methods=["POST"])
+@require_login
+@require_admin
+def admin_access_local_user_save(username):
+    target = request.form.get("username", "").strip()
+    if not target:
+        return _redirect_msg("/admin/access", error='Username is required')
+    password = request.form.get("password", "")
+    systems = _systems_from_tier_form(request.form)
+    is_admin = request.form.get("is_admin") == "1"
+    if target == username and not is_admin:
+        return _redirect_msg("/admin/access", error='You cannot remove your own admin access')
+    try:
+        _set_local_user(target, systems, is_admin, password=password or None)
+    except ValueError as e:
+        return _redirect_msg("/admin/access", error=str(e))
+    return _redirect_msg("/admin/access", message='Saved account ' + target)
+
+
+@app.route("/admin/access/local-user/delete", methods=["POST"])
+@require_login
+@require_admin
+def admin_access_local_user_delete(username):
+    target = request.form.get("username", "").strip()
+    if target == username:
+        return _redirect_msg("/admin/access", error='You cannot remove your own account')
+    if target:
+        _delete_local_user(target)
+    return _redirect_msg("/admin/access", message='Removed ' + target)
+
+
+@app.route("/admin/config")
+@require_login
+@require_admin
+def admin_config_page(username):
+    def row(label, value):
+        return f"<tr><td>{_esc(label)}</td><td>{_esc(value)}</td></tr>"
+
+    rows = [
+        row("Auth backend", f"{AUTH_BACKEND} ({'LDAP tried first, local accounts as fallback' if AUTH_BACKEND == 'ldap' else 'local accounts only, LDAP not attempted'})"),
+        row("Portal port", os.environ.get("PORTAL_PORT", "5004")),
+        row("Session timeout", f"{SESSION_TIMEOUT_SECONDS / 86400:.1f}d ({SESSION_TIMEOUT_SECONDS // 3600}h)"),
+        row("Session cookie secure", "Yes" if app.config["SESSION_COOKIE_SECURE"] else "No"),
+        row("Local accounts", str(len(_local_users()))),
+    ]
+    if AUTH_BACKEND == "ldap":
+        rows += [
+            row("LDAP server", LDAP_SERVER_URI),
+            row("LDAP base DN", LDAP_BASE_DN),
+            row("LDAP user search filter", LDAP_USER_SEARCH_FILTER),
+            row("LDAP group attribute", LDAP_GROUP_ATTR),
+            row("LDAP timeout", f"{LDAP_TIMEOUT_SECONDS}s"),
+            row("LDAP bind DN", LDAP_BIND_DN or "(anonymous search)"),
+            row("LDAP bind password set", "Yes" if LDAP_BIND_PASSWORD else "No"),
+            row("LDAP admin groups", ", ".join(sorted(dn for dn, cfg in _ldap_group_access().items() if cfg["is_admin"])) or "(none configured)"),
+            row("Individual AD user grants", str(len(_ldap_user_access()))),
+        ]
+    rows.append(row("Hyperview base URL", HYPERVIEW_BASE_URL))
+    for key, cfg in SYSTEMS.items():
+        rows.append(row(f"{cfg['label']} base URL", cfg["base_url"]))
+    rows += [
+        row("Maintenance log retention", f"{MAINTENANCE_LOG_RETENTION_DAYS} days"),
+        row("Maintenance log DB path", MAINTENANCE_LOG_DB_PATH),
+    ]
+
+    auto_enabled = _auto_restart_downtime_enabled()
+    with _auto_restart_status_lock:
+        status = dict(_auto_restart_status)
+    cred = _auto_restart_credential()
+    if cred:
+        credential_line = f"{cred[0]} (session active)"
+    else:
+        credential_line = "None - no admin with 'downtime' access is currently signed in via LDAP"
+    last_tick = (
+        datetime.fromtimestamp(status["last_tick_ts"]).strftime("%Y-%m-%d %I:%M:%S %p")
+        if status["last_tick_ts"] else "Not yet run"
+    )
+    pending = ", ".join(status["pending_hosts"]) or "None"
+    capped = ", ".join(status["capped_hosts"]) or "None"
+    recently_restarted = ", ".join(status.get("recently_restarted_hosts") or []) or "None"
+    lock_conn = _maintenance_log_db()
+    try:
+        lock_row = lock_conn.execute(
+            "SELECT owner, expires_at FROM process_locks WHERE name = ?", (AUTO_RESTART_LOCK_NAME,)
+        ).fetchone()
+    finally:
+        lock_conn.close()
+    if lock_row and lock_row[1] >= int(time.time()) and lock_row[0]:
+        holder = f"{lock_row[0]}{' (this process)' if lock_row[0] == _AUTO_RESTART_INSTANCE_ID else ''}"
+    else:
+        holder = "None currently held"
+    auto_restart_html = f"""
+    <div class="card" style="margin-top:16px;">
+      <div class="page-header" style="margin:0 0 8px;">
+        <div><h2 style="margin:0; font-size:15px;">Downtime Auto-Restart</h2>
+        <p class="sub" style="margin:4px 0 0;">Unattended background restarts for workstations that are down and
+        reachable by ping. Off by default - turn on only once you're comfortable with an automatic action
+        running with no one clicking a button.</p></div>
+        <form method="post" action="/admin/config/auto-restart">
+          <input type="hidden" name="enabled" value="{'0' if auto_enabled else '1'}">
+          <button type="submit" class="{'cancel-btn' if auto_enabled else ''}" style="{'padding:9px 18px; font-size:14px; margin-top:0;' if auto_enabled else 'margin-top:0;'}">
+            {'Disable' if auto_enabled else 'Enable'} auto-restart
+          </button>
+        </form>
+      </div>
+      <div class="table-scroll"><table>
+        {row('Status', 'Enabled' if auto_enabled else 'Disabled')}
+        {row('Check interval', f'every {AUTO_RESTART_DOWNTIME_CHECK_INTERVAL_SECONDS // 60} min')}
+        {row('Max attempts per workstation', f'{AUTO_RESTART_DOWNTIME_MAX_ATTEMPTS} per {AUTO_RESTART_DOWNTIME_COOLDOWN_SECONDS // 3600}h - then left for a human')}
+        {row('Runs as', credential_line)}
+        {row('Active instance (single-instance lock)', holder)}
+        {row('Last check', last_tick)}
+        {row('Currently pending restart', pending)}
+        {row('At the attempt limit (needs a human)', capped)}
+        {row(f'Skipped - restarted within the last {AUTO_RESTART_RECENT_RESTART_GRACE_SECONDS // 60} min', recently_restarted)}
+        {row('Last issue', status['last_error'] or 'None') if status['last_error'] else ''}
+      </table></div>
+    </div>
+    """
+
+    site_cards = [_hyperview_overview_card(), _ipro_overview_card()]
+
+    similar_pairs = []
+    for card in site_cards:
+        if card.get("site_names"):
+            for name_a, name_b, ratio in _find_similar_site_names(card["site_names"]):
+                similar_pairs.append((card["name"], name_a, name_b, ratio))
+    if similar_pairs:
+        similar_rows = "".join(
+            f"<tr><td>{_esc(system_label)}</td><td>{_esc(name_a)}</td><td>{_esc(name_b)}</td>"
+            f"<td>{round(ratio * 100)}% similar</td></tr>"
+            for system_label, name_a, name_b, ratio in similar_pairs
+        )
+        similar_sites_html = f"""
+        <div class="card" style="margin-top:16px;">
+          <div class="page-header" style="margin:0 0 8px;">
+            <div><h2 style="margin:0; font-size:15px;">Possible Duplicate Site Names</h2>
+            <p class="sub" style="margin:4px 0 0;">These pairs are close enough that they may be the same
+            physical site counted twice under two slightly different names (typo, abbreviation, stray
+            spacing) - worth a look upstream if the site count seems too high.</p></div>
+          </div>
+          <div class="table-scroll"><table>
+            <tr><th>System</th><th>Site A</th><th>Site B</th><th>Similarity</th></tr>
+            {similar_rows}
+          </table></div>
+        </div>
+        """
+    else:
+        similar_sites_html = ""
+
+    body = f"""
+    <div class="page-header">
+      <div>
+        <h1>System Config</h1>
+      </div>
+    </div>
+    <div class="card">
+      <div class="table-scroll"><table>{''.join(rows)}</table></div>
+    </div>
+    {auto_restart_html}
+    {similar_sites_html}
+    """
+    return Response(render_shell("Admin - System Config", body, "admin-config", username), mimetype="text/html")
+
+
+def _all_maintenance_actions(since_ts=None):
+    all_actions = []
+    for a in _query_maintenance_actions("hyperview", since_ts=since_ts):
+        a["system_label"] = "Hyperview"
+        all_actions.append(a)
+    for key, cfg in SYSTEMS.items():
+        for a in _query_maintenance_actions(key, since_ts=since_ts):
+            a["system_label"] = cfg["label"]
+            all_actions.append(a)
+    for a in _query_maintenance_actions("downtime", since_ts=since_ts):
+        a["system_label"] = "Downtime Workstations"
+        all_actions.append(a)
+    all_actions.sort(key=lambda a: a["ts"], reverse=True)
+    return all_actions
+
+
+DEVICE_HISTORY_ACTION_META = {
+    "acknowledged": ("Acknowledged", "var(--teal)"),
+    "un-acknowledged": ("Un-acknowledged", "var(--text-faint)"),
+    "restarted": ("Restarted", "var(--warn)"),
+    "resolved": ("Cleared", "var(--ok)"),
+    "alarm": ("New alarm", "var(--danger)"),
+    "changed": ("Changed", "var(--warn)"),
+    "rack_audited": ("Rack Audited", "var(--ok)"),
+}
+
+
+@app.route("/device/<system>/<path:target>")
+@require_login
+def device_history_page(username, system, target):
+    if system not in ("hyperview", "ipro", "ooma", "downtime"):
+        return _error_page(username, "Unknown system", 404)
+    if system not in _user_systems(username):
+        return _error_page(username, "Your account does not have access to this system")
+
+    actions = [a for a in _query_maintenance_actions(system) if a.get("target") == target]
+    actions.sort(key=lambda a: a["ts"], reverse=True)
+
+    total_acks = sum(1 for a in actions if a["action"] == "acknowledged")
+    total_restarts = sum(1 for a in actions if a["action"] == "restarted")
+    total_resolved = sum(1 for a in actions if a["action"] == "resolved")
+    incidents = sorted({a["incident_number"] for a in actions if a.get("incident_number")})
+    last_seen = (
+        datetime.fromtimestamp(actions[0]["ts"]).strftime("%Y-%m-%d %I:%M %p") if actions else None
+    )
+
+    stat_row = f"""
+    <div class="trend-stats">
+      <div class="trend-stat"><strong>{len(actions)}</strong>Total events</div>
+      <div class="trend-stat"><strong>{total_acks}</strong>Acknowledgments</div>
+      <div class="trend-stat"><strong>{total_restarts}</strong>Restarts</div>
+      <div class="trend-stat"><strong>{total_resolved}</strong>Cleared</div>
+      <div class="trend-stat"><strong>{len(incidents)}</strong>Incident #(s)</div>
+    </div>"""
+
+    def event_row(a):
+        label, color = DEVICE_HISTORY_ACTION_META.get(a["action"], (a["action"], "var(--text-dim)"))
+        when = datetime.fromtimestamp(a["ts"]).strftime("%Y-%m-%d %I:%M %p")
+        return (
+            f'<tr><td class="time">{_esc(when)}</td>'
+            f'<td><span class="tag" style="background:{color}22; color:{color};">{_esc(label)}</span></td>'
+            f'<td>{_esc(a["reason"] or "-")}</td>'
+            f'<td>{_esc(a["incident_number"] or "-")}</td>'
+            f'<td>{_esc(a["set_by"])}</td></tr>'
+        )
+
+    rows_html = "".join(event_row(a) for a in actions)
+    empty_note = f"No acknowledge/restart history recorded yet for {_esc(target)}."
+
+    body = f"""
+    <div class="page-header">
+      <div>
+        <h1>{_esc(target)}</h1>
+        <p class="sub">{_esc(TRENDS_SYSTEM_LABELS.get(system, system))}
+        {f' &middot; last activity {_esc(last_seen)}' if last_seen else ' &middot; no recorded activity'}</p>
+      </div>
+    </div>
+    <style>{DASHBOARD_BASE_CSS}</style>
+    <div class="panel" style="margin-bottom:16px;">
+      <div style="padding:14px 18px;">{stat_row}</div>
+    </div>
+    <div class="card">
+      <h3>History</h3>
+      <div class="table-scroll"><table><tr><th>Time</th><th>Action</th><th>Reason</th><th>Incident #</th><th>By</th></tr>
+      {rows_html or f'<tr><td colspan="5" class="empty">{empty_note}</td></tr>'}
+      </table></div>
+    </div>
+    """
+    return Response(render_shell(f"{target} - History", body, "", username), mimetype="text/html")
+
+
+ADMIN_LOG_ACTIONS = ("acknowledged", "un-acknowledged", "restarted", "resolved", "alarm")
+ADMIN_LOG_RANGE_DAYS = {"7d": 7, "30d": 30, "90d": 90, "all": None}
+
+
+@app.route("/admin/log")
+@require_login
+@require_admin
+def admin_log_page(username):
+    range_key = request.args.get("range", "all")
+    if range_key not in ADMIN_LOG_RANGE_DAYS:
+        range_key = "all"
+    range_days = ADMIN_LOG_RANGE_DAYS[range_key]
+    since_ts = (time.time() - range_days * 86400) if range_days else None
+
+    system_filter = request.args.get("system", "")
+    action_filter = request.args.get("action", "")
+    user_filter = request.args.get("user", "").strip()
+    q = request.args.get("q", "").strip().lower()
+
+    all_actions = _all_maintenance_actions(since_ts=since_ts)
+    known_users = sorted({a["set_by"] for a in all_actions})
+
+    filtered = all_actions
+    if system_filter:
+        filtered = [a for a in filtered if a["system"] == system_filter]
+    if action_filter:
+        filtered = [a for a in filtered if a["action"] == action_filter]
+    if user_filter:
+        filtered = [a for a in filtered if a["set_by"] == user_filter]
+    if q:
+        filtered = [
+            a for a in filtered
+            if q in (a["target"] or "").lower()
+            or q in (a["reason"] or "").lower()
+            or q in (a["incident_number"] or "").lower()
+        ]
+
+    all_scheduled = []
+    for key, cfg in SYSTEMS.items():
+        for s in _pending_scheduled_maintenance(key):
+            s["system_label"] = cfg["label"]
+            all_scheduled.append(s)
+    all_scheduled.sort(key=lambda s: s["start_at"])
+
+    def _action_row(a):
+        target_type_tag = f'<span class="tag">{_esc(a["target_type"])}</span>' if a["target_type"] else ""
+        when = datetime.fromtimestamp(a["ts"]).strftime("%Y-%m-%d %I:%M %p")
+        target = a.get("target")
+        target_html = (
+            f'<a href="/device/{a["system"]}/{quote(target, safe="")}">{_esc(target)}</a>'
+            if target else "-"
+        )
+        return (
+            f'<tr><td class="time">{_esc(when)}</td>'
+            f'<td><span class="tag">{_esc(a["system_label"])}</span></td>'
+            f'<td>{_esc(a["action"])}</td>'
+            f'<td>{target_html} {target_type_tag}</td>'
+            f'<td>{_esc(a["reason"] or "-")}</td>'
+            f'<td>{_esc(a["incident_number"] or "-")}</td>'
+            f'<td>{_esc(a["set_by"])}</td></tr>'
+        )
+
+    action_rows = "".join(_action_row(a) for a in filtered)
+    scheduled_rows = "".join(
+        f"<tr><td class=\"time\">{_esc(datetime.fromtimestamp(s['start_at']).strftime('%Y-%m-%d %I:%M %p'))}</td>"
+        f"<td><span class=\"tag\">{_esc(s['system_label'])}</span></td>"
+        f"<td>{_esc(s['target'])} <span class=\"tag\">{_esc(s['target_type'])}</span></td>"
+        f"<td>{_esc(s['reason'] or '-')}</td>"
+        f"<td>{_esc(s['incident_number'] or '-')}</td>"
+        f"<td>{_esc(s['set_by'])}</td></tr>"
+        for s in all_scheduled
+    )
+
+    system_options = "".join(
+        f'<option value="{key}"{" selected" if key == system_filter else ""}>{_esc(TRENDS_SYSTEM_LABELS.get(key, key))}</option>'
+        for key in ("hyperview", "ipro", "ooma", "downtime")
+    )
+    action_options = "".join(
+        f'<option value="{a}"{" selected" if a == action_filter else ""}>'
+        f'{_esc(DEVICE_HISTORY_ACTION_META.get(a, (a, None))[0])}</option>'
+        for a in ADMIN_LOG_ACTIONS
+    )
+    user_options = "".join(
+        f'<option value="{_esc(u)}"{" selected" if u == user_filter else ""}>{_esc(u)}</option>'
+        for u in known_users
+    )
+    system_q, action_q, user_q, q_q = (quote(v, safe="") for v in (system_filter, action_filter, user_filter, q))
+    range_buttons = "".join(
+        f'<a href="/admin/log?range={key}&system={system_q}&action={action_q}&user={user_q}&q={q_q}" '
+        f'class="range-btn{" active" if key == range_key else ""}">{key}</a>'
+        for key in ADMIN_LOG_RANGE_DAYS
+    )
+    active_filters = any([system_filter, action_filter, user_filter, q])
+    filter_count_note = f'<span class="count-note">{len(filtered)} of {len(all_actions)} shown</span>' if active_filters else ""
+
+    body = f"""
+    <div class="page-header">
+      <div>
+        <h1>Acknowledge Log</h1>
+      </div>
+    </div>
+    <style>{DASHBOARD_BASE_CSS}</style>
+    <div class="card">
+      <h3>Scheduled (not started yet)</h3>
+      <div class="table-scroll"><table><tr><th>Starts</th><th>System</th><th>Target</th><th>Reason</th><th>Incident #</th><th>Scheduled by</th></tr>
+      {scheduled_rows or '<tr><td colspan="6" class="empty">Nothing scheduled.</td></tr>'}
+      </table></div>
+    </div>
+    <div class="card">
+      <h3>History</h3>
+      <form method="get" action="/admin/log" class="log-filter-row">
+        <select name="system"><option value="">All systems</option>{system_options}</select>
+        <select name="action"><option value="">All actions</option>{action_options}</select>
+        <select name="user"><option value="">All users</option>{user_options}</select>
+        <input type="text" name="q" placeholder="Search target / reason / incident #" value="{_esc(q)}">
+        <input type="hidden" name="range" value="{range_key}">
+        <button type="submit">Filter</button>
+        {'<a class="ghost" href="/admin/log">Clear</a>' if active_filters else ''}
+      </form>
+      <div class="trend-range-row" style="margin:10px 0;">{range_buttons}{filter_count_note}</div>
+      <div class="table-scroll"><table><tr><th>Time</th><th>System</th><th>Action</th><th>Target</th><th>Reason</th><th>Incident #</th><th>By</th></tr>
+      {action_rows or '<tr><td colspan="7" class="empty">No actions match these filters.</td></tr>'}
+      </table></div>
+    </div>
+    """
+    return Response(render_shell("Admin - Acknowledge Log", body, "admin-log", username), mimetype="text/html")
+
+
+@app.route("/admin/activity")
+@require_login
+@require_admin
+def admin_activity_page(username):
+    range_key = request.args.get("range", "30d")
+    range_days = {"7d": 7, "30d": 30, "90d": 90, "all": None}.get(range_key, 30)
+    since_ts = (time.time() - range_days * 86400) if range_days else None
+
+    show_key = request.args.get("show", "human")
+    if show_key not in ("human", "all"):
+        show_key = "human"
+
+    by_user = {}
+    for a in _all_maintenance_actions(since_ts=since_ts):
+        # 'alarm' is always system-detected; 'resolved' is credited to the
+        # monitor too when nothing self-clears with no one having acted on
+        # it - either way, the monitor is not a human responder. It's kept
+        # here (not dropped) so the 'human'/'all' toggle below can show or
+        # hide it, but it's tagged so the equality stats never mistake it
+        # for a person.
+        u = by_user.setdefault(a["set_by"], {
+            "total": 0, "acknowledged": 0, "un-acknowledged": 0, "restarted": 0,
+            "systems": {}, "first_ts": a["ts"], "last_ts": a["ts"],
+            "is_system": a["set_by"] in NON_HUMAN_SET_BY_VALUES,
+        })
+        u["total"] += 1
+        u[a["action"]] = u.get(a["action"], 0) + 1
+        u["systems"][a["system_label"]] = u["systems"].get(a["system_label"], 0) + 1
+        u["first_ts"] = min(u["first_ts"], a["ts"])
+        u["last_ts"] = max(u["last_ts"], a["ts"])
+
+    # The equality stats (workload balance, top contributor, fair share) are
+    # always computed from human users only, regardless of the toggle -
+    # "is one person carrying the team" shouldn't change answer depending on
+    # whether the automated monitor happens to be visible in the table.
+    human_users = sorted(
+        ((name, u) for name, u in by_user.items() if not u["is_system"]),
+        key=lambda kv: -kv[1]["total"],
+    )
+    total_users = len(human_users)
+    total_actions = sum(u["total"] for _name, u in human_users)
+    # A perfectly even split would give every user this share (in
+    # percentage points) - each user's actual share is measured against it
+    # in points-over-fair, not a multiplier, so the flagging stays
+    # meaningful with as few as two active users (where a multiplier alone
+    # can never mathematically clear a high bar).
+    fair_share_pct = (100 / total_users) if total_users else 0
+    UNEVEN_MARGIN_PTS = 15
+    CONCENTRATED_MARGIN_PTS = 35
+
+    # What the table itself displays follows the toggle - shares in the
+    # table are computed against whatever's actually shown, so they still
+    # sum to 100% whether or not the monitor's row is included.
+    display_users = sorted(by_user.items(), key=lambda kv: -kv[1]["total"]) if show_key == "all" else human_users
+    display_total = sum(u["total"] for _name, u in display_users)
+
+    def _user_row(name, u):
+        systems_txt = ", ".join(f"{s} ({c})" for s, c in sorted(u["systems"].items(), key=lambda kv: -kv[1]))
+        last_active = datetime.fromtimestamp(u["last_ts"]).strftime("%Y-%m-%d %I:%M %p")
+        share_pct = round((u["total"] / display_total) * 100) if display_total else 0
+        bar_cls = " over" if not u["is_system"] and total_users > 1 and share_pct - fair_share_pct >= UNEVEN_MARGIN_PTS else ""
+        share_html = (
+            f'<div class="share-cell"><div class="share-bar"><div class="share-bar-fill{bar_cls}" '
+            f'style="width:{share_pct}%;"></div></div><span class="share-pct">{share_pct}%</span></div>'
+        )
+        name_html = f'{_esc(name)} <span class="tag">System</span>' if u["is_system"] else _esc(name)
+        return (
+            f"<tr><td>{name_html}</td>"
+            f"<td class=\"n\">{u['total']}</td>"
+            f"<td>{share_html}</td>"
+            f"<td class=\"n\">{u.get('acknowledged', 0)}</td>"
+            f"<td class=\"n\">{u.get('un-acknowledged', 0)}</td>"
+            f"<td class=\"n\">{u.get('restarted', 0)}</td>"
+            f"<td>{_esc(systems_txt)}</td>"
+            f"<td class=\"time\">{_esc(last_active)}</td></tr>"
+        )
+
+    rows_html = "".join(_user_row(name, u) for name, u in display_users)
+    range_buttons = "".join(
+        f'<a href="/admin/activity?range={key}&show={show_key}" class="range-btn{" active" if key == range_key else ""}">{label}</a>'
+        for key, label in (("7d", "7d"), ("30d", "30d"), ("90d", "90d"), ("all", "All time"))
+    )
+    show_buttons = "".join(
+        f'<a href="/admin/activity?range={range_key}&show={key}" class="range-btn{" active" if key == show_key else ""}">{label}</a>'
+        for key, label in (("human", "Human users"), ("all", "Include system/monitor"))
+    )
+
+    ratio_txt = f"{total_actions / total_users:.1f}" if total_users else "&mdash;"
+
+    top_name, top_share_pct, balance_html = "&mdash;", None, ""
+    if total_users and total_actions:
+        top_name, top_u = human_users[0]
+        top_share_pct = round((top_u["total"] / total_actions) * 100)
+        margin = top_share_pct - fair_share_pct
+        if total_users == 1:
+            balance_txt, balance_cls = "Only one active user", ""
+        elif margin >= CONCENTRATED_MARGIN_PTS:
+            balance_txt, balance_cls = "Concentrated", " balance-bad"
+        elif margin >= UNEVEN_MARGIN_PTS:
+            balance_txt, balance_cls = "Uneven", " balance-warn"
+        else:
+            balance_txt, balance_cls = "Balanced", " balance-good"
+        balance_html = f'<span class="balance-tag{balance_cls}">{_esc(balance_txt)}</span>'
+
+    ratio_stats_html = f"""
+    <div class="card">
+      <div class="stat-row">
+        <div class="stat-tile"><div class="stat-num">{total_users}</div><div class="stat-lbl">Active Users</div></div>
+        <div class="stat-tile"><div class="stat-num">{total_actions}</div><div class="stat-lbl">Total Actions</div></div>
+        <div class="stat-tile"><div class="stat-num">{ratio_txt}</div><div class="stat-lbl">Actions per User</div></div>
+        <div class="stat-tile"><div class="stat-num">{f'{top_share_pct}%' if top_share_pct is not None else '&mdash;'}</div>
+          <div class="stat-lbl">Top Contributor ({_esc(top_name)})</div></div>
+      </div>
+      {f'<div class="balance-row">Workload balance: {balance_html}</div>' if balance_html else ''}
+    </div>
+    """
+
+    body = f"""
+    <div class="page-header">
+      <div>
+        <h1>User Activity</h1>
+        <p class="sub">Acknowledge / restart activity broken down by user, and how evenly it's spread across the team.</p>
+      </div>
+    </div>
+    <style>{DASHBOARD_BASE_CSS}
+      .share-cell {{ display:flex; align-items:center; gap:8px; min-width:120px; }}
+      .share-bar {{ flex:1; height:8px; border-radius:4px; background:var(--panel-raised); border:1px solid var(--border); overflow:hidden; }}
+      .share-bar-fill {{ height:100%; background:var(--teal); border-radius:4px; }}
+      .share-bar-fill.over {{ background:var(--red, #c0392b); }}
+      .share-pct {{ font-variant-numeric:tabular-nums; font-size:12px; color:var(--text-faint); min-width:34px; text-align:right; }}
+      .balance-row {{ margin-top:10px; font-size:13px; color:var(--text-faint); }}
+      .balance-tag {{ display:inline-block; padding:2px 9px; border-radius:999px; font-weight:700; font-size:12px; margin-left:4px; }}
+      .balance-tag.balance-good {{ background:var(--teal-tint); color:var(--teal-dark); }}
+      .balance-tag.balance-warn {{ background:#fdf0d5; color:#8a5a00; }}
+      .balance-tag.balance-bad {{ background:#fbe2e2; color:#8a1f1f; }}
+    </style>
+    <div class="card">
+      <div class="trend-range-row">{range_buttons}</div>
+    </div>
+    {ratio_stats_html}
+    <div class="card">
+      <h3>Acknowledge/restart activity by user</h3>
+      <div class="trend-range-row" style="margin-bottom:10px;">{show_buttons}</div>
+      <p class="sub" style="margin-top:-6px;">% of Total is each user's share of all actions shown in this range vs. an even
+        split ({round(fair_share_pct) if fair_share_pct else 0}% each across {total_users or 0} human user(s)) - a share more
+        than {UNEVEN_MARGIN_PTS} points above that even split is flagged red. The automated monitor (system-detected alarms
+        and self-cleared events nobody acted on) is hidden by default and never counts toward the equality stats above,
+        even when shown.</p>
+      <div class="table-scroll"><table>
+        <tr><th>User</th><th>Total</th><th>% of Total</th><th>Acknowledged</th><th>Un-acknowledged</th><th>Restarted</th><th>Systems</th><th>Last active</th></tr>
+        {rows_html or '<tr><td colspan="8" class="empty">No actions recorded in this range.</td></tr>'}
+      </table></div>
+    </div>
+    """
+    return Response(render_shell("Admin - User Activity", body, "admin-activity", username), mimetype="text/html")
+
+
+LEADERSHIP_RANGE_HOURS = {"7d": 7 * 24, "30d": 30 * 24, "90d": 90 * 24}
+LEADERSHIP_DEFAULT_RANGE = "30d"
+
+
+@app.route("/admin/leadership")
+@require_login
+@require_admin
+def admin_leadership_page(username):
+    range_key = request.args.get("range", LEADERSHIP_DEFAULT_RANGE)
+    if range_key not in LEADERSHIP_RANGE_HOURS:
+        range_key = LEADERSHIP_DEFAULT_RANGE
+    until_ts = time.time()
+    since_ts = until_ts - LEADERSHIP_RANGE_HOURS[range_key] * 3600
+    range_days = LEADERSHIP_RANGE_HOURS[range_key] / 24
+
+    all_actions = [a for a in _all_maintenance_actions(since_ts=since_ts)]
+    total_acks = sum(1 for a in all_actions if a["action"] == "acknowledged")
+    total_restarts = sum(1 for a in all_actions if a["action"] == "restarted")
+    total_incidents = sum(1 for a in all_actions if a["action"] == "acknowledged" and a.get("incident_number"))
+
+    system_keys = ["hyperview", "ipro", "ooma", "downtime"]
+    prev_since_ts = since_ts - (until_ts - since_ts)
+    per_system = {}
+    for key in system_keys:
+        points = _history_points(key, since_ts, until_ts)
+        scores = [s for _, s in points]
+        prev_scores = [s for _, s in _history_points(key, prev_since_ts, since_ts)]
+        # Hyperview has no InfraWatch ack flow, but its own upstream
+        # /active-alarm-log carries a real 'acknowledged' flag per alarm -
+        # _hyperview_status_tick logs it locally the moment it flips, so
+        # Acknowledgements/MTTA/MTTR all work the same way for every system.
+        mtta_stats = _duration_stats(_mtta_samples_for_system(key, since_ts, until_ts))
+        acknowledgements = sum(
+            1 for a in all_actions
+            if a["system_label"] == TRENDS_SYSTEM_LABELS[key] and a["action"] == "acknowledged"
+        )
+        mttr_stats = _duration_stats(_mttr_samples_for_system(key, since_ts, until_ts))
+        per_system[key] = {
+            "points": points, "scores": scores, "prev_scores": prev_scores,
+            "mtta": mtta_stats, "acknowledgements": acknowledgements, "mttr": mttr_stats,
+        }
+
+    scores_with_data = [s["scores"] for s in per_system.values() if s["scores"]]
+    overall_avg = round(sum(sum(s) / len(s) for s in scores_with_data) / len(scores_with_data)) if scores_with_data else None
+    mtta_means = [s["mtta"]["mean"] for s in per_system.values() if s["mtta"]]
+    blended_mtta = _format_duration(sum(mtta_means) / len(mtta_means)) if mtta_means else "-"
+    mttr_means = [s["mttr"]["mean"] for s in per_system.values() if s["mttr"]]
+    blended_mttr = _format_duration(sum(mttr_means) / len(mttr_means)) if mttr_means else "-"
+
+    dash = '<span class="dash-mark">&mdash;</span>'
+    summary_html = f"""
+    <div class="panel" style="margin-bottom:16px;">
+      <div class="stat-row">
+        <div class="stat-tile"><div class="stat-num">{overall_avg if overall_avg is not None else dash}{'%' if overall_avg is not None else ''}</div><div class="stat-lbl">Avg Uptime Score</div></div>
+        <div class="stat-tile"><div class="stat-num">{total_acks}</div><div class="stat-lbl">Acknowledgments</div></div>
+        <div class="stat-tile"><div class="stat-num">{total_incidents}</div><div class="stat-lbl">Tied to an Incident #</div></div>
+        <div class="stat-tile"><div class="stat-num">{total_restarts}</div><div class="stat-lbl">Service Restarts</div></div>
+        <div class="stat-tile"><div class="stat-num">{blended_mtta}</div><div class="stat-lbl">Blended MTTA</div></div>
+        <div class="stat-tile"><div class="stat-num">{blended_mttr}</div><div class="stat-lbl">Blended MTTR</div></div>
+      </div>
+    </div>"""
+
+    def system_card(key):
+        s = per_system[key]
+        mtta_txt = "-" if s["mtta"] is None else _format_duration(s["mtta"]["mean"])
+        mttr_txt = "-" if s["mttr"] is None else _format_duration(s["mttr"]["mean"])
+        if not s["scores"]:
+            body_html = '<p class="empty">No score history yet for this range.</p>'
+        else:
+            avg = round(sum(s["scores"]) / len(s["scores"]))
+            if s["prev_scores"]:
+                prev_avg = round(sum(s["prev_scores"]) / len(s["prev_scores"]))
+                delta = avg - prev_avg
+                if delta > 0:
+                    trend_html = f'<span class="leadership-trend-up">&#8593; +{delta} vs last period</span>'
+                elif delta < 0:
+                    trend_html = f'<span class="leadership-trend-down">&#8595; {delta} vs last period</span>'
+                else:
+                    trend_html = '<span class="leadership-trend-flat">&#8594; unchanged vs last period</span>'
+            else:
+                trend_html = '<span class="leadership-trend-flat">No prior-period data to compare</span>'
+            stats_row_html = f"""
+            <div class="trend-stats">
+              <div class="trend-stat"><strong>{s['acknowledgements']}</strong>Acknowledgements</div>
+              <div class="trend-stat"><strong>{mtta_txt}</strong>MTTA</div>
+              <div class="trend-stat"><strong>{mttr_txt}</strong>MTTR</div>
+            </div>"""
+            body_html = f"""
+            <div class="leadership-score-row">
+              <div class="leadership-score-num">{avg}%</div>
+              {trend_html}
+            </div>
+            {stats_row_html}"""
+        return f"""
+        <div class="panel">
+          <div class="panel-head"><h2>{_esc(TRENDS_SYSTEM_LABELS[key])}</h2>
+            <a class="ghost" href="/trends?system={key}&range={'90d' if range_days >= 90 else '30d' if range_days >= 30 else '7d'}">View in Trends &rarr;</a>
+          </div>
+          <div style="padding:14px 18px;">{body_html}</div>
+        </div>"""
+
+    system_cards_html = f'<div class="leadership-sys-grid">{"".join(system_card(k) for k in system_keys)}</div>'
+
+    target_counts = {}
+    for a in all_actions:
+        if a["action"] != "acknowledged" or not a["target"]:
+            continue
+        key = (a["system_label"], a["target"])
+        target_counts[key] = target_counts.get(key, 0) + 1
+    top_targets = sorted(target_counts.items(), key=lambda kv: -kv[1])[:10]
+    top_targets_html = ""
+    if top_targets:
+        rows = "".join(
+            f'<tr><td><span class="tag">{_esc(sys_label)}</span></td><td>{_esc(target)}</td>'
+            f'<td class="n">{count}</td></tr>'
+            for (sys_label, target), count in top_targets
+        )
+        top_targets_html = f"""
+        <div class="card">
+          <h3>Most Frequently Acknowledged</h3>
+          <div class="table-scroll"><table><tr><th>System</th><th>Target</th><th>Times</th></tr>{rows}</table></div>
+        </div>"""
+    else:
+        top_targets_html = '<div class="card"><h3>Most Frequently Acknowledged</h3><p class="empty">No acknowledgments in this range.</p></div>'
+
+    by_user = {}
+    for a in all_actions:
+        if a["set_by"] in NON_HUMAN_SET_BY_VALUES:
+            continue  # system-detected (alarm, self-cleared resolved, auto-restart, etc.) - not a human responder
+        u = by_user.setdefault(a["set_by"], {"total": 0, "acknowledged": 0, "restarted": 0})
+        u["total"] += 1
+        u[a["action"]] = u.get(a["action"], 0) + 1
+    top_users = sorted(by_user.items(), key=lambda kv: -kv[1]["total"])[:6]
+    top_users_html = ""
+    if top_users:
+        rows = "".join(
+            f'<tr><td>{_esc(name)}</td><td class="n">{u["total"]}</td>'
+            f'<td class="n">{u.get("acknowledged", 0)}</td><td class="n">{u.get("restarted", 0)}</td></tr>'
+            for name, u in top_users
+        )
+        top_users_html = f"""
+        <div class="card">
+          <h3>Most Active Responders</h3>
+          <div class="table-scroll"><table><tr><th>User</th><th>Total</th><th>Acknowledged</th><th>Restarted</th></tr>{rows}</table></div>
+        </div>"""
+
+    range_buttons = "".join(
+        f'<a href="/admin/leadership?range={key}" class="range-btn{" active" if key == range_key else ""}">{key}</a>'
+        for key in LEADERSHIP_RANGE_HOURS
+    )
+
+    generated_at = datetime.now().strftime("%A, %B %-d, %Y at %-I:%M %p")
+    body = f"""
+    <div class="page-header">
+      <div>
+        <h1>Leadership Dashboard</h1>
+        <p class="sub">Last {int(range_days)} days &middot; generated {generated_at}</p>
+      </div>
+      <div class="page-action" style="display:flex; gap:8px;">
+        <a class="ghost page-action" href="/admin/leadership.csv?range={range_key}">Download CSV &darr;</a>
+        <button class="ghost print-btn" onclick="window.print()" type="button">Print / Save as PDF</button>
+      </div>
+    </div>
+    <style>{DASHBOARD_BASE_CSS}</style>
+    <div class="card"><div class="trend-range-row">{range_buttons}</div></div>
+    {summary_html}
+    {system_cards_html}
+    <div class="overview-2col">
+      {top_targets_html}
+      {top_users_html}
+    </div>
+    """
+    return Response(render_shell("Leadership Dashboard", body, "admin-leadership", username), mimetype="text/html")
+
+
+@app.route("/admin/leadership.csv")
+@require_login
+@require_admin
+def admin_leadership_csv(username):
+    range_key = request.args.get("range", LEADERSHIP_DEFAULT_RANGE)
+    if range_key not in LEADERSHIP_RANGE_HOURS:
+        range_key = LEADERSHIP_DEFAULT_RANGE
+    until_ts = time.time()
+    since_ts = until_ts - LEADERSHIP_RANGE_HOURS[range_key] * 3600
+
+    all_actions = _all_maintenance_actions(since_ts=since_ts)
+    total_acks = sum(1 for a in all_actions if a["action"] == "acknowledged")
+    total_restarts = sum(1 for a in all_actions if a["action"] == "restarted")
+    total_incidents = sum(1 for a in all_actions if a["action"] == "acknowledged" and a.get("incident_number"))
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Leadership Dashboard Export", f"Last {int(LEADERSHIP_RANGE_HOURS[range_key] / 24)} days",
+                      datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+    writer.writerow([])
+    writer.writerow(["Summary"])
+    writer.writerow(["Acknowledgments", total_acks])
+    writer.writerow(["Tied to an Incident #", total_incidents])
+    writer.writerow(["Service Restarts", total_restarts])
+    writer.writerow([])
+
+    writer.writerow(["Per-System"])
+    writer.writerow(["System", "Avg Health Score", "Worst", "Acknowledgements", "MTTA", "MTTR"])
+    for key in ("hyperview", "ipro", "ooma", "downtime"):
+        points = _history_points(key, since_ts, until_ts)
+        scores = [s for _, s in points]
+        # Acknowledgements/MTTA/MTTR are all computed from local history, so
+        # they apply the same way to every system, Hyperview included.
+        acknowledgements = sum(
+            1 for a in all_actions
+            if a["system_label"] == TRENDS_SYSTEM_LABELS[key] and a["action"] == "acknowledged"
+        )
+        mtta_stats = _duration_stats(_mtta_samples_for_system(key, since_ts, until_ts))
+        mtta_txt = "" if mtta_stats is None else _format_duration(mtta_stats["mean"])
+        mttr_stats = _duration_stats(_mttr_samples_for_system(key, since_ts, until_ts))
+        mttr_txt = "" if mttr_stats is None else _format_duration(mttr_stats["mean"])
+        writer.writerow([
+            TRENDS_SYSTEM_LABELS[key],
+            round(sum(scores) / len(scores)) if scores else "",
+            min(scores) if scores else "",
+            acknowledgements,
+            mtta_txt,
+            mttr_txt,
+        ])
+    writer.writerow([])
+
+    writer.writerow(["Most Frequently Acknowledged"])
+    writer.writerow(["System", "Target", "Times"])
+    target_counts = {}
+    for a in all_actions:
+        if a["action"] != "acknowledged" or not a["target"]:
+            continue
+        k = (a["system_label"], a["target"])
+        target_counts[k] = target_counts.get(k, 0) + 1
+    for (sys_label, target), count in sorted(target_counts.items(), key=lambda kv: -kv[1])[:10]:
+        writer.writerow([sys_label, target, count])
+    writer.writerow([])
+
+    writer.writerow(["Most Active Responders"])
+    writer.writerow(["User", "Total", "Acknowledged", "Restarted"])
+    by_user = {}
+    for a in all_actions:
+        if a["set_by"] in NON_HUMAN_SET_BY_VALUES:
+            continue  # system-detected (alarm, self-cleared resolved, auto-restart, etc.) - not a human responder
+        u = by_user.setdefault(a["set_by"], {"total": 0})
+        u["total"] += 1
+        u[a["action"]] = u.get(a["action"], 0) + 1
+    for name, u in sorted(by_user.items(), key=lambda kv: -kv[1]["total"])[:10]:
+        writer.writerow([name, u["total"], u.get("acknowledged", 0), u.get("restarted", 0)])
+
+    filename = f"leadership-{range_key}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
+    return Response(
+        buf.getvalue(), mimetype="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _login_page_html(error, next_url):
+    error_html = f'<div class="msg err">{_esc(error)}</div>' if error else ""
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" type="image/png" href="data:image/png;base64,{FAVICON_PNG_B64}">
+<title>Sign in - InfraWatch</title>
+<style>
+  :root {{
+    --bg: #eef2f5; --panel: #ffffff; --border: #dee6ec; --border-bright: #c5d2da;
+    --text: #16212b; --text-dim: #55636e;
+    --teal: #005a9c; --teal-dark: #06315e; --teal-tint: #e4edf5;
+    --danger: #ae0031; --danger-tint: #faeaee;
+    --shadow-md: 0 12px 32px rgba(15, 35, 55, 0.12);
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; min-height: 100vh; background:
+      radial-gradient(circle at 15% 15%, #dfe9f0 0%, transparent 45%),
+      radial-gradient(circle at 85% 85%, #dfe9f0 0%, transparent 45%),
+      var(--bg);
+    color: var(--text); font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, Arial, sans-serif;
+    display: flex; align-items: center; justify-content: center; padding: 2rem;
+    -webkit-font-smoothing: antialiased; zoom: 1.08;
+  }}
+  .login-card {{
+    width: 100%; max-width: 370px; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 14px; padding: 30px 28px 28px; box-shadow: var(--shadow-md);
+    border-top: 4px solid var(--teal); position: relative;
+  }}
+  .login-card .brand-logo {{ height: 40px; width: auto; display: block; margin: 0 0 10px; }}
+  .login-card .sub {{ color: var(--text-dim); font-size: 13px; margin: 0 0 20px; }}
+  .msg.err {{ background: var(--danger-tint); color: var(--danger); border: 1px solid var(--danger);
+    padding: 9px 12px; border-radius: 8px; font-size: 13px; margin-bottom: 16px;
+    display: flex; align-items: center; gap: 8px; }}
+  .msg.err::before {{ content: "\\26A0"; font-weight: 700; flex-shrink: 0; }}
+  label {{ display: block; font-size: 12px; color: var(--text-dim); margin: 12px 0 5px; font-weight: 600; }}
+  label:first-of-type {{ margin-top: 0; }}
+  input {{
+    width: 100%; padding: 10px 12px; border-radius: 8px; border: 1.5px solid var(--border-bright);
+    background: #fff; color: var(--text); font-size: 14px; font-family: inherit;
+    transition: border-color 0.12s ease, box-shadow 0.12s ease;
+  }}
+  input:focus {{ outline: none; border-color: var(--teal); box-shadow: 0 0 0 3px var(--teal-tint); }}
+  button {{
+    width: 100%; font-family: inherit; font-weight: 600; font-size: 14px; padding: 11px 18px;
+    border-radius: 8px; border: 1.5px solid var(--teal); background: var(--teal); color: #fff;
+    cursor: pointer; margin-top: 20px; box-shadow: 0 2px 8px rgba(0, 88, 152, 0.25);
+    transition: background 0.12s ease, border-color 0.12s ease, transform 0.06s ease;
+  }}
+  button:hover {{ background: var(--teal-dark); border-color: var(--teal-dark); }}
+  button:active {{ transform: translateY(1px); }}
+</style>
+</head>
+<body>
+  <form class="login-card" method="post" action="/login">
+    <img class="brand-logo" src="data:image/png;base64,{COVENANT_LOGO_PNG_B64}" alt="Covenant Health">
+    <p class="sub">InfraWatch &middot; sign in with your directory or local account</p>
+    {error_html}
+    <input type="hidden" name="next" value="{_esc(next_url)}">
+    <label for="login-username">Username</label>
+    <input id="login-username" type="text" name="username" autocomplete="username" autofocus required>
+    <label for="login-password">Password</label>
+    <input id="login-password" type="password" name="password" autocomplete="current-password" required>
+    <button type="submit">Sign in</button>
+  </form>
+</body>
+</html>"""
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login_page():
+    next_url = request.values.get("next") or "/overview"
+    if not next_url.startswith("/") or next_url.startswith("//"):
+        next_url = "/overview"
+
+    error = None
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        result = _authenticate(username, password)
+        if result is None:
+            error = "Incorrect username or password, or the directory couldn't be reached."
+        else:
+            systems, is_admin, source, ldap_groups = result
+            if not systems:
+                error = "Your account doesn't belong to any group with access to this portal."
+            else:
+                session.clear()
+                session.permanent = True
+                session["username"] = username
+                session["systems"] = sorted(systems)
+                session["is_admin"] = is_admin
+                session["auth_source"] = source
+                session["ldap_groups"] = ldap_groups
+                if source == "ldap":
+                    session["cred_token"] = _stash_ldap_credential(password)
+                    if "downtime" in systems:
+                        _record_ldap_downtime_operator(username, session["cred_token"])
+                return redirect(next_url)
+
+    return Response(_login_page_html(error, next_url), mimetype="text/html")
+
+
 @app.route("/logout")
 def logout():
-    """HTTP Basic auth has no real server-side session to end - the
-    browser just re-sends its cached credentials on every request. This
-    is the standard workaround: answering with 401 makes most browsers
-    discard the cached credentials and re-prompt on the next visit to a
-    protected page. It's not universal (some browsers/tabs hang onto
-    Basic auth credentials until fully closed regardless), so the page
-    also says to close the browser if a stale login persists."""
-    return Response(
-        render_shell(
-            "Logged out",
-            '<div class="card"><h3>Logged out</h3>'
-            '<p class="sub">You have been logged out. If your browser still shows you as signed in when you '
-            'go back to <a href="/maintenance">Maintenance</a> or '
-            '<a href="/events-search">Event search</a>, close all browser windows/tabs for this site - '
-            'some browsers keep a login active until then.</p></div>',
-            "", "",
-        ),
-        401, {"WWW-Authenticate": 'Basic realm="bridge portal - logged out"'},
-    )
+    _clear_ldap_credential(session.get("cred_token"))
+    _clear_ldap_downtime_operator(session.get("cred_token"))
+    session.clear()
+    return redirect("/login")
 
 
 @app.route("/")
