@@ -6780,15 +6780,112 @@ def _rack_audit_pdf_filename(rack_name, username):
     return f"{safe_rack}-{date_part}-{safe_user}-rackaudit"
 
 
+def _rack_audit_scope_racks(sites):
+    """_rack_audit_compliance_list(), filtered down to the given eligible
+    sites (None means every site) - shared by the overview page's
+    due-soon/overdue lists and anywhere else that needs "racks this user
+    is actually responsible for," not the whole tenant."""
+    racks, error = _rack_audit_compliance_list()
+    if error:
+        return None, error
+    if sites:
+        sites_ci = {s.strip().lower() for s in sites}
+        racks = [r for r in racks if (r.get("site") or "").strip().lower() in sites_ci]
+    return racks, None
+
+
 @app.route("/tools/rack-audit")
 @require_login
 def rack_audit_page(username):
+    """Compliance overview only - picking (and starting) the next rack is
+    a separate, explicit POST (/tools/rack-audit/start) rather than a side
+    effect of loading this page. find_next_rack_to_audit on the Hyperview
+    side silently stamps any EMPTY rack it walks past as audited to skip
+    it - a real write - so it must only ever fire from a deliberate click,
+    never from a page load, refresh, or the auto-refresh timer."""
     if "hyperview" not in _user_systems(username):
         return _error_page(username, "Your account does not have access to Hyperview")
 
     sites = _rack_audit_eligible_sites(username)
     assignment_html = (
-        f"Every site (no shift-specific AD group matched)" if sites is None
+        "Every site (no shift-specific AD group matched)" if sites is None
+        else ", ".join(sorted(sites)) if sites else "No sites (your AD group grants an empty scope)"
+    )
+
+    racks, error = _rack_audit_scope_racks(sites)
+    if error:
+        needs_attention_html = f'<div class="msg err">{_esc(error)}</div>'
+        counts = {}
+    else:
+        counts = {}
+        for r in racks:
+            status = (r.get("compliance") or {}).get("status", "unknown")
+            counts[status] = counts.get(status, 0) + 1
+        needing_attention = sorted(
+            (r for r in racks if (r.get("compliance") or {}).get("status") in ("overdue", "never_audited", "due_soon")),
+            key=_rack_audit_compliance_sort_key,
+        )
+        if not needing_attention:
+            needs_attention_html = '<p class="empty">Every rack in your scope is current on its audit schedule.</p>'
+        else:
+            rows = "".join(
+                f"""<tr>
+                  <td>{_esc(r.get("site_path") or r.get("site") or "Unknown")}</td>
+                  <td>{_esc(r.get("name") or r.get("id"))}</td>
+                  <td>{_rack_audit_last_audit_html(r.get("last_audit"))}</td>
+                  <td>{_rack_audit_compliance_badge_html(r.get("compliance"))}</td>
+                </tr>"""
+                for r in needing_attention
+            )
+            needs_attention_html = (
+                '<div class="table-scroll"><table><tr><th>Site</th><th>Rack</th>'
+                f'<th>Last Audited</th><th>Compliance</th></tr>{rows}</table></div>'
+            )
+
+    stat_row = "".join(
+        f'<div class="stat-tile{" unhealthy" if key in ("overdue", "never_audited") else ""}">'
+        f'<div class="stat-num">{counts.get(key, 0)}</div><div class="stat-lbl">{label}</div></div>'
+        for key, label in (
+            ("never_audited", "Never Audited"), ("overdue", "Overdue"),
+            ("due_soon", "Due Soon"), ("current", "Current"),
+        )
+    )
+
+    body = f"""
+    <div class="page-header">
+      <div>
+        <h1>Rack Audit</h1>
+        <p class="sub">Your assignment: {assignment_html}</p>
+      </div>
+    </div>
+    <style>{DASHBOARD_BASE_CSS}</style>
+    {_msg_html()}
+    <div class="panel">
+      <div class="stat-row">{stat_row}</div>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h2>Needs Attention</h2><span class="count-note">racks due soon or overdue in your scope</span></div>
+      {needs_attention_html}
+    </div>
+    <div class="panel" style="padding:16px 20px; display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap;">
+      <p class="sub" style="margin:0;">Starts the next rack automatically - most-overdue first, same as before - there's nothing to search or pick.</p>
+      <form method="POST" action="/tools/rack-audit/start" style="margin:0;">
+        <button class="btn" style="background:var(--teal); color:#fff; border:none; padding:11px 22px; border-radius:8px; font-weight:700; cursor:pointer;" type="submit">Start Next Audit &rarr;</button>
+      </form>
+    </div>
+    """
+    return Response(render_shell("Rack Audit", body, "rack-audit", username), mimetype="text/html")
+
+
+@app.route("/tools/rack-audit/start", methods=["POST"])
+@require_login
+def rack_audit_start(username):
+    if "hyperview" not in _user_systems(username):
+        return _error_page(username, "Your account does not have access to Hyperview")
+
+    sites = _rack_audit_eligible_sites(username)
+    assignment_html = (
+        "Every site (no shift-specific AD group matched)" if sites is None
         else ", ".join(sorted(sites)) if sites else "No sites (your AD group grants an empty scope)"
     )
 
@@ -6798,6 +6895,7 @@ def rack_audit_page(username):
         <div class="page-header"><div><h1>Rack Audit</h1></div></div>
         {_msg_html()}
         <div class="msg err">{_esc(error)}</div>
+        <p><a href="/tools/rack-audit">&larr; Back to overview</a></p>
         """
         return Response(render_shell("Rack Audit", body, "rack-audit", username), mimetype="text/html")
 
