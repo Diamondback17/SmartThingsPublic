@@ -7079,19 +7079,28 @@ def rack_audit_page(username):
             # right ranking - no separate sort needed. Top 8 keeps this a
             # quick scan, not another table.
             location_top_rack = {}
-            location_counts = {}
             for r in needing_attention:
                 loc = _rack_audit_parent_location(r)
-                location_counts[loc] = location_counts.get(loc, 0) + 1
                 if loc not in location_top_rack:
                     location_top_rack[loc] = r
+            # Counted against the SAME status as the location's displayed
+            # rack, not every rack sharing that room regardless of status -
+            # otherwise a room showing "Never audited" next to a count of 4
+            # could mean only 2 of those 4 were actually never audited (the
+            # other 2 merely overdue or due soon), which reads as wrong.
+            location_status_counts = {}
+            for r in needing_attention:
+                loc = _rack_audit_parent_location(r)
+                top_status = (location_top_rack[loc].get("compliance") or {}).get("status")
+                if (r.get("compliance") or {}).get("status") == top_status:
+                    location_status_counts[loc] = location_status_counts.get(loc, 0) + 1
             top_locations = list(location_top_rack.items())[:8]
             if len(top_locations) > 1:
                 rows = "".join(
                     f"""<div class="ra-site-row">
                       <div class="ra-site-name">{_esc(loc)} <span class="ra-site-rack">{_esc(rack.get("name") or rack.get("id"))}</span></div>
                       <div class="ra-site-when">{_rack_audit_last_audit_html(rack.get("last_audit"))}</div>
-                      <div class="ra-site-count">{location_counts[loc]} rack{"s" if location_counts[loc] != 1 else ""}</div>
+                      <div class="ra-site-count">{location_status_counts[loc]} rack{"s" if location_status_counts[loc] != 1 else ""}</div>
                     </div>"""
                     for loc, rack in top_locations
                 )
