@@ -7089,7 +7089,7 @@ def rack_audit_page(username):
             if len(top_locations) > 1:
                 rows = "".join(
                     f"""<div class="ra-site-row">
-                      <div class="ra-site-name">{_esc(loc)}</div>
+                      <div class="ra-site-name">{_esc(loc)} <span class="ra-site-rack">{_esc(rack.get("name") or rack.get("id"))}</span></div>
                       <div class="ra-site-when">{_rack_audit_last_audit_html(rack.get("last_audit"))}</div>
                       <div class="ra-site-count">{location_counts[loc]} rack{"s" if location_counts[loc] != 1 else ""}</div>
                     </div>"""
@@ -7180,6 +7180,8 @@ def rack_audit_page(username):
         gap: 16px; padding: 7px 0; font-size: 13px; border-bottom: 1px solid var(--border); }}
       .ra-site-row:last-child {{ border-bottom: none; }}
       .ra-site-name {{ color: var(--text); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+      .ra-site-rack {{ color: var(--teal); font-weight: 700; }}
+      .ra-site-rack::before {{ content: "\\00b7"; color: var(--text-faint); font-weight: 400; margin-right: 6px; }}
       .ra-site-when {{ font-size: 12px; white-space: nowrap; }}
       .ra-site-when .overdue {{ color: var(--danger); font-weight: 700; }}
       .ra-site-count {{ color: var(--text-faint); font-size: 11.5px; white-space: nowrap; text-align: right; }}
