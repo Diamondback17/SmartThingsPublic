@@ -1736,6 +1736,11 @@ PAGE_SHELL = """<!DOCTYPE html>
     display: flex; align-items: center; justify-content: space-between;
     box-shadow: var(--shadow-sm); position: relative; z-index: 5;
   }}
+  /* On the four videowall-style dashboards, the branding bar is pure
+     chrome competing with DASHBOARD_WALL_FIT_SCRIPT for vertical room -
+     drop it there and rely on nav.top (still shows the active page and
+     a way back to Overview) instead. */
+  html[data-dashboard] header.brand {{ display: none; }}
   .brand-logo-plate {{
     display: inline-flex; align-items: center; background: #fff;
     border-radius: 8px; padding: 5px 12px; box-shadow: var(--shadow-sm);
@@ -2263,6 +2268,14 @@ def render_shell(title, body, active, username=""):
     restricted_dashboard_path = _single_view_only_dashboard_path(username) if username else None
     single_system_path = _single_system_dashboard_path(username) if username else None
     theme_attr = ' data-theme="dark"' if username and _get_user_theme(username) == "dark" else ""
+    # The branding bar (logo + "InfraWatch / System Health") is pure
+    # chrome on the four videowall-style dashboards - every pixel it
+    # takes matters there, since DASHBOARD_WALL_FIT_SCRIPT scales the
+    # board to fill whatever's left below it. nav.top (with its own
+    # active-page highlight) stays as the only way to tell which
+    # dashboard you're on and to get back to Overview.
+    if active in ("ipro", "ooma", "hyperview", "downtime"):
+        theme_attr += ' data-dashboard="1"'
 
     def nav_link(href, active_flag, label, badge=""):
         cls = "active" if active == active_flag else ""
@@ -4917,7 +4930,16 @@ HYPERVIEW_COMPONENT_CSS = """
      visually without the page's own scrollable height ever accounting
      for it (i.e. genuinely unreachable, not just "needs a scroll").
      min-height keeps the row viewport-sized in the common case while
-     still letting it grow for a long site list. */
+     still letting it grow for a long site list. DASHBOARD_WALL_FIT_SCRIPT's
+     pinRowHeight() then overrides this auto with an explicit inline height
+     (Site Status's own real height, floored at this min-height) once it
+     runs - needed so column 3's overflow-y:auto (Device Detail/Active
+     Alarms) has an actual definite height to scroll within instead of
+     ballooning to its full unclipped content height: CSS grid's
+     align-items:stretch only bounds a stretched item to the row's size
+     when that row has a DEFINITE height - with height:auto, the row's own
+     size is computed from items' max-content (i.e. AS IF nothing could
+     scroll), so overflow-y:auto alone never bounded it. */
   .board-viewport-wrap.alarms-right-split { display: grid; height: auto; min-height: calc(100vh - 320px);
     grid-template-columns: minmax(380px, 460px) minmax(260px, 340px) 1fr; gap: 14px; align-items: stretch; }
   .board-viewport-wrap.alarms-right-split .board-fill-panel { min-height: 0; margin-bottom: 0; }
@@ -5255,7 +5277,103 @@ DASHBOARD_WALL_CSS = """
   .dashboard-wall .health-state { font-size: 22px; }
   .dashboard-wall .health-detail { font-size: 15px; }
   .dashboard-wall .status-banner { font-size: 17px; }
+  /* Long account/site names (e.g. "Morristown-Hamblen Healthcare System")
+     were forcing Site Status wider than its grid column and triggering a
+     horizontal scrollbar there, since .site-cell is nowrap everywhere
+     else on purpose (see the comment on .board's own definition). A
+     fit-to-screen wall display can't tolerate ANY scrollbar, so this
+     scope trades that for wrapping onto a second line instead. */
+  .dashboard-wall .site-cell, .dashboard-wall td.loc { white-space: normal; }
+  #wall-fit-outer { overflow: hidden; }
+  #wall-fit-inner { transform-origin: top left; }
 """
+
+# Scales #wall-fit-inner (header + board) down - or up, within reason - to
+# fill whatever room is left below the nav, the way the old standalone
+# videowall shell filled its whole screen with zero scrolling. Deliberately
+# NOT the CSS `zoom` property this used previously: zoom nests badly inside
+# the page's own body{zoom:1.08} and, worse, changes layout BEFORE the
+# scrollbar it may or may not need is accounted for, which is exactly what
+# caused a phantom horizontal scrollbar last time (the scrollbar carves out
+# width after a zoomed element is already sized). `transform: scale` is a
+# pure paint-time effect - it never feeds back into the layout that decides
+# whether a scrollbar exists - so measuring the content's true natural size
+# first and only THEN applying a scale can't create that feedback loop.
+#
+# The one thing transform doesn't fix on its own: CSS `width`/`height` (what
+# this script has to set on inner/outer) live in the LOCAL, pre-zoom pixel
+# space, but getBoundingClientRect()/innerHeight live in real VIEWPORT
+# pixels - already multiplied by that ambient body{zoom:1.08}. Mixing the
+# two (e.g. dividing a viewport-space available-height by a local-space
+# natural-height) silently bakes the zoom factor into the result a second
+# time. zoomFactor below measures that ambient ratio directly (rather than
+# hardcoding 1.08) and divides it back out of every viewport-space
+# measurement before it touches the local-space math, so this keeps working
+# even if that global zoom value ever changes.
+DASHBOARD_WALL_FIT_SCRIPT = """<script>
+(function () {
+  var outer = document.getElementById('wall-fit-outer');
+  var inner = document.getElementById('wall-fit-inner');
+  if (!outer || !inner) return;
+  var pending = false;
+  // Gives the Site Status / Device Detail row an explicit height (Site
+  // Status's own natural height, floored at the CSS min-height) so
+  // Device Detail's overflow-y:auto has something definite to scroll
+  // within - see the CSS comment on .board-viewport-wrap.alarms-right-split
+  // for why "auto" alone doesn't bound it. No-op on pages without this
+  // layout (e.g. Downtime's card grid).
+  function pinRowHeight(zoomFactor) {
+    var wrap = document.querySelector('.board-viewport-wrap.alarms-right-split');
+    if (!wrap) return;
+    var site = wrap.querySelector(':scope > .panel:first-child');
+    if (!site) return;
+    wrap.style.height = 'auto';
+    var minH = parseFloat(getComputedStyle(wrap).minHeight) || 0;
+    // getBoundingClientRect() is viewport-space (already zoom-multiplied);
+    // minHeight from getComputedStyle is local-space - divide the former
+    // back to local-space before comparing/assigning, same reasoning as
+    // the zoomFactor handling below.
+    var siteH = site.getBoundingClientRect().height / zoomFactor;
+    wrap.style.height = Math.max(minH, siteH) + 'px';
+  }
+  function fit() {
+    inner.style.transform = 'none';
+    inner.style.width = '100%';
+    var zoomFactor = inner.scrollHeight > 0 ? (inner.getBoundingClientRect().height / inner.scrollHeight) : 1;
+    if (!isFinite(zoomFactor) || zoomFactor <= 0) zoomFactor = 1;
+    pinRowHeight(zoomFactor);
+    var naturalWidth = inner.scrollWidth;
+    var naturalHeight = inner.scrollHeight;
+    var outerRect = outer.getBoundingClientRect();
+    // Whatever sits below outer right now (the site footer, body's own
+    // bottom padding) stays roughly constant regardless of scale - measured
+    // fresh each call rather than hardcoded, so it keeps working if that
+    // footer ever changes height.
+    var belowOuter = Math.max(0, document.documentElement.scrollHeight - outerRect.bottom);
+    var availWidth = (document.documentElement.clientWidth - outerRect.left) / zoomFactor;
+    var availHeight = (window.innerHeight - outerRect.top - belowOuter) / zoomFactor;
+    if (!naturalWidth || !naturalHeight || availWidth <= 0 || availHeight <= 0) return;
+    var factor = Math.min(availWidth / naturalWidth, availHeight / naturalHeight, 1.15);
+    if (!isFinite(factor) || factor <= 0) factor = 1;
+    factor = Math.max(factor, 0.4);
+    inner.style.width = naturalWidth + 'px';
+    inner.style.transform = 'scale(' + factor + ')';
+    outer.style.height = (naturalHeight * factor) + 'px';
+  }
+  function scheduleFit() {
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(function () { pending = false; fit(); });
+  }
+  window.addEventListener('load', scheduleFit);
+  window.addEventListener('resize', scheduleFit);
+  if (window.MutationObserver) {
+    new MutationObserver(scheduleFit).observe(inner, {childList: true, subtree: true, characterData: true});
+  }
+  setTimeout(scheduleFit, 300);
+  setTimeout(scheduleFit, 1200);
+})();
+</script>"""
 
 
 HEALTH_ICONS = {
@@ -5589,9 +5707,12 @@ def ipro_page(username):
     body = f"""
     <style>{DASHBOARD_BASE_CSS}{DASHBOARD_WALL_CSS}</style>
     <div class="dashboard-wall">
+    <div id="wall-fit-outer"><div id="wall-fit-inner">
     {_dashboard_page_header_html("iPRO Cameras")}
     {board}
+    </div></div>
     </div>
+    {DASHBOARD_WALL_FIT_SCRIPT}
     {DASHBOARD_AUTO_REFRESH_SCRIPT}
     {alert_script}
     """
@@ -5610,9 +5731,12 @@ def ooma_page(username):
     body = f"""
     <style>{DASHBOARD_BASE_CSS}{DASHBOARD_WALL_CSS}</style>
     <div class="dashboard-wall">
+    <div id="wall-fit-outer"><div id="wall-fit-inner">
     {_dashboard_page_header_html("Ooma AirDial")}
     {board}
+    </div></div>
     </div>
+    {DASHBOARD_WALL_FIT_SCRIPT}
     {DASHBOARD_AUTO_REFRESH_SCRIPT}
     {alert_script}
     """
@@ -7747,10 +7871,13 @@ def hyperview_page(username):
     body = f"""
     <style>{DASHBOARD_BASE_CSS}{DASHBOARD_WALL_CSS}</style>
     <div class="dashboard-wall">
+    <div id="wall-fit-outer"><div id="wall-fit-inner">
     {_dashboard_page_header_html("Hyperview")}
     {_hyperview_board_html()}
+    </div></div>
     </div>
     {HYPERVIEW_SCRIPT % {'auto_refresh_ms': 30000}}
+    {DASHBOARD_WALL_FIT_SCRIPT}
     """
     return Response(render_shell("Hyperview", body, "hyperview", username), mimetype="text/html")
 
@@ -10095,11 +10222,14 @@ def downtime_page(username):
     body = f"""
     <style>{DOWNTIME_CSS}{DASHBOARD_WALL_CSS}</style>
     <div class="dashboard-wall">
+    <div id="wall-fit-outer"><div id="wall-fit-inner">
     {_dashboard_page_header_html("Downtime Workstations", subtitle="Live reporting status for every downtime workstation.")}
     {board}
+    </div></div>
     </div>
     {DOWNTIME_DETAIL_MODAL_HTML}
     {DOWNTIME_SCRIPT}
+    {DASHBOARD_WALL_FIT_SCRIPT}
     {DASHBOARD_AUTO_REFRESH_SCRIPT}
     """
     return Response(render_shell("Downtime Workstations", body, "downtime", username), mimetype="text/html")
