@@ -5343,6 +5343,16 @@ RESPONSIVE_DASHBOARD_CSS = """
 
     .leadership-sys-grid { grid-template-columns: 1fr; }
     .status-grid { grid-template-columns: 1fr; }
+
+    /* .panel-head packs an h2 and a nowrap .count-note on one row with no
+       wrap allowed - on a narrow screen the h2 gets squeezed into a
+       multi-line stack of single words instead of just dropping the
+       count-note to its own line below, which is what should happen. A
+       long count-note (several of the Rack Audit page's are full
+       sentences) still can't wrap once nowrap - override that too, or it
+       just overflows past the edge on its own line instead. */
+    .panel-head { flex-wrap: wrap; }
+    .panel-head .count-note { white-space: normal; }
   }
 """
 
@@ -6915,7 +6925,14 @@ RACK_AUDIT_ELEVATION_CSS = """
   .ra-elevation .u-slot { flex: 1; padding: 0 4px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
   .ra-elevation .u-slot.filled { font-weight: 600; }
   .ra-elevation .u-slot.empty { color: var(--text-faint); }
-  table.ra-table { width: 100%; border-collapse: collapse; font-size: 12px; table-layout: fixed; }
+  /* table-layout:fixed with these percentage widths only stays readable
+     above a real minimum pixel width - below that (a phone screen) 10
+     columns squeeze into single-letter headers and unreadable cells. The
+     table keeps its designed proportions and scrolls horizontally instead
+     (.ra-table-scroll, screen-only - print always gets the full sheet
+     width, no scrolling possible on paper). */
+  .ra-table-scroll { overflow-x: auto; }
+  table.ra-table { width: 100%; min-width: 720px; border-collapse: collapse; font-size: 12px; table-layout: fixed; }
   table.ra-table th, table.ra-table td { padding: 8px 5px; border-bottom: 1px solid var(--border); text-align: left;
     vertical-align: top; white-space: normal; overflow-wrap: normal; word-break: normal; overflow: hidden; }
   table.ra-table th { font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.02em; color: var(--text-faint);
@@ -6937,6 +6954,8 @@ RACK_AUDIT_ELEVATION_CSS = """
        here. Keep it from breaking mid-rack across a page boundary. */
     .ra-elevation-row { display: flex; page-break-inside: avoid; break-inside: avoid; }
     .ra-elevation { page-break-inside: avoid; break-inside: avoid; }
+    .ra-table-scroll { overflow-x: visible; }
+    table.ra-table { min-width: 0; }
     table.ra-table td.notes-col { height: 46px; }
     /* The Delete checkbox is an interactive control, not part of the
        paper sheet - hidden from print same as the context panel. */
@@ -7185,13 +7204,17 @@ def rack_audit_page(username):
       .ra-attention-row.sev-overdue .ra-attention-badge, .ra-attention-row.sev-never .ra-attention-badge {{ background: var(--danger); }}
       .ra-attention-row.sev-due-soon .ra-attention-badge {{ background: var(--warn); color: #1a1200; }}
 
-      .ra-site-row {{ display: grid; grid-template-columns: 4fr auto auto; align-items: baseline;
-        gap: 16px; padding: 7px 0; font-size: 13px; border-bottom: 1px solid var(--border); }}
+      .ra-site-row {{ display: flex; align-items: baseline; flex-wrap: wrap; justify-content: space-between;
+        gap: 4px 16px; padding: 7px 0; font-size: 13px; border-bottom: 1px solid var(--border); }}
       .ra-site-row:last-child {{ border-bottom: none; }}
-      .ra-site-name {{ color: var(--text); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-      .ra-site-when {{ font-size: 12px; white-space: nowrap; }}
+      /* A real location path (Hospitals > Fort Sanders Regional Medical
+         Center > Basement > Data Center) is the whole point of this row -
+         truncating it with ellipsis on a narrow screen hides exactly the
+         thing someone opened this panel to read. Wraps instead. */
+      .ra-site-name {{ flex: 1 1 200px; min-width: 0; color: var(--text); font-weight: 600; overflow-wrap: break-word; }}
+      .ra-site-when {{ font-size: 12px; white-space: nowrap; flex-shrink: 0; }}
       .ra-site-when .overdue {{ color: var(--danger); font-weight: 700; }}
-      .ra-site-count {{ color: var(--text-faint); font-size: 11.5px; white-space: nowrap; text-align: right; }}
+      .ra-site-count {{ color: var(--text-faint); font-size: 11.5px; white-space: nowrap; flex-shrink: 0; }}
     </style>
     {_msg_html()}
     <div class="panel">
@@ -7318,18 +7341,20 @@ def rack_audit_start(username):
         <div class="ra-elevation-col"><div class="ev-label">Front</div>{_rack_audit_elevation_html(assets, "front", rack.get("total_u"))}</div>
         <div class="ra-elevation-col"><div class="ev-label">Rear</div>{_rack_audit_elevation_html(assets, "rear", rack.get("total_u"))}</div>
       </div>
-      <table class="ra-table">
-        <colgroup>
-          <col style="width:3%"><col style="width:8%"><col style="width:13%"><col style="width:9%">
-          <col style="width:8%"><col style="width:9%"><col style="width:9%"><col style="width:11%">
-          <col style="width:22%"><col class="delete-col" style="width:8%">
-        </colgroup>
-        <thead><tr>
-          <th>U</th><th>Side</th><th>Device</th><th>Type</th><th>Make</th><th>Model</th><th>Serial</th><th>Power</th>
-          <th>Notes</th><th class="chk delete-col">Delete</th>
-        </tr></thead>
-        <tbody>{asset_rows or '<tr><td colspan="10" class="empty">No assets.</td></tr>'}</tbody>
-      </table>
+      <div class="table-scroll ra-table-scroll">
+        <table class="ra-table">
+          <colgroup>
+            <col style="width:3%"><col style="width:8%"><col style="width:13%"><col style="width:9%">
+            <col style="width:8%"><col style="width:9%"><col style="width:9%"><col style="width:11%">
+            <col style="width:22%"><col class="delete-col" style="width:8%">
+          </colgroup>
+          <thead><tr>
+            <th>U</th><th>Side</th><th>Device</th><th>Type</th><th>Make</th><th>Model</th><th>Serial</th><th>Power</th>
+            <th>Notes</th><th class="chk delete-col">Delete</th>
+          </tr></thead>
+          <tbody>{asset_rows or '<tr><td colspan="10" class="empty">No assets.</td></tr>'}</tbody>
+        </table>
+      </div>
     </div>
 
     <div class="panel ra-context-panel" style="max-width:1100px; margin:16px auto 0;">
