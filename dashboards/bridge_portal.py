@@ -7133,12 +7133,6 @@ def rack_audit_page(username):
       </div>
     </div>
     <style>{DASHBOARD_BASE_CSS}
-      details.panel > summary.panel-head {{ cursor: pointer; list-style: none; }}
-      details.panel > summary.panel-head::-webkit-details-marker {{ display: none; }}
-      details.panel > summary.panel-head::before {{ content: "\\25B8"; display: inline-block;
-        margin-right: 8px; transition: transform 0.15s ease; color: var(--text-faint); }}
-      details.panel[open] > summary.panel-head::before {{ transform: rotate(90deg); }}
-
       .ra-start-card {{ padding: 20px 24px; display: flex; align-items: center; justify-content: space-between;
         gap: 20px; flex-wrap: wrap; background: linear-gradient(135deg, var(--teal-tint), var(--panel)); border-color: var(--teal); }}
       .ra-start-eyebrow {{ font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
@@ -7198,14 +7192,13 @@ def rack_audit_page(username):
       </form>
     </div>
     {top_sites_html}
-    <details class="panel" id="ra-attention-panel">
-      <summary class="panel-head"><h2 style="display:inline;">Needs Attention</h2><span class="count-note">racks due soon or overdue in your scope &mdash; click a stat above to filter</span></summary>
+    <div class="panel" id="ra-attention-panel">
+      <div class="panel-head"><h2>Needs Attention</h2><span class="count-note">racks due soon or overdue in your scope &mdash; click a stat above to filter</span></div>
       <div id="ra-attention-body" style="padding:12px 16px;">{needs_attention_html}</div>
-    </details>
+    </div>
     <script>
       (function() {{
         var tiles = document.querySelectorAll(".ra-filter-tile");
-        var panel = document.getElementById("ra-attention-panel");
         function applyFilter(status) {{
           tiles.forEach(function(t) {{ t.classList.toggle("active", t.dataset.filter === status); }});
           document.querySelectorAll(".ra-attention-row").forEach(function(row) {{
@@ -7222,7 +7215,6 @@ def rack_audit_page(username):
         }}
         tiles.forEach(function(tile) {{
           tile.addEventListener("click", function() {{
-            if (panel) panel.open = true;
             var next = tile.classList.contains("active") ? "" : tile.dataset.filter;
             applyFilter(next);
           }});
