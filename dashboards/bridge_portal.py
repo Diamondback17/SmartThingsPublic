@@ -7112,6 +7112,16 @@ def rack_audit_page(username):
         margin-right: 8px; transition: transform 0.15s ease; color: var(--text-faint); }}
       details.panel[open] > summary.panel-head::before {{ transform: rotate(90deg); }}
 
+      .ra-start-card {{ padding: 20px 24px; display: flex; align-items: center; justify-content: space-between;
+        gap: 20px; flex-wrap: wrap; background: linear-gradient(135deg, var(--teal-tint), var(--panel)); border-color: var(--teal); }}
+      .ra-start-eyebrow {{ font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+        color: var(--teal); margin-bottom: 5px; }}
+      .ra-start-copy {{ margin: 0; font-size: 14.5px; color: var(--text-dim); }}
+      .ra-start-btn {{ background: var(--teal); color: #fff; border: none; padding: 13px 26px; border-radius: 8px;
+        font-weight: 700; font-size: 14px; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+        transition: filter 0.1s ease; }}
+      .ra-start-btn:hover {{ filter: brightness(1.08); }}
+
       .ra-filter-tile {{ cursor: pointer; transition: box-shadow 0.15s ease, transform 0.1s ease; }}
       .ra-filter-tile:hover {{ box-shadow: 0 0 0 2px var(--border-bright) inset; }}
       .ra-filter-tile.active {{ box-shadow: 0 0 0 2px var(--teal) inset; }}
@@ -7147,10 +7157,13 @@ def rack_audit_page(username):
     <div class="panel">
       <div class="stat-row">{stat_row}</div>
     </div>
-    <div class="panel" style="padding:16px 20px; display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap;">
-      <p class="sub" style="margin:0;">Starts the next rack automatically - most-overdue first, same as before - there's nothing to search or pick.</p>
+    <div class="panel ra-start-card">
+      <div>
+        <div class="ra-start-eyebrow">Next Audit</div>
+        <p class="ra-start-copy">We'll pick the most overdue rack in your scope for you.</p>
+      </div>
       <form method="POST" action="/tools/rack-audit/start" style="margin:0;">
-        <button class="btn" style="background:var(--teal); color:#fff; border:none; padding:11px 22px; border-radius:8px; font-weight:700; cursor:pointer;" type="submit">Start Next Audit &rarr;</button>
+        <button class="ra-start-btn" type="submit">Start Next Audit &rarr;</button>
       </form>
     </div>
     {top_sites_html}
