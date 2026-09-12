@@ -3455,7 +3455,7 @@ def _hyperview_set_ack_state(alarm_event_id, acknowledged):
     resp.raise_for_status()
 
 
-RACK_AUDIT_REQUEST_TIMEOUT = REQUEST_TIMEOUT + 45  # walks every eligible rack server-side - can run long
+RACK_AUDIT_REQUEST_TIMEOUT = REQUEST_TIMEOUT + 105  # walks every eligible rack server-side - can run long
 
 
 def _rack_audit_compliance_list():
@@ -3493,6 +3493,24 @@ def _rack_audit_compliance_sort_key(rack):
     severity = _RACK_AUDIT_STATUS_SEVERITY.get(compliance.get("status"), 5)
     days_overdue = compliance.get("days_overdue") or 0
     return (severity, -days_overdue, (rack.get("site") or ""), (rack.get("name") or ""))
+
+
+def _rack_audit_prefetch(sites):
+    """Fire-and-forget: tells matrix.py to start warming its rack-contents
+    cache for the next few candidate racks in the background, and returns
+    without waiting for that warm-up to finish - only for matrix.py to
+    receive and accept the request. Called when the Rack Audit overview
+    page loads, so by the time someone actually clicks Start Next Audit a
+    few seconds later, the answer is already cached instead of costing
+    30-40 live API calls on that click itself. Any failure here is
+    silently ignored - worst case, Start Next Audit just computes it live
+    as before."""
+    try:
+        requests.post(f"{HYPERVIEW_BASE_URL}/rack-audit/prefetch",
+                       data={"sites": ",".join(sorted(sites))} if sites else None,
+                       timeout=REQUEST_TIMEOUT)
+    except requests.RequestException:
+        pass
 
 
 def _rack_audit_next(sites):
@@ -6948,6 +6966,11 @@ def rack_audit_page(username):
         return _error_page(username, "Your account does not have access to Hyperview")
 
     sites = _rack_audit_eligible_sites(username)
+    # Warm matrix.py's rack-contents cache for the next few candidate racks
+    # now, while this page is loading - by the time the auditor reads the
+    # compliance table and clicks Start Next Audit, the answer is likely
+    # already cached instead of costing 30-40 live API calls on that click.
+    _rack_audit_prefetch(sites)
     assignment_html = (
         "Every site (no shift-specific AD group matched)" if sites is None
         else ", ".join(sorted(sites)) if sites else "No sites (your AD group grants an empty scope)"

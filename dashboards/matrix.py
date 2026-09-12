@@ -11,6 +11,7 @@ always wins if both are set.
 import json
 import logging
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -407,7 +408,7 @@ def delete_asset(asset_id):
 
 
 def get_asset_cache():
-    global asset_cache, asset_cache_time, serial_cache
+    global asset_cache, asset_cache_time, serial_cache, rack_contents_cache
     if asset_cache and (time.time() - asset_cache_time) < ASSET_CACHE_SECONDS:
         return asset_cache
 
@@ -427,6 +428,7 @@ def get_asset_cache():
     asset_cache = cache
     asset_cache_time = time.time()
     serial_cache = {}
+    rack_contents_cache = {}
     return cache
 
 
@@ -478,6 +480,16 @@ rack_audit_cache_time = 0
 # record. Populated lazily (only for assets an audit sheet actually asks
 # about), not rebuilt wholesale like asset_cache.
 serial_cache = {}
+
+# Full contained-assets list (serials, power sources, elevation) for a
+# rack, keyed by rack id - rack_id -> (fetched_at, [asset dicts]). Cleared
+# alongside asset_cache for the same reason serial_cache is. Warmed ahead
+# of time by prefetch_rack_contents for the next few racks a real audit is
+# likely to land on, so Start Next Audit can serve them instantly instead
+# of paying the 30-40 live per-device API calls on the request itself.
+rack_contents_cache = {}
+RACK_CONTENTS_CACHE_SECONDS = int(os.environ.get("RACK_CONTENTS_CACHE_SECONDS", "600"))
+RACK_AUDIT_PREFETCH_COUNT = int(os.environ.get("RACK_AUDIT_PREFETCH_COUNT", "3"))
 
 
 def _unwrap_list(resp):
@@ -608,65 +620,90 @@ def set_audit_date_now(asset_id, audited_by=None):
     return wrote_something
 
 
+RACK_AUDIT_CACHE_WORKERS = int(os.environ.get("RACK_AUDIT_CACHE_WORKERS", "12"))
+_rack_audit_cache_lock = threading.Lock()
+
+
+def _fetch_rack_audit_entry(rack):
+    rack_id = rack.get("id")
+    if not rack_id:
+        return None
+    # One customAssetProperties call per rack instead of two (was:
+    # get_audit_date_property + get_audit_frequency_property, each
+    # separately re-fetching and re-scanning the exact same list) -
+    # halves the API calls this cache rebuild makes across every rack
+    # in the tenant.
+    try:
+        props = _unwrap_list(hv_get(f"asset/customAssetProperties/{rack_id}"))
+    except requests.exceptions.RequestException:
+        logger.exception("rack audit: could not read custom properties for rack %s", rack_id)
+        props = []
+    audit_prop = next((p for p in props if p.get("name") == RACK_AUDIT_DATE_FIELD_NAME), None)
+    frequency_prop = next((p for p in props if p.get("name") == RACK_AUDIT_FREQUENCY_FIELD_NAME), None)
+    last_audit = audit_prop["value"] if audit_prop else None
+    audit_frequency = frequency_prop["value"] if frequency_prop else None
+    return {
+        "id": rack_id,
+        "name": rack.get("name"),
+        "site": _rack_site_name(rack),
+        "site_path": _rack_site_path(rack),
+        "last_audit": last_audit,
+        "audit_frequency": audit_frequency,
+        "compliance": rack_audit_compliance(last_audit, audit_frequency),
+        # Total rack height in U - the elevation always shows every U
+        # slot the rack actually has, not just the range that happens
+        # to be occupied. None if Hyperview has no dimension on record
+        # for this rack; the elevation renderer falls back sensibly.
+        "total_u": (rack.get("dimension") or {}).get("providedRackUnits"),
+    }
+
+
 def get_rack_audit_cache():
     """Every rack asset with its 'Last Audit Date' custom property value,
     rebuilt at most once every RACK_AUDIT_CACHE_SECONDS - avoids re-fetching
     every single rack's custom properties (one call each) on every
-    /rack-audit/next request."""
+    /rack-audit/next request.
+
+    That per-rack fetch is done through a thread pool (RACK_AUDIT_CACHE_WORKERS)
+    rather than one rack after another - with ~180 racks in this tenant, doing
+    it sequentially took well over a minute and blew past the caller's
+    request timeout (bridge_portal would report "Could not reach Hyperview" /
+    a read timeout even though Hyperview itself was fine, just slow to walk
+    one rack at a time)."""
     global rack_audit_cache, rack_audit_cache_time
     if rack_audit_cache is not None and time.time() - rack_audit_cache_time < RACK_AUDIT_CACHE_SECONDS:
         return rack_audit_cache
 
-    racks = []
-    offset = 0
-    while True:
-        page = hv_get(f"asset/assets?assetType=rack&includeDimensions=true&(limit)=100&(after)={offset}")
-        page_racks = _unwrap_list(page)
-        if not page_racks:
-            break
-        racks.extend(page_racks)
-        offset += 100
-        total = page.get("_metadata", {}).get("total") if isinstance(page, dict) else None
-        if (total is not None and offset >= total) or (total is None and len(page_racks) < 100):
-            break
+    # A lock, not just the time-check above, so concurrent cold-cache
+    # requests (e.g. the compliance page and a Start Next Audit click
+    # landing at the same moment) don't each independently pay the full
+    # ~180-rack walk - the second one in just waits for the first's result.
+    with _rack_audit_cache_lock:
+        if rack_audit_cache is not None and time.time() - rack_audit_cache_time < RACK_AUDIT_CACHE_SECONDS:
+            return rack_audit_cache
 
-    entries = []
-    for rack in racks:
-        rack_id = rack.get("id")
-        if not rack_id:
-            continue
-        # One customAssetProperties call per rack instead of two (was:
-        # get_audit_date_property + get_audit_frequency_property, each
-        # separately re-fetching and re-scanning the exact same list) -
-        # halves the API calls this cache rebuild makes across every rack
-        # in the tenant.
-        try:
-            props = _unwrap_list(hv_get(f"asset/customAssetProperties/{rack_id}"))
-        except requests.exceptions.RequestException:
-            logger.exception("rack audit: could not read custom properties for rack %s", rack_id)
-            props = []
-        audit_prop = next((p for p in props if p.get("name") == RACK_AUDIT_DATE_FIELD_NAME), None)
-        frequency_prop = next((p for p in props if p.get("name") == RACK_AUDIT_FREQUENCY_FIELD_NAME), None)
-        last_audit = audit_prop["value"] if audit_prop else None
-        audit_frequency = frequency_prop["value"] if frequency_prop else None
-        entries.append({
-            "id": rack_id,
-            "name": rack.get("name"),
-            "site": _rack_site_name(rack),
-            "site_path": _rack_site_path(rack),
-            "last_audit": last_audit,
-            "audit_frequency": audit_frequency,
-            "compliance": rack_audit_compliance(last_audit, audit_frequency),
-            # Total rack height in U - the elevation always shows every U
-            # slot the rack actually has, not just the range that happens
-            # to be occupied. None if Hyperview has no dimension on record
-            # for this rack; the elevation renderer falls back sensibly.
-            "total_u": (rack.get("dimension") or {}).get("providedRackUnits"),
-        })
+        racks = []
+        offset = 0
+        while True:
+            page = hv_get(f"asset/assets?assetType=rack&includeDimensions=true&(limit)=100&(after)={offset}")
+            page_racks = _unwrap_list(page)
+            if not page_racks:
+                break
+            racks.extend(page_racks)
+            offset += 100
+            total = page.get("_metadata", {}).get("total") if isinstance(page, dict) else None
+            if (total is not None and offset >= total) or (total is None and len(page_racks) < 100):
+                break
 
-    rack_audit_cache = entries
-    rack_audit_cache_time = time.time()
-    return entries
+        if racks:
+            with ThreadPoolExecutor(max_workers=min(RACK_AUDIT_CACHE_WORKERS, len(racks))) as pool:
+                entries = [e for e in pool.map(_fetch_rack_audit_entry, racks) if e is not None]
+        else:
+            entries = []
+
+        rack_audit_cache = entries
+        rack_audit_cache_time = time.time()
+        return entries
 
 
 def get_device_power_sources(asset_id):
@@ -723,7 +760,7 @@ def get_asset_serial(asset_id):
 RACK_AUDIT_ASSET_LOOKUP_WORKERS = int(os.environ.get("RACK_AUDIT_ASSET_LOOKUP_WORKERS", "8"))
 
 
-def get_rack_contained_assets(rack_id):
+def get_rack_contained_assets(rack_id, use_cache=True):
     """Elevation entries (U position, side, power source PDUs) for
     everything mounted in this rack. Deliberately NOT
     assetTrackerContainedAssets - that belongs to Hyperview's separate
@@ -738,7 +775,17 @@ def get_rack_contained_assets(rack_id):
     per asset (see get_asset_serial / get_device_power_sources) - done
     with a small thread pool instead of sequentially, since a rack with
     30-40 mounted devices made this the slow part of loading a rack audit
-    (30-40 round trips to Hyperview, one after another)."""
+    (30-40 round trips to Hyperview, one after another). The result is
+    also cached per rack (rack_contents_cache) so a rack that was already
+    warmed by prefetch_rack_contents (or just audited a moment ago) is
+    served instantly instead of redoing all of that work - pass
+    use_cache=False to force a fresh read (e.g. once an audit actually
+    completes and a device was removed)."""
+    if use_cache:
+        cached = rack_contents_cache.get(rack_id)
+        if cached and (time.time() - cached[0]) < RACK_CONTENTS_CACHE_SECONDS:
+            return cached[1]
+
     cache = get_asset_cache()
     entries = []
     for asset in cache.values():
@@ -767,11 +814,59 @@ def get_rack_contained_assets(rack_id):
         }
 
     if not entries:
-        return []
-    if len(entries) == 1:
-        return [_lookup(entries[0])]
-    with ThreadPoolExecutor(max_workers=min(RACK_AUDIT_ASSET_LOOKUP_WORKERS, len(entries))) as pool:
-        return list(pool.map(_lookup, entries))
+        result = []
+    elif len(entries) == 1:
+        result = [_lookup(entries[0])]
+    else:
+        with ThreadPoolExecutor(max_workers=min(RACK_AUDIT_ASSET_LOOKUP_WORKERS, len(entries))) as pool:
+            result = list(pool.map(_lookup, entries))
+
+    rack_contents_cache[rack_id] = (time.time(), result)
+    return result
+
+
+def _ordered_audit_racks(sites=None):
+    """Every eligible rack, most-overdue-first (never-audited racks sort
+    first, then oldest audit date first) - the walk order both
+    find_next_rack_to_audit and prefetch_rack_contents use, factored out
+    so prefetch warms exactly the racks a real audit click would land on."""
+    racks = get_rack_audit_cache()
+    if sites:
+        sites_ci = {s.strip().lower() for s in sites}
+        racks = [r for r in racks if (r["site"] or "").strip().lower() in sites_ci]
+    return sorted(racks, key=lambda r: (r["last_audit"] is not None, r["last_audit"] or ""))
+
+
+def prefetch_rack_contents(sites=None, count=None):
+    """Best-effort warm-up for rack_contents_cache: walks racks in the same
+    most-overdue-first order find_next_rack_to_audit uses and eagerly
+    computes get_rack_contained_assets for the next `count` non-empty ones
+    (default RACK_AUDIT_PREFETCH_COUNT), skipping empty racks the same way
+    the real walk does but without stamping them (this is a read-only
+    warm-up, not a real audit pass). Meant to run in a background thread
+    - e.g. right after the rack-audit overview page loads, or right after
+    a real audit is handed out - so that by the time someone actually
+    clicks Start Next Audit, the answer is already sitting in cache
+    instead of costing 30-40 live API calls on the request itself.
+    Any failure here is silently swallowed - worst case, the next real
+    request just computes it live like before this existed."""
+    count = count or RACK_AUDIT_PREFETCH_COUNT
+    try:
+        ordered = _ordered_audit_racks(sites)
+    except requests.exceptions.RequestException:
+        logger.exception("rack audit: prefetch could not build rack list")
+        return
+    warmed = 0
+    for rack in ordered:
+        if warmed >= count:
+            break
+        try:
+            contained = get_rack_contained_assets(rack["id"])
+        except requests.exceptions.RequestException:
+            logger.exception("rack audit: prefetch failed for rack %s", rack["id"])
+            continue
+        if contained:
+            warmed += 1
 
 
 def find_next_rack_to_audit(sites=None):
@@ -780,11 +875,7 @@ def find_next_rack_to_audit(sites=None):
     and skipping it, until it lands on a rack that actually has something
     mounted in it - that's the one returned for a real, physical audit.
     sites=None (or empty) means every site is eligible."""
-    racks = get_rack_audit_cache()
-    if sites:
-        sites_ci = {s.strip().lower() for s in sites}
-        racks = [r for r in racks if (r["site"] or "").strip().lower() in sites_ci]
-    ordered = sorted(racks, key=lambda r: (r["last_audit"] is not None, r["last_audit"] or ""))
+    ordered = _ordered_audit_racks(sites)
 
     global rack_audit_cache
     for rack in ordered:
@@ -1327,7 +1418,25 @@ def rack_audit_next():
         return jsonify({"error": f"Could not reach Hyperview: {e}"}), 502
     if rack is None:
         return jsonify({"error": "No eligible rack with any mounted assets was found"}), 404
+    # Warm the NEXT few candidates in the background so a second Start Next
+    # Audit click right after finishing this one is also instant, instead
+    # of only ever warming reactively after the fact.
+    threading.Thread(target=prefetch_rack_contents, args=(sites,), daemon=True).start()
     return jsonify({"rack": rack, "assets": contained})
+
+
+@app.route("/rack-audit/prefetch", methods=["POST"])
+def rack_audit_prefetch():
+    """Fire-and-forget cache warm-up: kicks off prefetch_rack_contents in a
+    background thread and returns immediately, rather than making the
+    caller (the rack-audit overview page load) wait on it. Meant to be
+    called right when that page renders, so the top few candidate racks'
+    contents are already cached by the time someone actually clicks Start
+    Next Audit a few seconds later."""
+    sites_param = request.values.get("sites", "")
+    sites = {s.strip() for s in sites_param.split(",") if s.strip()} or None
+    threading.Thread(target=prefetch_rack_contents, args=(sites,), daemon=True).start()
+    return jsonify({"ok": True}), 202
 
 
 @app.route("/rack-audit/compliance")
