@@ -6999,14 +6999,16 @@ def rack_audit_page(username):
         <p class="sub">Your assignment: {assignment_html}</p>
       </div>
     </div>
-    <style>{DASHBOARD_BASE_CSS}</style>
+    <style>{DASHBOARD_BASE_CSS}
+      details.panel > summary.panel-head {{ cursor: pointer; list-style: none; }}
+      details.panel > summary.panel-head::-webkit-details-marker {{ display: none; }}
+      details.panel > summary.panel-head::before {{ content: "\\25B8"; display: inline-block;
+        margin-right: 8px; transition: transform 0.15s ease; color: var(--text-faint); }}
+      details.panel[open] > summary.panel-head::before {{ transform: rotate(90deg); }}
+    </style>
     {_msg_html()}
     <div class="panel">
       <div class="stat-row">{stat_row}</div>
-    </div>
-    <div class="panel">
-      <div class="panel-head"><h2>Needs Attention</h2><span class="count-note">racks due soon or overdue in your scope</span></div>
-      {needs_attention_html}
     </div>
     <div class="panel" style="padding:16px 20px; display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap;">
       <p class="sub" style="margin:0;">Starts the next rack automatically - most-overdue first, same as before - there's nothing to search or pick.</p>
@@ -7014,6 +7016,10 @@ def rack_audit_page(username):
         <button class="btn" style="background:var(--teal); color:#fff; border:none; padding:11px 22px; border-radius:8px; font-weight:700; cursor:pointer;" type="submit">Start Next Audit &rarr;</button>
       </form>
     </div>
+    <details class="panel">
+      <summary class="panel-head"><h2 style="display:inline;">Needs Attention</h2><span class="count-note">racks due soon or overdue in your scope</span></summary>
+      <div style="padding:12px 16px;">{needs_attention_html}</div>
+    </details>
     """
     return Response(render_shell("Rack Audit", body, "rack-audit", username), mimetype="text/html")
 
