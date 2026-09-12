@@ -3514,7 +3514,13 @@ def _rack_audit_attention_card_html(rack):
     if label is None:
         days = compliance.get("days_overdue")
         label = f"Overdue {days}d" if days is not None else "Overdue"
-    site = _esc(rack.get("site_path") or rack.get("site") or "Unknown")
+    # The rack's own name already appears below in full - showing it again
+    # as the tail of site_path (e.g. "Site A > Room 1 > MDF > R1-L4") was
+    # both redundant and, on a narrow card, the reason the whole line ran
+    # off the edge. Parent location (one level up) is both shorter and
+    # more useful context. Full path still available on hover via title=.
+    full_path = rack.get("site_path") or rack.get("site") or "Unknown"
+    site = _esc(_rack_audit_parent_location(rack))
     name = _esc(rack.get("name") or rack.get("id"))
     meta = _rack_audit_last_audit_html(rack.get("last_audit"))
     return f"""
@@ -3523,7 +3529,7 @@ def _rack_audit_attention_card_html(rack):
             <span class="ra-attention-icon">{icon}</span>
             <span class="ra-attention-badge">{_esc(label)}</span>
           </div>
-          <div class="ra-attention-site">{site}</div>
+          <div class="ra-attention-site" title="{_esc(full_path)}">{site}</div>
           <div class="ra-attention-name">{name}</div>
           <div class="ra-attention-meta">{meta}</div>
         </div>"""
