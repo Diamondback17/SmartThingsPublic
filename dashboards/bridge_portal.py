@@ -3508,9 +3508,13 @@ def _rack_audit_next(sites):
     return (data["rack"], data["assets"]), None
 
 
-def _rack_audit_mark_complete(rack_id):
+def _rack_audit_mark_complete(rack_id, audited_by=None):
     try:
-        resp = requests.post(f"{HYPERVIEW_BASE_URL}/rack-audit/complete/{quote(rack_id, safe='')}", timeout=REQUEST_TIMEOUT)
+        resp = requests.post(
+            f"{HYPERVIEW_BASE_URL}/rack-audit/complete/{quote(rack_id, safe='')}",
+            data={"audited_by": audited_by} if audited_by else None,
+            timeout=REQUEST_TIMEOUT,
+        )
         resp.raise_for_status()
     except requests.RequestException as e:
         return f"Could not reach Hyperview: {e}"
@@ -7133,7 +7137,7 @@ def rack_audit_complete_action(username):
             remove_devices.append((device_id, device_name or device_id))
     if not rack_id:
         return _redirect_msg("/tools/rack-audit", error="No rack selected")
-    error = _rack_audit_mark_complete(rack_id)
+    error = _rack_audit_mark_complete(rack_id, audited_by=username)
     if error:
         return _redirect_msg("/tools/rack-audit", error=error)
     try:

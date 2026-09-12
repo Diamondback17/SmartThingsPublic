@@ -406,7 +406,7 @@ def delete_asset(asset_id):
 
 
 def get_asset_cache():
-    global asset_cache, asset_cache_time
+    global asset_cache, asset_cache_time, serial_cache
     if asset_cache and (time.time() - asset_cache_time) < ASSET_CACHE_SECONDS:
         return asset_cache
 
@@ -425,6 +425,7 @@ def get_asset_cache():
 
     asset_cache = cache
     asset_cache_time = time.time()
+    serial_cache = {}
     return cache
 
 
@@ -457,6 +458,11 @@ def is_acknowledged(alarm):
 # cross-tenant identifier this service can hardcode.
 RACK_AUDIT_DATE_FIELD_NAME = os.environ.get("HYPERVIEW_AUDIT_DATE_FIELD_NAME", "Last Audit Date")
 RACK_AUDIT_FREQUENCY_FIELD_NAME = os.environ.get("HYPERVIEW_AUDIT_FREQUENCY_FIELD_NAME", "Audit Frequency")
+# Written back alongside Last Audit Date whenever a human completes an
+# audit (see rack_audit_complete) - never touched by the automated
+# empty-rack skip in find_next_rack_to_audit, since nobody actually
+# audited that rack.
+RACK_AUDIT_BY_FIELD_NAME = os.environ.get("HYPERVIEW_AUDIT_BY_FIELD_NAME", "Last Audited By")
 RACK_AUDIT_CACHE_SECONDS = int(os.environ.get("RACK_AUDIT_CACHE_SECONDS", "3600"))
 
 # How many days a rack's stated frequency allows between audits.
@@ -464,6 +470,13 @@ RACK_AUDIT_FREQUENCY_DAYS = {"annually": 365, "biennially": 730}
 
 rack_audit_cache = None
 rack_audit_cache_time = 0
+
+# Per-asset serial number, looked up from that asset's own assetProperties
+# record (see get_asset_serial) - keyed by asset id, cleared alongside
+# asset_cache since a stale serial is exactly as wrong as a stale asset
+# record. Populated lazily (only for assets an audit sheet actually asks
+# about), not rebuilt wholesale like asset_cache.
+serial_cache = {}
 
 
 def _unwrap_list(resp):
@@ -517,13 +530,12 @@ def get_audit_date_property(asset_id):
     return None
 
 
-def get_audit_frequency_property(asset_id):
-    """The 'Audit Frequency' custom property record for one asset (its
-    value is "Annually" or "Biennially"), or None if the asset has no such
-    property configured."""
+def get_audit_by_property(asset_id):
+    """The 'Last Audited By' custom property record for one asset, or
+    None if that asset has no such property configured."""
     props = _unwrap_list(hv_get(f"asset/customAssetProperties/{asset_id}"))
     for p in props:
-        if p.get("name") == RACK_AUDIT_FREQUENCY_FIELD_NAME:
+        if p.get("name") == RACK_AUDIT_BY_FIELD_NAME:
             return p
     return None
 
@@ -556,20 +568,43 @@ def rack_audit_compliance(last_audit, frequency):
     return {"status": "current", "due": due, "days_overdue": None}
 
 
-def set_audit_date_now(asset_id):
-    """Stamps this asset's 'Last Audit Date' custom property to now.
-    Returns False (no-op) if the asset has no such property - nothing to
-    write back to."""
-    prop = get_audit_date_property(asset_id)
-    if not prop or not prop.get("id"):
-        return False
-    hv_put(f"asset/customAssetProperties/{prop['id']}", {
-        "id": prop["id"],
-        "customAssetPropertyKeyId": prop["customAssetPropertyKeyId"],
-        "value": datetime.now(timezone.utc).isoformat(),
-        "dataType": prop.get("dataType", "dateTime"),
-    })
-    return True
+def set_audit_date_now(asset_id, audited_by=None):
+    """Stamps this asset's 'Last Audit Date' custom property to now, and -
+    only when audited_by is given - its 'Last Audited By' custom property
+    to whoever completed the audit. audited_by is deliberately optional
+    and omitted by find_next_rack_to_audit's automated empty-rack skip:
+    that path stamps a date so the rack drops off the overdue list, but
+    no human actually audited it, so it must never claim one did.
+
+    The two properties are written independently - an asset missing one
+    of them (not configured for its asset type) still gets the other
+    written, rather than an all-or-nothing failure. Returns True if at
+    least one property was actually written, False if neither exists on
+    this asset."""
+    wrote_something = False
+
+    date_prop = get_audit_date_property(asset_id)
+    if date_prop and date_prop.get("id"):
+        hv_put(f"asset/customAssetProperties/{date_prop['id']}", {
+            "id": date_prop["id"],
+            "customAssetPropertyKeyId": date_prop["customAssetPropertyKeyId"],
+            "value": datetime.now(timezone.utc).isoformat(),
+            "dataType": date_prop.get("dataType", "dateTime"),
+        })
+        wrote_something = True
+
+    if audited_by:
+        by_prop = get_audit_by_property(asset_id)
+        if by_prop and by_prop.get("id"):
+            hv_put(f"asset/customAssetProperties/{by_prop['id']}", {
+                "id": by_prop["id"],
+                "customAssetPropertyKeyId": by_prop["customAssetPropertyKeyId"],
+                "value": audited_by,
+                "dataType": by_prop.get("dataType", "text"),
+            })
+            wrote_something = True
+
+    return wrote_something
 
 
 def get_rack_audit_cache():
@@ -599,16 +634,18 @@ def get_rack_audit_cache():
         rack_id = rack.get("id")
         if not rack_id:
             continue
+        # One customAssetProperties call per rack instead of two (was:
+        # get_audit_date_property + get_audit_frequency_property, each
+        # separately re-fetching and re-scanning the exact same list) -
+        # halves the API calls this cache rebuild makes across every rack
+        # in the tenant.
         try:
-            audit_prop = get_audit_date_property(rack_id)
+            props = _unwrap_list(hv_get(f"asset/customAssetProperties/{rack_id}"))
         except requests.exceptions.RequestException:
             logger.exception("rack audit: could not read custom properties for rack %s", rack_id)
-            audit_prop = None
-        try:
-            frequency_prop = get_audit_frequency_property(rack_id)
-        except requests.exceptions.RequestException:
-            logger.exception("rack audit: could not read audit frequency for rack %s", rack_id)
-            frequency_prop = None
+            props = []
+        audit_prop = next((p for p in props if p.get("name") == RACK_AUDIT_DATE_FIELD_NAME), None)
+        frequency_prop = next((p for p in props if p.get("name") == RACK_AUDIT_FREQUENCY_FIELD_NAME), None)
         last_audit = audit_prop["value"] if audit_prop else None
         audit_frequency = frequency_prop["value"] if frequency_prop else None
         entries.append({
@@ -658,6 +695,30 @@ def get_device_power_sources(asset_id):
     return out
 
 
+def get_asset_serial(asset_id):
+    """An asset's serial number, from its own assetProperties record -
+    the general asset directory's serialNumber field (see
+    get_rack_contained_assets' fallback) is empty for some asset types,
+    but the dedicated property is populated more reliably. Cached per
+    asset (serial_cache, cleared alongside asset_cache) since a rack
+    audit sheet would otherwise cost one extra live API call per mounted
+    device on every single render."""
+    if asset_id in serial_cache:
+        return serial_cache[asset_id]
+    try:
+        props = _unwrap_list(hv_get(f"asset/assetProperties/{asset_id}"))
+    except requests.exceptions.RequestException:
+        logger.exception("rack audit: could not read asset properties for asset %s", asset_id)
+        return ""
+    serial = ""
+    for p in props:
+        if p.get("type") == "serialNumber":
+            serial = p.get("value") or ""
+            break
+    serial_cache[asset_id] = serial
+    return serial
+
+
 def get_rack_contained_assets(rack_id):
     """Elevation entries (U position, side, power source PDUs) for
     everything mounted in this rack. Deliberately NOT
@@ -675,13 +736,17 @@ def get_rack_contained_assets(rack_id):
         if loc.get("parentId") != rack_id:
             continue
         asset_id = asset.get("id")
+        # get_asset_serial's dedicated property lookup first - falls back
+        # to the general directory's own (less reliably populated) field
+        # rather than ever showing a blank serial when either source has it.
+        serial = (get_asset_serial(asset_id) if asset_id else "") or asset.get("serialNumber") or ""
         out.append({
             "id": asset_id,
             "name": asset.get("name") or "(unknown)",
             "type": asset.get("assetTypeId"),
             "manufacturer": asset.get("manufacturerName"),
             "model": asset.get("productName"),
-            "serial": asset.get("serialNumber"),
+            "serial": serial,
             "u_location": loc.get("rackULocation"),
             "side": loc.get("rackSide"),
             "power_sources": get_device_power_sources(asset_id) if asset_id else [],
@@ -701,15 +766,25 @@ def find_next_rack_to_audit(sites=None):
         racks = [r for r in racks if (r["site"] or "").strip().lower() in sites_ci]
     ordered = sorted(racks, key=lambda r: (r["last_audit"] is not None, r["last_audit"] or ""))
 
+    global rack_audit_cache
     for rack in ordered:
         contained = get_rack_contained_assets(rack["id"])
         if contained:
             return rack, contained
         try:
+            # No audited_by here - this is an automated skip, not a human
+            # completing an audit, so "Last Audited By" must stay untouched.
             set_audit_date_now(rack["id"])
         except requests.exceptions.RequestException:
             logger.exception("rack audit: failed to auto-stamp empty rack %s", rack["id"])
             continue
+        # Without this, get_rack_audit_cache's cached (pre-stamp) copy still
+        # shows this rack as never-audited/oldest for up to
+        # RACK_AUDIT_CACHE_SECONDS - a repeat call within that window would
+        # re-select and silently re-stamp the SAME already-stamped rack
+        # again, and the compliance overview would keep reporting it as
+        # overdue when Hyperview itself already says otherwise.
+        rack_audit_cache = None
     return None, None
 
 
@@ -1258,12 +1333,19 @@ def rack_audit_compliance_list():
 
 @app.route("/rack-audit/complete/<rack_id>", methods=["POST"])
 def rack_audit_complete(rack_id):
+    # Accept audited_by from a JSON body, a form post, or a query param -
+    # whichever InfraWatch (or anything else calling this) finds easiest to
+    # send. Optional: omitting it just skips the "Last Audited By" write,
+    # same as an asset with no such custom property configured.
+    body = request.get_json(silent=True) or {}
+    audited_by = (body.get("audited_by") or request.form.get("audited_by")
+                  or request.args.get("audited_by") or "").strip() or None
     try:
-        stamped = set_audit_date_now(rack_id)
+        stamped = set_audit_date_now(rack_id, audited_by=audited_by)
     except requests.exceptions.RequestException as e:
         return jsonify({"error": f"Could not reach Hyperview: {e}"}), 502
     if not stamped:
-        return jsonify({"error": "This asset has no 'Last Audit Date' custom property to update"}), 404
+        return jsonify({"error": "This asset has no 'Last Audit Date' or 'Last Audited By' custom property to update"}), 404
     global rack_audit_cache
     rack_audit_cache = None  # force a fresh fetch next time rather than serving a stale date
     return jsonify({"ok": True})
