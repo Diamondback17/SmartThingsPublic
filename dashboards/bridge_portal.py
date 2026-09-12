@@ -3508,30 +3508,30 @@ _RACK_AUDIT_ATTENTION_META = {
 
 
 def _rack_audit_attention_card_html(rack):
+    """A full-width row rather than a grid card - a real Hyperview path
+    ("Hospitals > Fort Sanders Regional Medical Center > Basement > Data
+    Center") runs far too long to fit a narrow card without truncating to
+    the point of being unreadable. A row gives the path its own line with
+    room to wrap, while the rack name (the thing an auditor is actually
+    scanning for) stays the most prominent text."""
     compliance = rack.get("compliance") or {}
     status = compliance.get("status")
     css_class, icon, label = _RACK_AUDIT_ATTENTION_META.get(status, ("sev-due-soon", "⚠", "Needs attention"))
     if label is None:
         days = compliance.get("days_overdue")
         label = f"Overdue {days}d" if days is not None else "Overdue"
-    # The rack's own name already appears below in full - showing it again
-    # as the tail of site_path (e.g. "Site A > Room 1 > MDF > R1-L4") was
-    # both redundant and, on a narrow card, the reason the whole line ran
-    # off the edge. Parent location (one level up) is both shorter and
-    # more useful context. Full path still available on hover via title=.
-    full_path = rack.get("site_path") or rack.get("site") or "Unknown"
-    site = _esc(_rack_audit_parent_location(rack))
+    path = _esc(_rack_audit_parent_location(rack))
     name = _esc(rack.get("name") or rack.get("id"))
     meta = _rack_audit_last_audit_html(rack.get("last_audit"))
     return f"""
-        <div class="ra-attention-card {css_class}" data-status="{_esc(status or "")}">
-          <div class="ra-attention-top">
-            <span class="ra-attention-icon">{icon}</span>
-            <span class="ra-attention-badge">{_esc(label)}</span>
+        <div class="ra-attention-row {css_class}" data-status="{_esc(status or "")}">
+          <span class="ra-attention-icon">{icon}</span>
+          <div class="ra-attention-body">
+            <div class="ra-attention-name">{name}</div>
+            <div class="ra-attention-path">{path}</div>
           </div>
-          <div class="ra-attention-site" title="{_esc(full_path)}">{site}</div>
-          <div class="ra-attention-name">{name}</div>
-          <div class="ra-attention-meta">{meta}</div>
+          <div class="ra-attention-when">{meta}</div>
+          <span class="ra-attention-badge">{_esc(label)}</span>
         </div>"""
 
 
@@ -7058,11 +7058,11 @@ def rack_audit_page(username):
                 group = [r for r in needing_attention if (r.get("compliance") or {}).get("status") == status]
                 if not group:
                     continue
-                cards = "".join(_rack_audit_attention_card_html(r) for r in group)
+                rows = "".join(_rack_audit_attention_card_html(r) for r in group)
                 sections.append(f"""
                 <div class="ra-attention-group" data-group="{status}">
                   <div class="ra-attention-group-head">{heading} <span class="count-note">({len(group)})</span></div>
-                  <div class="ra-attention-grid">{cards}</div>
+                  <div class="ra-attention-list">{rows}</div>
                 </div>""")
             needs_attention_html = "".join(sections)
 
@@ -7154,22 +7154,22 @@ def rack_audit_page(username):
       .ra-attention-group + .ra-attention-group {{ margin-top: 18px; }}
       .ra-attention-group-head {{ font-size: 13px; font-weight: 700; color: var(--text-dim);
         text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 10px; }}
-      .ra-attention-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 10px; }}
-      .ra-attention-card {{ background: var(--panel-raised); border: 1px solid var(--border);
-        border-top: 3px solid var(--border-bright); border-radius: 10px; padding: 12px 14px 11px; }}
-      .ra-attention-card.sev-overdue, .ra-attention-card.sev-never {{ border-top-color: var(--danger); }}
-      .ra-attention-card.sev-due-soon {{ border-top-color: var(--warn); }}
-      .ra-attention-top {{ display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }}
-      .ra-attention-icon {{ font-size: 15px; line-height: 1; }}
+      .ra-attention-list {{ display: flex; flex-direction: column; gap: 6px; }}
+      .ra-attention-row {{ display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+        background: var(--panel-raised); border: 1px solid var(--border); border-left: 4px solid var(--border-bright);
+        border-radius: 8px; padding: 10px 16px; }}
+      .ra-attention-row.sev-overdue, .ra-attention-row.sev-never {{ border-left-color: var(--danger); }}
+      .ra-attention-row.sev-due-soon {{ border-left-color: var(--warn); }}
+      .ra-attention-icon {{ font-size: 16px; line-height: 1; flex-shrink: 0; }}
+      .ra-attention-body {{ flex: 1 1 260px; min-width: 0; }}
+      .ra-attention-name {{ font-size: 15px; font-weight: 700; color: var(--text); }}
+      .ra-attention-path {{ font-size: 12px; color: var(--text-faint); overflow-wrap: break-word; }}
+      .ra-attention-when {{ font-size: 12px; color: var(--text-dim); white-space: nowrap; flex-shrink: 0; }}
+      .ra-attention-when .overdue {{ color: var(--danger); font-weight: 700; }}
       .ra-attention-badge {{ font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
-        padding: 2px 8px; border-radius: 20px; color: #fff; background: var(--border-bright); white-space: nowrap; }}
-      .ra-attention-card.sev-overdue .ra-attention-badge, .ra-attention-card.sev-never .ra-attention-badge {{ background: var(--danger); }}
-      .ra-attention-card.sev-due-soon .ra-attention-badge {{ background: var(--warn); color: #1a1200; }}
-      .ra-attention-site {{ font-size: 10.5px; color: var(--text-faint); text-transform: uppercase;
-        letter-spacing: 0.03em; margin-bottom: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-      .ra-attention-name {{ font-size: 16px; font-weight: 700; color: var(--text); margin-bottom: 5px; }}
-      .ra-attention-meta {{ font-size: 12px; color: var(--text-dim); }}
-      .ra-attention-meta .overdue {{ color: var(--danger); font-weight: 700; }}
+        padding: 3px 10px; border-radius: 20px; color: #fff; background: var(--border-bright); white-space: nowrap; flex-shrink: 0; }}
+      .ra-attention-row.sev-overdue .ra-attention-badge, .ra-attention-row.sev-never .ra-attention-badge {{ background: var(--danger); }}
+      .ra-attention-row.sev-due-soon .ra-attention-badge {{ background: var(--warn); color: #1a1200; }}
 
       .ra-site-row {{ display: grid; grid-template-columns: 4fr 1fr auto; align-items: center;
         gap: 12px; padding: 6px 0; font-size: 13px; }}
@@ -7202,11 +7202,11 @@ def rack_audit_page(username):
         var panel = document.getElementById("ra-attention-panel");
         function applyFilter(status) {{
           tiles.forEach(function(t) {{ t.classList.toggle("active", t.dataset.filter === status); }});
-          document.querySelectorAll(".ra-attention-card").forEach(function(card) {{
-            card.hidden = !!status && card.dataset.status !== status;
+          document.querySelectorAll(".ra-attention-row").forEach(function(row) {{
+            row.hidden = !!status && row.dataset.status !== status;
           }});
           document.querySelectorAll(".ra-attention-group").forEach(function(group) {{
-            var visible = group.querySelectorAll(".ra-attention-card:not([hidden])").length > 0;
+            var visible = group.querySelectorAll(".ra-attention-row:not([hidden])").length > 0;
             group.hidden = !visible;
           }});
         }}
