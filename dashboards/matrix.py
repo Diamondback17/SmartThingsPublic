@@ -869,6 +869,41 @@ def prefetch_rack_contents(sites=None, count=None):
             warmed += 1
 
 
+RACK_AUDIT_WARM_INTERVAL_SECONDS = int(os.environ.get("RACK_AUDIT_WARM_INTERVAL_SECONDS", str(RACK_AUDIT_CACHE_SECONDS)))
+
+
+def _rack_audit_cache_warmer():
+    """Runs for the lifetime of the process (started as a daemon thread from
+    __main__, so it's live from the moment the service starts, restart
+    included) and keeps both rack-audit caches proactively warm rather
+    than waiting for a request to notice they're stale:
+
+    - get_rack_audit_cache() - every rack's compliance status, tenant-wide.
+    - prefetch_rack_contents(sites=None) - the top few most-overdue racks'
+      full contents (serials, power sources), for the "every site" catch-all
+      scope every 1st-shift/no-shift-group account uses.
+
+    A site-scoped account (2nd/3rd shift) still gets its own reactive
+    prefetch from the rack-audit page load / a real audit pick, same as
+    before this existed - this warmer just means the common case (an
+    account with no shift-specific group) never pays a cold rebuild at
+    all: it's always warm by the time anyone loads the page, restart or
+    not. One cycle runs immediately on startup, then every
+    RACK_AUDIT_WARM_INTERVAL_SECONDS (an hour by default, matching
+    RACK_AUDIT_CACHE_SECONDS). Broad exception handling is deliberate here:
+    this loop has to keep running indefinitely regardless of what a given
+    cycle hits (a Hyperview outage, an unexpected response shape, ...), or
+    the service would silently stop warming anything for the rest of its
+    life with nothing else to notice or restart it."""
+    while True:
+        try:
+            get_rack_audit_cache()
+            prefetch_rack_contents(sites=None)
+        except Exception:
+            logger.exception("rack audit: scheduled cache warm-up failed")
+        time.sleep(RACK_AUDIT_WARM_INTERVAL_SECONDS)
+
+
 def find_next_rack_to_audit(sites=None):
     """Walks racks most-overdue-first (never-audited racks sort first, then
     oldest audit date first), silently stamping any EMPTY rack's audit date
@@ -1568,6 +1603,11 @@ _require_config()
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     logger.info("Hyperview Matrix Service starting on port 5001 (cache=%ss)", CACHE_SECONDS)
+    # Keeps the rack-audit caches warm from the moment the service comes up
+    # (this restart included) and every RACK_AUDIT_WARM_INTERVAL_SECONDS
+    # after that, rather than leaving the first request after a cold start
+    # (or after an hour of no traffic) to pay for the rebuild itself.
+    threading.Thread(target=_rack_audit_cache_warmer, daemon=True).start()
     # Flask's built-in app.run() is a dev server -- not meant for sustained
     # production load. Serve with waitress instead (pip install waitress).
     # All the in-memory caches assume a single process, so keep this to one
