@@ -3495,6 +3495,40 @@ def _rack_audit_compliance_sort_key(rack):
     return (severity, -days_overdue, (rack.get("site") or ""), (rack.get("name") or ""))
 
 
+# (css class, icon, badge label or None to derive one from days_overdue) per
+# Needs Attention status - the Rack Audit overview's card grid keyed off
+# this instead of the plain table _rack_audit_compliance_badge_html was
+# built for (that one's still used elsewhere, e.g. the admin compliance
+# table, where a dense table is the right call).
+_RACK_AUDIT_ATTENTION_META = {
+    "overdue": ("sev-overdue", "⚠", None),
+    "never_audited": ("sev-never", "❓", "Never audited"),
+    "due_soon": ("sev-due-soon", "⏰", "Due soon"),
+}
+
+
+def _rack_audit_attention_card_html(rack):
+    compliance = rack.get("compliance") or {}
+    status = compliance.get("status")
+    css_class, icon, label = _RACK_AUDIT_ATTENTION_META.get(status, ("sev-due-soon", "⚠", "Needs attention"))
+    if label is None:
+        days = compliance.get("days_overdue")
+        label = f"Overdue {days}d" if days is not None else "Overdue"
+    site = _esc(rack.get("site_path") or rack.get("site") or "Unknown")
+    name = _esc(rack.get("name") or rack.get("id"))
+    meta = _rack_audit_last_audit_html(rack.get("last_audit"))
+    return f"""
+        <div class="ra-attention-card {css_class}" data-status="{_esc(status or "")}">
+          <div class="ra-attention-top">
+            <span class="ra-attention-icon">{icon}</span>
+            <span class="ra-attention-badge">{_esc(label)}</span>
+          </div>
+          <div class="ra-attention-site">{site}</div>
+          <div class="ra-attention-name">{name}</div>
+          <div class="ra-attention-meta">{meta}</div>
+        </div>"""
+
+
 def _rack_audit_prefetch(sites):
     """Fire-and-forget: tells matrix.py to start warming its rack-contents
     cache for the next few candidate racks in the background, and returns
@@ -6977,6 +7011,7 @@ def rack_audit_page(username):
     )
 
     racks, error = _rack_audit_scope_racks(sites)
+    top_sites_html = ""
     if error:
         needs_attention_html = f'<div class="msg err">{_esc(error)}</div>'
         counts = {}
@@ -6992,19 +7027,47 @@ def rack_audit_page(username):
         if not needing_attention:
             needs_attention_html = '<p class="empty">Every rack in your scope is current on its audit schedule.</p>'
         else:
-            rows = "".join(
-                f"""<tr>
-                  <td>{_esc(r.get("site_path") or r.get("site") or "Unknown")}</td>
-                  <td>{_esc(r.get("name") or r.get("id"))}</td>
-                  <td>{_rack_audit_last_audit_html(r.get("last_audit"))}</td>
-                  <td>{_rack_audit_compliance_badge_html(r.get("compliance"))}</td>
-                </tr>"""
-                for r in needing_attention
-            )
-            needs_attention_html = (
-                '<div class="table-scroll"><table><tr><th>Site</th><th>Rack</th>'
-                f'<th>Last Audited</th><th>Compliance</th></tr>{rows}</table></div>'
-            )
+            # Grouped by severity (worst first) rather than one flat list -
+            # an auditor scanning this wants to know "how many are actually
+            # overdue" at a glance, not just a long undifferentiated table.
+            sections = []
+            for status, heading in (
+                ("overdue", "Overdue"), ("never_audited", "Never Audited"), ("due_soon", "Due Soon"),
+            ):
+                group = [r for r in needing_attention if (r.get("compliance") or {}).get("status") == status]
+                if not group:
+                    continue
+                cards = "".join(_rack_audit_attention_card_html(r) for r in group)
+                sections.append(f"""
+                <div class="ra-attention-group" data-group="{status}">
+                  <div class="ra-attention-group-head">{heading} <span class="count-note">({len(group)})</span></div>
+                  <div class="ra-attention-grid">{cards}</div>
+                </div>""")
+            needs_attention_html = "".join(sections)
+
+            # Which sites actually need a visit, ranked - the auditor's real
+            # question is usually "where do I go first," not just "how many
+            # racks total." Top 8 keeps this a quick scan, not another table.
+            site_counts = {}
+            for r in needing_attention:
+                site = r.get("site_path") or r.get("site") or "Unknown"
+                site_counts[site] = site_counts.get(site, 0) + 1
+            top_sites = sorted(site_counts.items(), key=lambda kv: -kv[1])[:8]
+            if len(top_sites) > 1:
+                max_count = top_sites[0][1]
+                bars = "".join(
+                    f"""<div class="ra-site-row">
+                      <div class="ra-site-name">{_esc(site)}</div>
+                      <div class="ra-site-bar-track"><div class="ra-site-bar" style="width:{max(8, round(count / max_count * 100))}%;"></div></div>
+                      <div class="ra-site-count">{count}</div>
+                    </div>"""
+                    for site, count in top_sites
+                )
+                top_sites_html = f"""
+                <div class="panel">
+                  <div class="panel-head"><h2>Where To Go First</h2><span class="count-note">sites with the most racks needing attention</span></div>
+                  <div style="padding:14px 18px;">{bars}</div>
+                </div>"""
 
     # counts.values() only ever holds the statuses actually seen above
     # (never_audited/overdue/due_soon/current/unknown), so summing it - not
@@ -7012,11 +7075,18 @@ def rack_audit_page(username):
     # the per-status tiles below, including "Unknown" ones a rack falls
     # into when it has no Audit Frequency set.
     total_racks = sum(counts.values())
+    # never_audited/overdue/due_soon tiles double as filter buttons for the
+    # card grid below (click to isolate one severity, click again to clear)
+    # - Total Racks/Current/No Frequency Set aren't statuses that appear in
+    # that grid at all, so they stay plain, non-clickable tiles.
+    filterable_statuses = {"never_audited", "overdue", "due_soon"}
     stat_row = (
         f'<div class="stat-tile"><div class="stat-num">{total_racks}</div><div class="stat-lbl">Total Racks</div></div>'
         + "".join(
-            f'<div class="stat-tile{" unhealthy" if key in ("overdue", "never_audited") else ""}">'
-            f'<div class="stat-num">{counts.get(key, 0)}</div><div class="stat-lbl">{label}</div></div>'
+            f'<div class="stat-tile{" unhealthy" if key in ("overdue", "never_audited") else ""}'
+            f'{" ra-filter-tile" if key in filterable_statuses else ""}"'
+            + (f' data-filter="{key}" role="button" tabindex="0"' if key in filterable_statuses else "")
+            + f'><div class="stat-num">{counts.get(key, 0)}</div><div class="stat-lbl">{label}</div></div>'
             for key, label in (
                 ("never_audited", "Never Audited"), ("overdue", "Overdue"),
                 ("due_soon", "Due Soon"), ("current", "Current"),
@@ -7041,6 +7111,37 @@ def rack_audit_page(username):
       details.panel > summary.panel-head::before {{ content: "\\25B8"; display: inline-block;
         margin-right: 8px; transition: transform 0.15s ease; color: var(--text-faint); }}
       details.panel[open] > summary.panel-head::before {{ transform: rotate(90deg); }}
+
+      .ra-filter-tile {{ cursor: pointer; transition: box-shadow 0.15s ease, transform 0.1s ease; }}
+      .ra-filter-tile:hover {{ box-shadow: 0 0 0 2px var(--border-bright) inset; }}
+      .ra-filter-tile.active {{ box-shadow: 0 0 0 2px var(--teal) inset; }}
+
+      .ra-attention-group + .ra-attention-group {{ margin-top: 18px; }}
+      .ra-attention-group-head {{ font-size: 13px; font-weight: 700; color: var(--text-dim);
+        text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 10px; }}
+      .ra-attention-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 10px; }}
+      .ra-attention-card {{ background: var(--panel-raised); border: 1px solid var(--border);
+        border-top: 3px solid var(--border-bright); border-radius: 10px; padding: 12px 14px 11px; }}
+      .ra-attention-card.sev-overdue, .ra-attention-card.sev-never {{ border-top-color: var(--danger); }}
+      .ra-attention-card.sev-due-soon {{ border-top-color: var(--warn); }}
+      .ra-attention-top {{ display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }}
+      .ra-attention-icon {{ font-size: 15px; line-height: 1; }}
+      .ra-attention-badge {{ font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+        padding: 2px 8px; border-radius: 20px; color: #fff; background: var(--border-bright); white-space: nowrap; }}
+      .ra-attention-card.sev-overdue .ra-attention-badge, .ra-attention-card.sev-never .ra-attention-badge {{ background: var(--danger); }}
+      .ra-attention-card.sev-due-soon .ra-attention-badge {{ background: var(--warn); color: #1a1200; }}
+      .ra-attention-site {{ font-size: 10.5px; color: var(--text-faint); text-transform: uppercase;
+        letter-spacing: 0.03em; margin-bottom: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+      .ra-attention-name {{ font-size: 16px; font-weight: 700; color: var(--text); margin-bottom: 5px; }}
+      .ra-attention-meta {{ font-size: 12px; color: var(--text-dim); }}
+      .ra-attention-meta .overdue {{ color: var(--danger); font-weight: 700; }}
+
+      .ra-site-row {{ display: grid; grid-template-columns: minmax(120px, 220px) 1fr auto; align-items: center;
+        gap: 12px; padding: 6px 0; font-size: 13px; }}
+      .ra-site-name {{ color: var(--text); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+      .ra-site-bar-track {{ background: var(--panel-raised); border: 1px solid var(--border); border-radius: 20px; height: 10px; overflow: hidden; }}
+      .ra-site-bar {{ background: var(--teal); height: 100%; border-radius: 20px; }}
+      .ra-site-count {{ color: var(--text-dim); font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; min-width: 18px; }}
     </style>
     {_msg_html()}
     <div class="panel">
@@ -7052,10 +7153,37 @@ def rack_audit_page(username):
         <button class="btn" style="background:var(--teal); color:#fff; border:none; padding:11px 22px; border-radius:8px; font-weight:700; cursor:pointer;" type="submit">Start Next Audit &rarr;</button>
       </form>
     </div>
-    <details class="panel">
-      <summary class="panel-head"><h2 style="display:inline;">Needs Attention</h2><span class="count-note">racks due soon or overdue in your scope</span></summary>
-      <div style="padding:12px 16px;">{needs_attention_html}</div>
+    {top_sites_html}
+    <details class="panel" id="ra-attention-panel">
+      <summary class="panel-head"><h2 style="display:inline;">Needs Attention</h2><span class="count-note">racks due soon or overdue in your scope &mdash; click a stat above to filter</span></summary>
+      <div id="ra-attention-body" style="padding:12px 16px;">{needs_attention_html}</div>
     </details>
+    <script>
+      (function() {{
+        var tiles = document.querySelectorAll(".ra-filter-tile");
+        var panel = document.getElementById("ra-attention-panel");
+        function applyFilter(status) {{
+          tiles.forEach(function(t) {{ t.classList.toggle("active", t.dataset.filter === status); }});
+          document.querySelectorAll(".ra-attention-card").forEach(function(card) {{
+            card.hidden = !!status && card.dataset.status !== status;
+          }});
+          document.querySelectorAll(".ra-attention-group").forEach(function(group) {{
+            var visible = group.querySelectorAll(".ra-attention-card:not([hidden])").length > 0;
+            group.hidden = !visible;
+          }});
+        }}
+        tiles.forEach(function(tile) {{
+          tile.addEventListener("click", function() {{
+            if (panel) panel.open = true;
+            var next = tile.classList.contains("active") ? "" : tile.dataset.filter;
+            applyFilter(next);
+          }});
+          tile.addEventListener("keydown", function(e) {{
+            if (e.key === "Enter" || e.key === " ") {{ e.preventDefault(); tile.click(); }}
+          }});
+        }});
+      }})();
+    </script>
     """
     return Response(render_shell("Rack Audit", body, "rack-audit", username), mimetype="text/html")
 
