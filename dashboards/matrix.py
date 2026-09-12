@@ -491,6 +491,15 @@ rack_contents_cache = {}
 RACK_CONTENTS_CACHE_SECONDS = int(os.environ.get("RACK_CONTENTS_CACHE_SECONDS", "600"))
 RACK_AUDIT_PREFETCH_COUNT = int(os.environ.get("RACK_AUDIT_PREFETCH_COUNT", "3"))
 
+# customAssetPropertyKeyId for "Last Audit Date"/"Audit Frequency" - the
+# property *definitions*, not any asset's value, so these barely ever
+# change and are cached for a full day. Needed for the bulk children
+# lookup in get_rack_audit_cache() below, which addresses a property by
+# key id rather than by name.
+_custom_property_key_id_cache = {}
+_custom_property_key_id_cache_time = 0
+CUSTOM_PROPERTY_KEY_ID_CACHE_SECONDS = int(os.environ.get("CUSTOM_PROPERTY_KEY_ID_CACHE_SECONDS", "86400"))
+
 
 def _unwrap_list(resp):
     """This tenant's list endpoints wrap results as {"data": [...],
@@ -591,17 +600,23 @@ def set_audit_date_now(asset_id, audited_by=None):
 
     The two properties are written independently - an asset missing one
     of them (not configured for its asset type) still gets the other
-    written, rather than an all-or-nothing failure. Returns True if at
-    least one property was actually written, False if neither exists on
-    this asset."""
+    written, rather than an all-or-nothing failure. Returns
+    (wrote_something, stamped_at) - wrote_something is True if at least
+    one property was actually written; stamped_at is the ISO timestamp
+    used for 'Last Audit Date' specifically (None if that property wasn't
+    written), so a caller can patch its own in-memory rack_audit_cache
+    with the exact value Hyperview now holds instead of invalidating the
+    whole cache and paying for a full rebuild next time."""
     wrote_something = False
+    stamped_at = None
 
     date_prop = get_audit_date_property(asset_id)
     if date_prop and date_prop.get("id"):
+        stamped_at = datetime.now(timezone.utc).isoformat()
         hv_put(f"asset/customAssetProperties/{date_prop['id']}", {
             "id": date_prop["id"],
             "customAssetPropertyKeyId": date_prop["customAssetPropertyKeyId"],
-            "value": datetime.now(timezone.utc).isoformat(),
+            "value": stamped_at,
             "dataType": date_prop.get("dataType", "dateTime"),
         })
         wrote_something = True
@@ -617,7 +632,26 @@ def set_audit_date_now(asset_id, audited_by=None):
             })
             wrote_something = True
 
-    return wrote_something
+    return wrote_something, stamped_at
+
+
+def _patch_rack_audit_cache_last_audit(rack_id, last_audit_iso):
+    """Updates one rack's 'last_audit' (and recomputed compliance) in the
+    already-built rack_audit_cache in place, instead of invalidating the
+    whole thing and paying for a full rebuild the next time anyone asks
+    for it. Safe because this app is the only writer of 'Last Audit Date'
+    on the paths that call this - the hourly background warmer (see
+    _rack_audit_cache_warmer) is what reconciles an out-of-band edit made
+    directly in Hyperview instead of through here. A no-op if the cache
+    hasn't been built yet or doesn't have this rack; the next real fetch
+    picks up the correct value regardless."""
+    if not rack_audit_cache:
+        return
+    for entry in rack_audit_cache:
+        if entry.get("id") == rack_id:
+            entry["last_audit"] = last_audit_iso
+            entry["compliance"] = rack_audit_compliance(last_audit_iso, entry.get("audit_frequency"))
+            return
 
 
 RACK_AUDIT_CACHE_WORKERS = int(os.environ.get("RACK_AUDIT_CACHE_WORKERS", "12"))
@@ -625,14 +659,16 @@ _rack_audit_cache_lock = threading.Lock()
 
 
 def _fetch_rack_audit_entry(rack):
+    """Per-rack fallback: one customAssetProperties call for this rack
+    alone. get_rack_audit_cache() below only reaches for this when the
+    bulk per-parent lookup didn't cover a given rack (the bulk call
+    failed, or this rack wasn't in its response for some other reason) -
+    otherwise it's a two-birds-one-call read (Last Audit Date and Audit
+    Frequency both come back from the same customAssetProperties list)
+    for whichever racks still need it."""
     rack_id = rack.get("id")
     if not rack_id:
         return None
-    # One customAssetProperties call per rack instead of two (was:
-    # get_audit_date_property + get_audit_frequency_property, each
-    # separately re-fetching and re-scanning the exact same list) -
-    # halves the API calls this cache rebuild makes across every rack
-    # in the tenant.
     try:
         props = _unwrap_list(hv_get(f"asset/customAssetProperties/{rack_id}"))
     except requests.exceptions.RequestException:
@@ -658,18 +694,125 @@ def _fetch_rack_audit_entry(rack):
     }
 
 
+def _custom_property_key_ids():
+    """(date_key_id, frequency_key_id) - the customAssetPropertyKeyId GUIDs
+    behind "Last Audit Date" and "Audit Frequency", resolved from the
+    tenant's custom property *definitions* (setting/customPropertySetting)
+    rather than any asset's value. These almost never change, so the
+    lookup is cached for CUSTOM_PROPERTY_KEY_ID_CACHE_SECONDS (a day by
+    default) instead of being re-fetched on every rack-audit-cache
+    rebuild. Needed by the bulk children/customPropertyValue lookup
+    below, which addresses a property by key id rather than by name.
+    Returns (None, None) if the lookup itself fails - callers fall back
+    to the per-rack path in that case."""
+    global _custom_property_key_id_cache, _custom_property_key_id_cache_time
+    if (not _custom_property_key_id_cache
+            or time.time() - _custom_property_key_id_cache_time >= CUSTOM_PROPERTY_KEY_ID_CACHE_SECONDS):
+        try:
+            settings = _unwrap_list(hv_get("setting/customPropertySetting"))
+        except requests.exceptions.RequestException:
+            logger.exception("rack audit: could not resolve custom property key ids")
+            return (
+                _custom_property_key_id_cache.get(RACK_AUDIT_DATE_FIELD_NAME),
+                _custom_property_key_id_cache.get(RACK_AUDIT_FREQUENCY_FIELD_NAME),
+            )
+        _custom_property_key_id_cache = {s.get("name"): s.get("id") for s in settings if s.get("name")}
+        _custom_property_key_id_cache_time = time.time()
+    return (
+        _custom_property_key_id_cache.get(RACK_AUDIT_DATE_FIELD_NAME),
+        _custom_property_key_id_cache.get(RACK_AUDIT_FREQUENCY_FIELD_NAME),
+    )
+
+
+def _fetch_children_property_values(parent_id, key_id):
+    """assetId -> value for one custom property key, across every direct
+    child of parent_id (asset/customAssetProperties/{id}/children/
+    customPropertyValue) - one API call covering every rack in that room/
+    row instead of one call per rack. Racks generally cluster many-to-a-
+    room, so grouping by parent and using this instead of per-rack calls
+    is the difference between ~180 API calls and however many distinct
+    rooms/rows actually hold racks in this tenant. Returns {} (never
+    raises) on any failure, so the caller falls back to per-rack lookups
+    for just that group rather than losing the whole cache rebuild."""
+    if not key_id:
+        return {}
+    try:
+        entries = _unwrap_list(hv_get(
+            f"asset/customAssetProperties/{parent_id}/children/customPropertyValue"
+            f"?customAssetPropertyKeyId={key_id}"
+        ))
+    except requests.exceptions.RequestException:
+        logger.exception("rack audit: bulk children property lookup failed for parent %s", parent_id)
+        return {}
+    return {e["assetId"]: e.get("value") for e in entries if e.get("assetId")}
+
+
+def _fetch_racks_parallel(racks):
+    """_fetch_rack_audit_entry for each of these racks, through a thread
+    pool rather than one after another - used wherever the bulk children
+    lookup can't be used at all (no resolvable parent/key ids) or didn't
+    cover every rack in a group, so falling back never means falling all
+    the way back to fully sequential per-rack calls."""
+    racks = [r for r in racks if r.get("id")]
+    if not racks:
+        return []
+    if len(racks) == 1:
+        entry = _fetch_rack_audit_entry(racks[0])
+        return [entry] if entry else []
+    with ThreadPoolExecutor(max_workers=min(RACK_AUDIT_CACHE_WORKERS, len(racks))) as pool:
+        return [e for e in pool.map(_fetch_rack_audit_entry, racks) if e is not None]
+
+
+def _fetch_rack_group_entries(item, date_key_id, freq_key_id):
+    """Builds rack-audit entries for every rack sharing one immediate
+    parent (room/row), using the bulk children lookup above for both
+    properties in two calls total - then falls back to the reliable
+    per-rack path (_fetch_rack_audit_entry, still parallelized) only for a
+    rack that call didn't cover, whether because the bulk call itself
+    failed or this rack just wasn't in its response."""
+    parent_id, group_racks = item
+    if not parent_id or not (date_key_id or freq_key_id):
+        return _fetch_racks_parallel(group_racks)
+
+    date_values = _fetch_children_property_values(parent_id, date_key_id) if date_key_id else {}
+    freq_values = _fetch_children_property_values(parent_id, freq_key_id) if freq_key_id else {}
+
+    uncovered = [r for r in group_racks if r.get("id") not in date_values and r.get("id") not in freq_values]
+    uncovered_ids = {r["id"] for r in uncovered}
+    out = _fetch_racks_parallel(uncovered)
+    for rack in group_racks:
+        rack_id = rack.get("id")
+        if not rack_id or rack_id in uncovered_ids:
+            continue
+        last_audit = date_values.get(rack_id)
+        audit_frequency = freq_values.get(rack_id)
+        out.append({
+            "id": rack_id,
+            "name": rack.get("name"),
+            "site": _rack_site_name(rack),
+            "site_path": _rack_site_path(rack),
+            "last_audit": last_audit,
+            "audit_frequency": audit_frequency,
+            "compliance": rack_audit_compliance(last_audit, audit_frequency),
+            "total_u": (rack.get("dimension") or {}).get("providedRackUnits"),
+        })
+    return out
+
+
 def get_rack_audit_cache():
     """Every rack asset with its 'Last Audit Date' custom property value,
     rebuilt at most once every RACK_AUDIT_CACHE_SECONDS - avoids re-fetching
-    every single rack's custom properties (one call each) on every
-    /rack-audit/next request.
+    every single rack's custom properties on every /rack-audit/next request.
 
-    That per-rack fetch is done through a thread pool (RACK_AUDIT_CACHE_WORKERS)
-    rather than one rack after another - with ~180 racks in this tenant, doing
-    it sequentially took well over a minute and blew past the caller's
-    request timeout (bridge_portal would report "Could not reach Hyperview" /
-    a read timeout even though Hyperview itself was fine, just slow to walk
-    one rack at a time)."""
+    Racks are grouped by their immediate parent (room/row) and fetched via
+    the bulk children/customPropertyValue lookup, two calls per group
+    instead of one call per rack - with ~180 racks in this tenant clustered
+    across a much smaller number of rooms, that's the difference between a
+    rebuild that blows past the caller's request timeout ("Could not reach
+    Hyperview" even though Hyperview itself was fine, just slow to walk one
+    rack at a time) and one that finishes in a handful of calls. Each group
+    is still processed through a thread pool (RACK_AUDIT_CACHE_WORKERS) for
+    the same reason - no need to wait on one room before starting the next."""
     global rack_audit_cache, rack_audit_cache_time
     if rack_audit_cache is not None and time.time() - rack_audit_cache_time < RACK_AUDIT_CACHE_SECONDS:
         return rack_audit_cache
@@ -677,7 +820,7 @@ def get_rack_audit_cache():
     # A lock, not just the time-check above, so concurrent cold-cache
     # requests (e.g. the compliance page and a Start Next Audit click
     # landing at the same moment) don't each independently pay the full
-    # ~180-rack walk - the second one in just waits for the first's result.
+    # rebuild - the second one in just waits for the first's result.
     with _rack_audit_cache_lock:
         if rack_audit_cache is not None and time.time() - rack_audit_cache_time < RACK_AUDIT_CACHE_SECONDS:
             return rack_audit_cache
@@ -695,11 +838,19 @@ def get_rack_audit_cache():
             if (total is not None and offset >= total) or (total is None and len(page_racks) < 100):
                 break
 
-        if racks:
-            with ThreadPoolExecutor(max_workers=min(RACK_AUDIT_CACHE_WORKERS, len(racks))) as pool:
-                entries = [e for e in pool.map(_fetch_rack_audit_entry, racks) if e is not None]
-        else:
+        if not racks:
             entries = []
+        else:
+            date_key_id, freq_key_id = _custom_property_key_ids()
+            groups = {}
+            for rack in racks:
+                groups.setdefault(rack.get("parentId"), []).append(rack)
+
+            def _fetch_group(item):
+                return _fetch_rack_group_entries(item, date_key_id, freq_key_id)
+
+            with ThreadPoolExecutor(max_workers=min(RACK_AUDIT_CACHE_WORKERS, len(groups))) as pool:
+                entries = [e for chunk in pool.map(_fetch_group, groups.items()) for e in chunk]
 
         rack_audit_cache = entries
         rack_audit_cache_time = time.time()
@@ -912,7 +1063,6 @@ def find_next_rack_to_audit(sites=None):
     sites=None (or empty) means every site is eligible."""
     ordered = _ordered_audit_racks(sites)
 
-    global rack_audit_cache
     for rack in ordered:
         contained = get_rack_contained_assets(rack["id"])
         if contained:
@@ -920,7 +1070,7 @@ def find_next_rack_to_audit(sites=None):
         try:
             # No audited_by here - this is an automated skip, not a human
             # completing an audit, so "Last Audited By" must stay untouched.
-            set_audit_date_now(rack["id"])
+            _wrote, stamped_at = set_audit_date_now(rack["id"])
         except requests.exceptions.RequestException:
             logger.exception("rack audit: failed to auto-stamp empty rack %s", rack["id"])
             continue
@@ -929,8 +1079,12 @@ def find_next_rack_to_audit(sites=None):
         # RACK_AUDIT_CACHE_SECONDS - a repeat call within that window would
         # re-select and silently re-stamp the SAME already-stamped rack
         # again, and the compliance overview would keep reporting it as
-        # overdue when Hyperview itself already says otherwise.
-        rack_audit_cache = None
+        # overdue when Hyperview itself already says otherwise. Patched in
+        # place rather than invalidating the whole cache, since we know
+        # exactly what changed and a full rebuild is no longer a cheap
+        # thing to trigger on every skipped-empty-rack.
+        if stamped_at:
+            _patch_rack_audit_cache_last_audit(rack["id"], stamped_at)
     return None, None
 
 
@@ -1505,13 +1659,13 @@ def rack_audit_complete(rack_id):
     audited_by = (body.get("audited_by") or request.form.get("audited_by")
                   or request.args.get("audited_by") or "").strip() or None
     try:
-        stamped = set_audit_date_now(rack_id, audited_by=audited_by)
+        wrote_something, stamped_at = set_audit_date_now(rack_id, audited_by=audited_by)
     except requests.exceptions.RequestException as e:
         return jsonify({"error": f"Could not reach Hyperview: {e}"}), 502
-    if not stamped:
+    if not wrote_something:
         return jsonify({"error": "This asset has no 'Last Audit Date' or 'Last Audited By' custom property to update"}), 404
-    global rack_audit_cache
-    rack_audit_cache = None  # force a fresh fetch next time rather than serving a stale date
+    if stamped_at:
+        _patch_rack_audit_cache_last_audit(rack_id, stamped_at)
     return jsonify({"ok": True})
 
 
