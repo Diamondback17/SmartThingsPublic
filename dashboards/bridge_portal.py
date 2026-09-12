@@ -7068,32 +7068,37 @@ def rack_audit_page(username):
                 </details>""")
             needs_attention_html = "".join(sections)
 
-            # Which locations actually need a visit, ranked - the auditor's
-            # real question is usually "where do I go first," not just "how
-            # many racks total." site_path already runs all the way down to
-            # the rack itself (e.g. "...  MDF > R1-L4"), which is unique per
-            # rack and would only ever count 1 here - step back one level to
-            # the room/IDF/MDF that actually holds more than one rack. Top 8
-            # keeps this a quick scan, not another table.
-            site_counts = {}
+            # Which location to visit first - ranked by that location's own
+            # most urgent rack (earliest last_audit, never-audited racks
+            # first), not by how many racks it has. A room with a single
+            # rack overdue by a year outranks a room with three racks all
+            # merely due soon. needing_attention is already sorted
+            # most-urgent-first (_rack_audit_compliance_sort_key), so the
+            # first rack seen per location in that order is its most urgent
+            # one, and the order locations are first seen in is already the
+            # right ranking - no separate sort needed. Top 8 keeps this a
+            # quick scan, not another table.
+            location_top_rack = {}
+            location_counts = {}
             for r in needing_attention:
-                site = _rack_audit_parent_location(r)
-                site_counts[site] = site_counts.get(site, 0) + 1
-            top_sites = sorted(site_counts.items(), key=lambda kv: -kv[1])[:8]
-            if len(top_sites) > 1:
-                max_count = top_sites[0][1]
-                bars = "".join(
+                loc = _rack_audit_parent_location(r)
+                location_counts[loc] = location_counts.get(loc, 0) + 1
+                if loc not in location_top_rack:
+                    location_top_rack[loc] = r
+            top_locations = list(location_top_rack.items())[:8]
+            if len(top_locations) > 1:
+                rows = "".join(
                     f"""<div class="ra-site-row">
-                      <div class="ra-site-name">{_esc(site)}</div>
-                      <div class="ra-site-bar-track"><div class="ra-site-bar" style="width:{max(8, round(count / max_count * 100))}%;"></div></div>
-                      <div class="ra-site-count">{count}</div>
+                      <div class="ra-site-name">{_esc(loc)}</div>
+                      <div class="ra-site-when">{_rack_audit_last_audit_html(rack.get("last_audit"))}</div>
+                      <div class="ra-site-count">{location_counts[loc]} rack{"s" if location_counts[loc] != 1 else ""}</div>
                     </div>"""
-                    for site, count in top_sites
+                    for loc, rack in top_locations
                 )
                 top_sites_html = f"""
                 <div class="panel">
-                  <div class="panel-head"><h2>Where To Go First</h2><span class="count-note">sites with the most racks needing attention</span></div>
-                  <div style="padding:14px 18px;">{bars}</div>
+                  <div class="panel-head"><h2>Where To Go First</h2><span class="count-note">ranked by each location's most overdue rack</span></div>
+                  <div style="padding:14px 18px;">{rows}</div>
                 </div>"""
 
     # counts.values() only ever holds the statuses actually seen above
@@ -7171,12 +7176,13 @@ def rack_audit_page(username):
       .ra-attention-row.sev-overdue .ra-attention-badge, .ra-attention-row.sev-never .ra-attention-badge {{ background: var(--danger); }}
       .ra-attention-row.sev-due-soon .ra-attention-badge {{ background: var(--warn); color: #1a1200; }}
 
-      .ra-site-row {{ display: grid; grid-template-columns: 4fr 1fr auto; align-items: center;
-        gap: 12px; padding: 6px 0; font-size: 13px; }}
+      .ra-site-row {{ display: grid; grid-template-columns: 4fr auto auto; align-items: baseline;
+        gap: 16px; padding: 7px 0; font-size: 13px; border-bottom: 1px solid var(--border); }}
+      .ra-site-row:last-child {{ border-bottom: none; }}
       .ra-site-name {{ color: var(--text); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-      .ra-site-bar-track {{ background: var(--panel-raised); border: 1px solid var(--border); border-radius: 20px; height: 10px; overflow: hidden; }}
-      .ra-site-bar {{ background: var(--teal); height: 100%; border-radius: 20px; }}
-      .ra-site-count {{ color: var(--text-dim); font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; min-width: 18px; }}
+      .ra-site-when {{ font-size: 12px; white-space: nowrap; }}
+      .ra-site-when .overdue {{ color: var(--danger); font-weight: 700; }}
+      .ra-site-count {{ color: var(--text-faint); font-size: 11.5px; white-space: nowrap; text-align: right; }}
     </style>
     {_msg_html()}
     <div class="panel">
