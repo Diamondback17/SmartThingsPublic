@@ -7146,7 +7146,7 @@ def rack_audit_page(username):
       .ra-attention-meta {{ font-size: 12px; color: var(--text-dim); }}
       .ra-attention-meta .overdue {{ color: var(--danger); font-weight: 700; }}
 
-      .ra-site-row {{ display: grid; grid-template-columns: minmax(120px, 220px) 1fr auto; align-items: center;
+      .ra-site-row {{ display: grid; grid-template-columns: 4fr 1fr auto; align-items: center;
         gap: 12px; padding: 6px 0; font-size: 13px; }}
       .ra-site-name {{ color: var(--text); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
       .ra-site-bar-track {{ background: var(--panel-raised); border: 1px solid var(--border); border-radius: 20px; height: 10px; overflow: hidden; }}
