@@ -7048,22 +7048,24 @@ def rack_audit_page(username):
         if not needing_attention:
             needs_attention_html = '<p class="empty">Every rack in your scope is current on its audit schedule.</p>'
         else:
-            # Grouped by severity (worst first) rather than one flat list -
-            # an auditor scanning this wants to know "how many are actually
-            # overdue" at a glance, not just a long undifferentiated table.
+            # Grouped by severity rather than one flat list - an auditor
+            # scanning this wants to know "how many are actually overdue" at
+            # a glance, not just a long undifferentiated table. Each group
+            # is its own collapsed-by-default <details> so opening the page
+            # doesn't dump every rack needing attention at once.
             sections = []
             for status, heading in (
-                ("overdue", "Overdue"), ("never_audited", "Never Audited"), ("due_soon", "Due Soon"),
+                ("never_audited", "Never Audited"), ("overdue", "Overdue"), ("due_soon", "Due Soon"),
             ):
                 group = [r for r in needing_attention if (r.get("compliance") or {}).get("status") == status]
                 if not group:
                     continue
                 rows = "".join(_rack_audit_attention_card_html(r) for r in group)
                 sections.append(f"""
-                <div class="ra-attention-group" data-group="{status}">
-                  <div class="ra-attention-group-head">{heading} <span class="count-note">({len(group)})</span></div>
+                <details class="ra-attention-group" data-group="{status}">
+                  <summary class="ra-attention-group-head">{heading} <span class="count-note">({len(group)})</span></summary>
                   <div class="ra-attention-list">{rows}</div>
-                </div>""")
+                </details>""")
             needs_attention_html = "".join(sections)
 
             # Which locations actually need a visit, ranked - the auditor's
@@ -7151,10 +7153,14 @@ def rack_audit_page(username):
       .ra-filter-tile:hover {{ box-shadow: 0 0 0 2px var(--border-bright) inset; }}
       .ra-filter-tile.active {{ box-shadow: 0 0 0 2px var(--teal) inset; }}
 
-      .ra-attention-group + .ra-attention-group {{ margin-top: 18px; }}
+      .ra-attention-group + .ra-attention-group {{ margin-top: 10px; }}
       .ra-attention-group-head {{ font-size: 13px; font-weight: 700; color: var(--text-dim);
-        text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 10px; }}
-      .ra-attention-list {{ display: flex; flex-direction: column; gap: 6px; }}
+        text-transform: uppercase; letter-spacing: 0.04em; cursor: pointer; list-style: none; padding: 4px 0; }}
+      .ra-attention-group-head::-webkit-details-marker {{ display: none; }}
+      .ra-attention-group-head::before {{ content: "\\25B8"; display: inline-block; width: 12px;
+        transition: transform 0.15s ease; color: var(--text-faint); }}
+      .ra-attention-group[open] > .ra-attention-group-head::before {{ transform: rotate(90deg); }}
+      .ra-attention-list {{ display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }}
       .ra-attention-row {{ display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
         background: var(--panel-raised); border: 1px solid var(--border); border-left: 4px solid var(--border-bright);
         border-radius: 8px; padding: 10px 16px; }}
@@ -7208,6 +7214,10 @@ def rack_audit_page(username):
           document.querySelectorAll(".ra-attention-group").forEach(function(group) {{
             var visible = group.querySelectorAll(".ra-attention-row:not([hidden])").length > 0;
             group.hidden = !visible;
+            // Groups start collapsed - filtering to a status needs to
+            // actually open that one group, since a collapsed <details>
+            // hides its rows regardless of their own [hidden] state.
+            group.open = !!status && group.dataset.group === status;
           }});
         }}
         tiles.forEach(function(tile) {{
