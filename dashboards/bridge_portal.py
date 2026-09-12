@@ -3529,6 +3529,21 @@ def _rack_audit_attention_card_html(rack):
         </div>"""
 
 
+def _rack_audit_parent_location(rack):
+    """One level up from the rack itself: site_path runs all the way down
+    to the rack's own name (e.g. "Site A > Room 1 > MDF > R1-L4"), which is
+    unique per rack - grouping by it directly (as the "Where To Go First"
+    panel used to) meant every rack was its own "site" with a count of
+    exactly 1. Stripping the last segment gives the room/IDF/MDF closet
+    that actually holds more than one rack, so multiple overdue racks in
+    the same location correctly roll up into one bar there."""
+    path = rack.get("site_path") or rack.get("site") or "Unknown"
+    parts = [p.strip() for p in path.split("›") if p.strip()]
+    if len(parts) > 1:
+        return " › ".join(parts[:-1])
+    return path
+
+
 def _rack_audit_prefetch(sites):
     """Fire-and-forget: tells matrix.py to start warming its rack-contents
     cache for the next few candidate racks in the background, and returns
@@ -7045,12 +7060,16 @@ def rack_audit_page(username):
                 </div>""")
             needs_attention_html = "".join(sections)
 
-            # Which sites actually need a visit, ranked - the auditor's real
-            # question is usually "where do I go first," not just "how many
-            # racks total." Top 8 keeps this a quick scan, not another table.
+            # Which locations actually need a visit, ranked - the auditor's
+            # real question is usually "where do I go first," not just "how
+            # many racks total." site_path already runs all the way down to
+            # the rack itself (e.g. "...  MDF > R1-L4"), which is unique per
+            # rack and would only ever count 1 here - step back one level to
+            # the room/IDF/MDF that actually holds more than one rack. Top 8
+            # keeps this a quick scan, not another table.
             site_counts = {}
             for r in needing_attention:
-                site = r.get("site_path") or r.get("site") or "Unknown"
+                site = _rack_audit_parent_location(r)
                 site_counts[site] = site_counts.get(site, 0) + 1
             top_sites = sorted(site_counts.items(), key=lambda kv: -kv[1])[:8]
             if len(top_sites) > 1:
