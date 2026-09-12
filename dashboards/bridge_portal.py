@@ -1999,14 +1999,7 @@ PAGE_SHELL = """<!DOCTYPE html>
   <div class="nav-secondary">
     {search_box}
     {operations_menu}
-    <details class="nav-dropdown {tools_has_active}">
-      <summary>Tools</summary>
-      <div class="nav-dropdown-menu">
-        {acknowledge_nav}
-        {events_nav}
-        {trends_nav}
-      </div>
-    </details>
+    {tools_menu}
     {admin_menu}
     <details class="nav-dropdown nav-account">
       <summary>{username}</summary>
@@ -2312,15 +2305,28 @@ def render_shell(title, body, active, username=""):
           </div>
         </details>"""
 
+    acknowledge_nav = _acknowledge_nav_html(active, has_full_control_system)
+    events_nav = nav_link("/events-search", "events", "Event search") if has_full_control_system else ""
+    trends_nav = nav_link("/trends", "trends", "Trends") if full_allowed else ""
+    tools_menu = ""
+    if acknowledge_nav or events_nav or trends_nav:
+        tools_has_active = "nav-has-active" if active in ("acknowledge", "events", "trends") else ""
+        tools_menu = f"""
+        <details class="nav-dropdown {tools_has_active}">
+          <summary>Tools</summary>
+          <div class="nav-dropdown-menu">
+            {acknowledge_nav}
+            {events_nav}
+            {trends_nav}
+          </div>
+        </details>"""
+
     return PAGE_SHELL.format(
         title=title, body=body, username=_esc(username), admin_menu=admin_menu, operations_menu=operations_menu,
         pending_handoff_banner=_pending_handoff_banner_html(username) if username else "",
         logo_b64=COVENANT_LOGO_PNG_B64, favicon_b64=FAVICON_PNG_B64, theme_attr=theme_attr,
         overview_nav="" if single_system_path else nav_link("/overview", "overview", "Overview"),
-        tools_has_active="nav-has-active" if active in ("acknowledge", "events", "trends") else "",
-        acknowledge_nav=_acknowledge_nav_html(active, has_full_control_system),
-        events_nav=nav_link("/events-search", "events", "Event search") if has_full_control_system else "",
-        trends_nav=nav_link("/trends", "trends", "Trends") if full_allowed else "",
+        tools_menu=tools_menu,
         search_box=('<form class="nav-search" action="/search" method="GET">'
                      '<input type="text" name="q" id="nav-search-input" placeholder="Search... ( / )" autocomplete="off"></form>'
                      ) if allowed and not restricted_dashboard_path else "",
