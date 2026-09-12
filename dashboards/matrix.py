@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -719,6 +720,9 @@ def get_asset_serial(asset_id):
     return serial
 
 
+RACK_AUDIT_ASSET_LOOKUP_WORKERS = int(os.environ.get("RACK_AUDIT_ASSET_LOOKUP_WORKERS", "8"))
+
+
 def get_rack_contained_assets(rack_id):
     """Elevation entries (U position, side, power source PDUs) for
     everything mounted in this rack. Deliberately NOT
@@ -728,19 +732,29 @@ def get_rack_contained_assets(rack_id):
     get_asset_cache() already builds for other uses) already carries
     locationData - parentId, rackULocation, rackSide - inline, so a
     rack's contents are just every asset whose parentId is this rack, no
-    separate elevation-specific call needed."""
+    separate elevation-specific call needed.
+
+    Serial number and power-source info each still cost one live API call
+    per asset (see get_asset_serial / get_device_power_sources) - done
+    with a small thread pool instead of sequentially, since a rack with
+    30-40 mounted devices made this the slow part of loading a rack audit
+    (30-40 round trips to Hyperview, one after another)."""
     cache = get_asset_cache()
-    out = []
+    entries = []
     for asset in cache.values():
         loc = asset.get("locationData") or {}
         if loc.get("parentId") != rack_id:
             continue
+        entries.append((asset, loc))
+
+    def _lookup(pair):
+        asset, loc = pair
         asset_id = asset.get("id")
         # get_asset_serial's dedicated property lookup first - falls back
         # to the general directory's own (less reliably populated) field
         # rather than ever showing a blank serial when either source has it.
         serial = (get_asset_serial(asset_id) if asset_id else "") or asset.get("serialNumber") or ""
-        out.append({
+        return {
             "id": asset_id,
             "name": asset.get("name") or "(unknown)",
             "type": asset.get("assetTypeId"),
@@ -750,8 +764,14 @@ def get_rack_contained_assets(rack_id):
             "u_location": loc.get("rackULocation"),
             "side": loc.get("rackSide"),
             "power_sources": get_device_power_sources(asset_id) if asset_id else [],
-        })
-    return out
+        }
+
+    if not entries:
+        return []
+    if len(entries) == 1:
+        return [_lookup(entries[0])]
+    with ThreadPoolExecutor(max_workers=min(RACK_AUDIT_ASSET_LOOKUP_WORKERS, len(entries))) as pool:
+        return list(pool.map(_lookup, entries))
 
 
 def find_next_rack_to_audit(sites=None):

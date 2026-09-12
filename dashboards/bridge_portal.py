@@ -6983,12 +6983,25 @@ def rack_audit_page(username):
                 f'<th>Last Audited</th><th>Compliance</th></tr>{rows}</table></div>'
             )
 
-    stat_row = "".join(
-        f'<div class="stat-tile{" unhealthy" if key in ("overdue", "never_audited") else ""}">'
-        f'<div class="stat-num">{counts.get(key, 0)}</div><div class="stat-lbl">{label}</div></div>'
-        for key, label in (
-            ("never_audited", "Never Audited"), ("overdue", "Overdue"),
-            ("due_soon", "Due Soon"), ("current", "Current"),
+    # counts.values() only ever holds the statuses actually seen above
+    # (never_audited/overdue/due_soon/current/unknown), so summing it - not
+    # re-deriving from len(racks) - is what keeps this exactly in sync with
+    # the per-status tiles below, including "Unknown" ones a rack falls
+    # into when it has no Audit Frequency set.
+    total_racks = sum(counts.values())
+    stat_row = (
+        f'<div class="stat-tile"><div class="stat-num">{total_racks}</div><div class="stat-lbl">Total Racks</div></div>'
+        + "".join(
+            f'<div class="stat-tile{" unhealthy" if key in ("overdue", "never_audited") else ""}">'
+            f'<div class="stat-num">{counts.get(key, 0)}</div><div class="stat-lbl">{label}</div></div>'
+            for key, label in (
+                ("never_audited", "Never Audited"), ("overdue", "Overdue"),
+                ("due_soon", "Due Soon"), ("current", "Current"),
+            )
+        )
+        + (
+            f'<div class="stat-tile"><div class="stat-num">{counts["unknown"]}</div><div class="stat-lbl">No Frequency Set</div></div>'
+            if counts.get("unknown") else ""
         )
     )
 
