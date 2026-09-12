@@ -1139,6 +1139,7 @@ LDAP_BIND_DN = os.environ.get("LDAP_BIND_DN", "svc_alber")
 LDAP_BIND_PASSWORD = os.environ.get("LDAP_BIND_PASSWORD")
 LDAP_USER_SEARCH_FILTER = os.environ.get("LDAP_USER_SEARCH_FILTER", "(sAMAccountName={username})")
 LDAP_GROUP_ATTR = os.environ.get("LDAP_GROUP_ATTR", "memberOf")
+LDAP_DISPLAY_NAME_ATTR = os.environ.get("LDAP_DISPLAY_NAME_ATTR", "displayName")
 LDAP_TIMEOUT_SECONDS = int(os.environ.get("LDAP_TIMEOUT_SECONDS", "10"))
 
 LDAP_GROUP_SYSTEM_MAP_DEFAULT = {
@@ -1403,7 +1404,7 @@ def _ldap_authenticate(username, password):
             search_filter = LDAP_USER_SEARCH_FILTER.format(
                 username=ldap3.utils.conv.escape_filter_chars(username)
             )
-            search_conn.search(LDAP_BASE_DN, search_filter, attributes=[LDAP_GROUP_ATTR])
+            search_conn.search(LDAP_BASE_DN, search_filter, attributes=[LDAP_GROUP_ATTR, LDAP_DISPLAY_NAME_ATTR])
             if not search_conn.entries:
                 return None
             user_entry = search_conn.entries[0]
@@ -1411,6 +1412,10 @@ def _ldap_authenticate(username, password):
             groups = (
                 [str(g).strip().lower() for g in user_entry[LDAP_GROUP_ATTR].values]
                 if LDAP_GROUP_ATTR in user_entry else []
+            )
+            display_name = (
+                str(user_entry[LDAP_DISPLAY_NAME_ATTR].value).strip()
+                if LDAP_DISPLAY_NAME_ATTR in user_entry and user_entry[LDAP_DISPLAY_NAME_ATTR].value else ""
             )
         finally:
             search_conn.unbind()
@@ -1442,7 +1447,7 @@ def _ldap_authenticate(username, password):
         granted |= user_entry["systems"]
         is_admin = is_admin or user_entry["is_admin"]
 
-    return granted, is_admin, groups
+    return granted, is_admin, groups, display_name
 
 
 def _split_grant_token(token):
@@ -1594,8 +1599,9 @@ def _verify_password(username, password):
 def _authenticate(username, password):
     """Tries LDAP first, then falls back to local_users - covers both a
     directory outage and an account never in AD. Returns (systems,
-    is_admin, source, ldap_groups) or None. ldap_groups is [] for a local
-    account - it only has meaning for the ldap source."""
+    is_admin, source, ldap_groups, display_name) or None. ldap_groups is []
+    for a local account - it only has meaning for the ldap source.
+    display_name is "" for a local account (no directory to pull one from)."""
     if not username or not password:
         return None
     if AUTH_BACKEND == "ldap":
@@ -1604,12 +1610,12 @@ def _authenticate(username, password):
         except _LdapNotConfigured:
             result = None
         if result is not None:
-            systems, is_admin, groups = result
+            systems, is_admin, groups, display_name = result
             if systems:
-                return systems, is_admin, "ldap", groups
+                return systems, is_admin, "ldap", groups, display_name
     user = _local_users().get(username)
     if user and _verify_password(username, password):
-        return user["systems"], user["is_admin"], "local", []
+        return user["systems"], user["is_admin"], "local", [], ""
     return None
 
 
@@ -2321,8 +2327,9 @@ def render_shell(title, body, active, username=""):
           </div>
         </details>"""
 
+    display_name = (session.get("display_name") if username and session.get("username") == username else "") or username
     return PAGE_SHELL.format(
-        title=title, body=body, username=_esc(username), admin_menu=admin_menu, operations_menu=operations_menu,
+        title=title, body=body, username=_esc(display_name), admin_menu=admin_menu, operations_menu=operations_menu,
         pending_handoff_banner=_pending_handoff_banner_html(username) if username else "",
         logo_b64=COVENANT_LOGO_PNG_B64, favicon_b64=FAVICON_PNG_B64, theme_attr=theme_attr,
         overview_nav="" if single_system_path else nav_link("/overview", "overview", "Overview"),
@@ -12294,7 +12301,7 @@ def login_page():
         if result is None:
             error = "Incorrect username or password, or the directory couldn't be reached."
         else:
-            systems, is_admin, source, ldap_groups = result
+            systems, is_admin, source, ldap_groups, display_name = result
             if not systems:
                 error = "Your account doesn't belong to any group with access to this portal."
             else:
@@ -12305,6 +12312,7 @@ def login_page():
                 session["is_admin"] = is_admin
                 session["auth_source"] = source
                 session["ldap_groups"] = ldap_groups
+                session["display_name"] = display_name
                 _record_known_human_user(username)
                 if source == "ldap":
                     session["cred_token"] = _stash_ldap_credential(password)
