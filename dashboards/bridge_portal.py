@@ -12867,7 +12867,7 @@ def _leadership_digest_email_html(data):
 
     if data["top_targets"]:
         top_rows = "".join(
-            f'<tr><td style="padding:6px 10px;border-bottom:1px solid #eef2f5;">'
+            f'<tr><td style="padding:6px 10px;border-bottom:1px solid #eef2f5;overflow-wrap:break-word;word-break:break-word;">'
             f'<span style="font-size:10.5px;text-transform:uppercase;background:#e4edf5;color:#06315e;padding:2px 7px;border-radius:20px;">{_esc(sys_label)}</span> '
             f'{_esc(target)}</td><td style="padding:6px 10px;border-bottom:1px solid #eef2f5;text-align:right;">{count}</td></tr>'
             for (sys_label, target), count in data["top_targets"]
@@ -13164,8 +13164,8 @@ def _monitoring_issue_rows_html(issues):
             'margin-bottom:8px;border-radius:0 4px 4px 0;">'
             f'<span style="font-size:10.5px;text-transform:uppercase;background:#e4edf5;color:#06315e;'
             f'padding:2px 7px;border-radius:20px;">{_esc(i["system_label"])}</span>{badge}'
-            f'<div style="font-weight:700;font-size:14px;color:#16212b;margin-top:6px;">{where}</div>'
-            f'<div style="color:#55636e;font-size:13px;margin-top:2px;">{_esc(i["message"])}</div>'
+            f'<div style="font-weight:700;font-size:14px;color:#16212b;margin-top:6px;overflow-wrap:break-word;word-break:break-word;">{where}</div>'
+            f'<div style="color:#55636e;font-size:13px;margin-top:2px;overflow-wrap:break-word;word-break:break-word;">{_esc(i["message"])}</div>'
             '</div>'
         )
     return "".join(row(i) for i in issues)
