@@ -1754,7 +1754,15 @@ PAGE_SHELL = """<!DOCTYPE html>
   header.brand .brand-logo {{ height: 30px; width: auto; display: block; }}
   header.brand .brand-sub {{ font-size: 11px; color: var(--text-dim); font-weight: 600;
     margin-top: 5px; letter-spacing: 0.02em; text-transform: uppercase; }}
-  .wrap {{ max-width: 2200px; width: 97%; margin: 0 auto; padding-top: 18px; }}
+  .wrap {{ max-width: 2200px; width: 97%; margin: 0 auto; padding-top: 18px; animation: page-fade-in 0.18s ease-out; }}
+  /* The nav/header chrome stays put (re-fading it on every navigation
+     would feel like the whole app reloads); just the content pane eases
+     in, so moving between pages reads as one app rather than a stack of
+     flat server-rendered documents. */
+  @keyframes page-fade-in {{ from {{ opacity: 0; transform: translateY(3px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+  .breadcrumb {{ font-size: 12.5px; color: var(--text-faint); margin: 0 0 10px; display: flex; align-items: center; gap: 6px; }}
+  .breadcrumb .crumb-current {{ color: var(--text-dim); font-weight: 600; }}
+  .breadcrumb .crumb-sep {{ color: var(--border-bright); }}
   .site-footer {{ margin-top: 32px; padding: 16px 0 24px; text-align: center;
     font-size: 11px; color: var(--text-faint); border-top: 1px solid var(--border); }}
   h1 {{ font-size: 19px; margin: 0 0 14px; color: var(--teal-dark); font-weight: 700; letter-spacing: -0.01em; }}
@@ -1967,7 +1975,22 @@ PAGE_SHELL = """<!DOCTYPE html>
   td.time {{ color: var(--text-dim); white-space: nowrap; font-variant-numeric: tabular-nums; }}
   .empty {{ color: var(--text-faint); font-size: 13px; padding: 22px 10px; text-align: center; }}
   .empty::before {{ content: "\\2014"; display: block; font-size: 16px; margin-bottom: 4px; color: var(--border-bright); }}
-  .table-scroll {{ overflow-x: auto; }}
+  /* overflow-y defaults to 'visible', but the CSS Overflow spec silently
+     forces its computed value to 'auto' the instant overflow-x is
+     anything but 'visible', even if overflow-y: visible is spelled out
+     explicitly - the pair can't be (visible, non-visible). That makes
+     this div itself the nearest ancestor a sticky child sticks within,
+     and with no height limit its scrollport is exactly as tall as its
+     content, so nothing inside it ever visibly needs to "stick" as the
+     page scrolls. Giving it a real bounded height turns that unavoidable
+     auto into an actual scrolling pane instead of a no-op - a table
+     under this rarely needs it (most fit well under it) and gets its own
+     scrollbar with a pinned header on the ones that don't. */
+  .table-scroll {{ overflow: auto; max-height: 65vh; }}
+  /* Column labels on a long table (Acknowledge Log, Event Search results,
+     User Activity) shouldn't scroll out of view the moment you scroll past
+     row one - sticks to the top of this scrolling pane. */
+  .table-scroll th {{ position: sticky; top: 0; z-index: 2; background: var(--panel); }}
   .tag {{ font-size: 10px; text-transform: uppercase; padding: 2px 6px; border-radius: 4px;
     background: var(--teal-tint); border: 1px solid var(--border-bright); color: var(--teal-dark); font-weight: 600; }}
   .filters {{ display: flex; flex-wrap: wrap; gap: 14px; align-items: end; }}
@@ -2051,6 +2074,7 @@ PAGE_SHELL = """<!DOCTYPE html>
   <div class="ack-panel-body" id="ack-panel-body"></div>
 </div>
 <div class="wrap">
+  {breadcrumb}
   {pending_handoff_banner}
   {body}
   <footer class="site-footer">InfraWatch &middot; Covenant Health IT</footer>
@@ -2325,6 +2349,41 @@ def _acknowledge_nav_html(active, has_maintenance_system):
     return f'<a href="/acknowledge" class="{cls}">Acknowledge</a>'
 
 
+# (group label, page label) for every route that lives inside a nav
+# dropdown rather than being one of the top-level nav links - those
+# already show which page you're on via the highlighted nav link itself,
+# so a breadcrumb on top would just repeat it. A page nested a level
+# down (behind "Admin"/"Operations"/"Tools") only shows as a highlighted
+# dropdown pill, not which specific page inside it - the breadcrumb
+# fills that gap.
+_BREADCRUMB_MAP = {
+    "handoff": ("Operations", "Handoff"),
+    "runbook-view": ("Operations", "Runbook"),
+    "rack-audit": ("Operations", "Rack Audit"),
+    "acknowledge": ("Tools", "Acknowledge"),
+    "events": ("Tools", "Event Search"),
+    "trends": ("Tools", "Trends"),
+    "admin-leadership": ("Admin", "Leadership Dashboard"),
+    "admin-access": ("Admin", "Access Management"),
+    "admin-log": ("Admin", "Acknowledge Log"),
+    "admin-activity": ("Admin", "User Activity"),
+    "admin-runbook-manage": ("Admin", "Runbook Management"),
+    "admin-rack-audit-scope": ("Admin", "Rack Audit Management"),
+    "admin-config": ("Admin", "System Config"),
+}
+
+
+def _breadcrumb_html(active):
+    entry = _BREADCRUMB_MAP.get(active)
+    if not entry:
+        return ""
+    group, page = entry
+    return (
+        f'<div class="breadcrumb">{_esc(group)}<span class="crumb-sep">&rsaquo;</span>'
+        f'<span class="crumb-current">{_esc(page)}</span></div>'
+    )
+
+
 def render_shell(title, body, active, username=""):
     allowed = _user_systems(username) if username else set()
     full_allowed = _user_full_systems(username) if username else set()
@@ -2408,6 +2467,7 @@ def render_shell(title, body, active, username=""):
         ipro_nav=nav_link("/ipro", "ipro", "iPRO Cameras", _nav_badge_html("ipro")) if "ipro" in allowed else "",
         ooma_nav=nav_link("/ooma", "ooma", "Ooma AirDial", _nav_badge_html("ooma")) if "ooma" in allowed else "",
         downtime_nav=nav_link("/downtime", "downtime", "Downtime Workstations", _nav_badge_html("downtime")) if "downtime" in allowed else "",
+        breadcrumb=_breadcrumb_html(active),
     )
 
 
@@ -6997,8 +7057,11 @@ RACK_AUDIT_ELEVATION_CSS = """
      columns squeeze into single-letter headers and unreadable cells. The
      table keeps its designed proportions and scrolls horizontally instead
      (.ra-table-scroll, screen-only - print always gets the full sheet
-     width, no scrolling possible on paper). */
-  .ra-table-scroll { overflow-x: auto; }
+     width, no scrolling possible on paper). Overrides the shared
+     .table-scroll's bounded height/sticky-header treatment - a rack can
+     run to dozens of devices and an auditor walking it needs the whole
+     sheet in view scrolling with the page, not a capped inner pane. */
+  .ra-table-scroll { overflow-x: auto; max-height: none; }
   table.ra-table { width: 100%; min-width: 720px; border-collapse: collapse; font-size: 12px; table-layout: fixed; }
   table.ra-table th, table.ra-table td { padding: 8px 5px; border-bottom: 1px solid var(--border); text-align: left;
     vertical-align: top; white-space: normal; overflow-wrap: normal; word-break: normal; overflow: hidden; }
