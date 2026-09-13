@@ -12719,6 +12719,13 @@ LEADERSHIP_DIGEST_CHECK_INTERVAL_SECONDS = int(os.environ.get("LEADERSHIP_DIGEST
 LEADERSHIP_DIGEST_DASHBOARD_URL = os.environ.get("LEADERSHIP_DIGEST_DASHBOARD_URL", "")
 _LEADERSHIP_DIGEST_DAY_NAMES = {0: "mon", 1: "tue", 2: "wed", 3: "thu", 4: "fri", 5: "sat", 6: "sun"}
 _LEADERSHIP_DIGEST_DAY_NUMS = {v: k for k, v in _LEADERSHIP_DIGEST_DAY_NAMES.items()}
+# If the app runs with more than one worker process (see
+# _AUTO_RESTART_INSTANCE_ID's own comment - this is the exact same
+# scenario), every one of them runs its own copy of this loop and,
+# without this lease lock, every one of them would independently decide
+# "it's due" and send its own copy of the same email.
+LEADERSHIP_DIGEST_LOCK_NAME = "leadership_digest"
+LEADERSHIP_DIGEST_LOCK_LEASE_SECONDS = max(LEADERSHIP_DIGEST_CHECK_INTERVAL_SECONDS * 2, 60)
 
 
 def _leadership_digest_enabled():
@@ -12988,6 +12995,12 @@ def _leadership_digest_tick():
         return
     if not _leadership_digest_due():
         return
+    # Only the one process holding this lease actually sends - see
+    # LEADERSHIP_DIGEST_LOCK_NAME's comment above. Checked after (not
+    # before) _leadership_digest_due() so a worker that isn't going to do
+    # anything this tick anyway doesn't bother writing to acquire/renew it.
+    if not _try_acquire_process_lock(LEADERSHIP_DIGEST_LOCK_NAME, _AUTO_RESTART_INSTANCE_ID, LEADERSHIP_DIGEST_LOCK_LEASE_SECONDS):
+        return
     _send_leadership_digest_now()
 
 
@@ -13047,6 +13060,13 @@ MONITORING_ALERT_CHECK_INTERVAL_SECONDS = int(os.environ.get("MONITORING_ALERT_C
 MONITORING_ALERT_DIGEST_INTERVAL_SECONDS = int(os.environ.get("MONITORING_ALERT_DIGEST_INTERVAL_SECONDS", "900"))
 MONITORING_CRITICAL_REPEAT_INTERVAL_SECONDS = int(os.environ.get("MONITORING_CRITICAL_REPEAT_INTERVAL_SECONDS", "300"))
 MONITORING_ALERT_DASHBOARD_URL = os.environ.get("MONITORING_ALERT_DASHBOARD_URL", "")
+# Same multi-worker-process concern as LEADERSHIP_DIGEST_LOCK_NAME above
+# (and AUTO_RESTART_LOCK_NAME before that) - without this, every worker
+# process independently polls, independently decides what's newly
+# critical, and independently emails it, multiplying every alert and
+# every digest by however many workers are running.
+MONITORING_ALERT_LOCK_NAME = "monitoring_alerts"
+MONITORING_ALERT_LOCK_LEASE_SECONDS = max(MONITORING_ALERT_CHECK_INTERVAL_SECONDS * 2, 60)
 
 
 def _monitoring_alerts_enabled():
@@ -13321,6 +13341,11 @@ def _monitoring_alert_send_test():
 
 def _monitoring_alert_tick():
     if not _monitoring_alerts_enabled():
+        return
+    # Only the one process holding this lease actually checks/sends -
+    # see MONITORING_ALERT_LOCK_NAME's comment above. Every worker still
+    # calls this every check interval; all but the lease holder just no-op.
+    if not _try_acquire_process_lock(MONITORING_ALERT_LOCK_NAME, _AUTO_RESTART_INSTANCE_ID, MONITORING_ALERT_LOCK_LEASE_SECONDS):
         return
     realtime_issues = _monitoring_realtime_issues()
     _monitoring_alert_check_criticals(realtime_issues)
