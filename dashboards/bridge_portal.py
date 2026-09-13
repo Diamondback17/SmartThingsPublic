@@ -11141,6 +11141,25 @@ def admin_config_auto_restart(username):
     return redirect("/admin/config")
 
 
+@app.route("/admin/config/leadership-digest", methods=["POST"])
+@require_login
+@require_admin
+def admin_config_leadership_digest(username):
+    enabled = request.form.get("enabled") == "1"
+    _set_leadership_digest_enabled(enabled)
+    return redirect("/admin/config")
+
+
+@app.route("/admin/config/leadership-digest/test", methods=["POST"])
+@require_login
+@require_admin
+def admin_config_leadership_digest_test(username):
+    error = _send_leadership_digest_now()
+    if error:
+        return _redirect_msg("/admin/config", error=f"Test digest failed: {error}")
+    return _redirect_msg("/admin/config", message=f"Test digest sent to {', '.join(LEADERSHIP_DIGEST_RECIPIENTS)}")
+
+
 DASHBOARD_VIDEOWALL_SHELL = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -12029,6 +12048,43 @@ def admin_config_page(username):
     </div>
     """
 
+    digest_enabled = _leadership_digest_enabled()
+    digest_last_sent = _leadership_digest_last_sent()
+    digest_last_sent_txt = (
+        datetime.fromtimestamp(digest_last_sent).strftime("%Y-%m-%d %I:%M:%S %p") if digest_last_sent else "Never"
+    )
+    digest_recipients_txt = ", ".join(LEADERSHIP_DIGEST_RECIPIENTS) if LEADERSHIP_DIGEST_RECIPIENTS else "None configured (set LEADERSHIP_DIGEST_RECIPIENTS)"
+    digest_day_label = LEADERSHIP_DIGEST_DAY.capitalize()
+    leadership_digest_html = f"""
+    <div class="card">
+      <div class="page-header" style="margin:0 0 8px;">
+        <div><h2 style="margin:0; font-size:15px;">Leadership Digest Email</h2>
+        <p class="sub" style="margin:4px 0 0;">A periodic summary of the Leadership Dashboard's numbers -
+        uptime, acknowledgments, MTTA/MTTR per system - sent to people who don't open the portal themselves.
+        Off by default. Recipients and schedule are set via environment variables, not here.</p></div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <form method="post" action="/admin/config/leadership-digest/test" style="margin:0;">
+            <button type="submit" class="ghost" style="margin-top:0;" {'disabled title="Configure LEADERSHIP_DIGEST_RECIPIENTS first"' if not LEADERSHIP_DIGEST_RECIPIENTS else ''}>Send Test Digest Now</button>
+          </form>
+          <form method="post" action="/admin/config/leadership-digest" style="margin:0;">
+            <input type="hidden" name="enabled" value="{'0' if digest_enabled else '1'}">
+            <button type="submit" class="{'cancel-btn' if digest_enabled else ''}" style="{'padding:9px 18px; font-size:14px; margin-top:0;' if digest_enabled else 'margin-top:0;'}">
+              {'Disable' if digest_enabled else 'Enable'} digest
+            </button>
+          </form>
+        </div>
+      </div>
+      <div class="table-scroll"><table>
+        {row('Status', 'Enabled' if digest_enabled else 'Disabled')}
+        {row('Recipients', digest_recipients_txt)}
+        {row('Schedule', f'Every {digest_day_label} at {LEADERSHIP_DIGEST_HOUR:02d}:00 (server-local time)')}
+        {row('Range summarized', f'Last {LEADERSHIP_RANGE_HOURS[LEADERSHIP_DIGEST_RANGE_KEY] // 24} days')}
+        {row('Sent from', f'{LEADERSHIP_DIGEST_MAIL_FROM_NAME} <{LEADERSHIP_DIGEST_MAIL_FROM}>')}
+        {row('Last sent', digest_last_sent_txt)}
+      </table></div>
+    </div>
+    """
+
     site_cards = [_hyperview_overview_card(), _ipro_overview_card()]
 
     similar_pairs = []
@@ -12065,10 +12121,12 @@ def admin_config_page(username):
         <h1>System Config</h1>
       </div>
     </div>
+    {_msg_html()}
     <div class="card">
       <div class="table-scroll"><table>{''.join(rows)}</table></div>
     </div>
     {auto_restart_html}
+    {leadership_digest_html}
     {similar_sites_html}
     """
     return Response(render_shell("Admin - System Config", body, "admin-config", username), mimetype="text/html")
@@ -12473,6 +12531,285 @@ def admin_activity_page(username):
 
 LEADERSHIP_RANGE_HOURS = {"7d": 7 * 24, "30d": 30 * 24, "90d": 90 * 24}
 LEADERSHIP_DEFAULT_RANGE = "30d"
+
+# ---------------------------------------------------------------------------
+# Leadership digest email - a periodic (default: weekly) summary of the same
+# numbers the Leadership Dashboard shows on screen, sent to people who don't
+# open the portal themselves. Recipients/schedule/mail relay are read from
+# the environment (matching how every other external-integration setting in
+# this file - HYPERVIEW_BASE_URL, LDAP_*, AUTO_RESTART_* - is configured),
+# not editable in the UI; enabling/disabling it and seeing when it last went
+# out live in app_settings (the same generic KV table the auto-restart
+# toggle already uses) since that's a runtime on/off switch, not deployment
+# config. Sent via msmtp (piped a fully-formed message, not the `mail`/
+# `mailx` command - `mail -a` for a raw header isn't reliably "add this
+# header" across implementations, which silently degrades an HTML email to
+# plain text on some builds) since that's this org's already-working mail
+# relay setup elsewhere in the environment.
+# ---------------------------------------------------------------------------
+LEADERSHIP_DIGEST_SETTING_KEY = "leadership_digest_enabled"
+LEADERSHIP_DIGEST_LAST_SENT_KEY = "leadership_digest_last_sent_ts"
+LEADERSHIP_DIGEST_RECIPIENTS = [
+    addr.strip() for addr in os.environ.get("LEADERSHIP_DIGEST_RECIPIENTS", "").split(",") if addr.strip()
+]
+LEADERSHIP_DIGEST_MAIL_FROM = os.environ.get("LEADERSHIP_DIGEST_MAIL_FROM", "infrawatch@covhlth.com")
+LEADERSHIP_DIGEST_MAIL_FROM_NAME = os.environ.get("LEADERSHIP_DIGEST_MAIL_FROM_NAME", "InfraWatch")
+# 3-letter day name, lower-case - which day of the week the digest goes out.
+LEADERSHIP_DIGEST_DAY = os.environ.get("LEADERSHIP_DIGEST_DAY", "mon").strip().lower()[:3]
+LEADERSHIP_DIGEST_HOUR = int(os.environ.get("LEADERSHIP_DIGEST_HOUR", "7"))  # 0-23, server-local time
+LEADERSHIP_DIGEST_RANGE_KEY = os.environ.get("LEADERSHIP_DIGEST_RANGE", "7d")
+if LEADERSHIP_DIGEST_RANGE_KEY not in LEADERSHIP_RANGE_HOURS:
+    LEADERSHIP_DIGEST_RANGE_KEY = "7d"
+LEADERSHIP_DIGEST_CHECK_INTERVAL_SECONDS = int(os.environ.get("LEADERSHIP_DIGEST_CHECK_INTERVAL_SECONDS", "900"))
+LEADERSHIP_DIGEST_DASHBOARD_URL = os.environ.get("LEADERSHIP_DIGEST_DASHBOARD_URL", "")
+_LEADERSHIP_DIGEST_DAY_NAMES = {0: "mon", 1: "tue", 2: "wed", 3: "thu", 4: "fri", 5: "sat", 6: "sun"}
+_LEADERSHIP_DIGEST_DAY_NUMS = {v: k for k, v in _LEADERSHIP_DIGEST_DAY_NAMES.items()}
+
+
+def _leadership_digest_enabled():
+    return _get_app_setting(LEADERSHIP_DIGEST_SETTING_KEY, "0") == "1"
+
+
+def _set_leadership_digest_enabled(enabled):
+    _set_app_setting(LEADERSHIP_DIGEST_SETTING_KEY, "1" if enabled else "0")
+
+
+def _leadership_digest_last_sent():
+    raw = _get_app_setting(LEADERSHIP_DIGEST_LAST_SENT_KEY)
+    return float(raw) if raw else None
+
+
+def _set_leadership_digest_last_sent(ts):
+    _set_app_setting(LEADERSHIP_DIGEST_LAST_SENT_KEY, str(ts))
+
+
+def _leadership_digest_data(range_key=None):
+    """Same computation as admin_leadership_page's summary/per-system stats
+    (not refactored to share code with it directly, to keep this isolated
+    from a page that's rendered on every dashboard load - a bug here should
+    only ever be able to break the digest, never the live page)."""
+    range_key = range_key if range_key in LEADERSHIP_RANGE_HOURS else LEADERSHIP_DIGEST_RANGE_KEY
+    until_ts = time.time()
+    since_ts = until_ts - LEADERSHIP_RANGE_HOURS[range_key] * 3600
+
+    all_actions = _all_maintenance_actions(since_ts=since_ts)
+    total_acks = sum(1 for a in all_actions if a["action"] == "acknowledged")
+    total_restarts = sum(1 for a in all_actions if a["action"] == "restarted")
+    total_incidents = sum(1 for a in all_actions if a["action"] == "acknowledged" and a.get("incident_number"))
+
+    system_keys = ["hyperview", "ipro", "ooma", "downtime"]
+    per_system = {}
+    for key in system_keys:
+        scores = [s for _, s in _history_points(key, since_ts, until_ts)]
+        mtta_stats = _duration_stats(_mtta_samples_for_system(key, since_ts, until_ts))
+        mttr_stats = _duration_stats(_mttr_samples_for_system(key, since_ts, until_ts))
+        acknowledgements = sum(
+            1 for a in all_actions
+            if a["system_label"] == TRENDS_SYSTEM_LABELS[key] and a["action"] == "acknowledged"
+        )
+        per_system[key] = {
+            "avg": round(sum(scores) / len(scores)) if scores else None,
+            "mtta": mtta_stats, "mttr": mttr_stats, "acknowledgements": acknowledgements,
+        }
+
+    scores_with_data = [per_system[k]["avg"] for k in system_keys if per_system[k]["avg"] is not None]
+    overall_avg = round(sum(scores_with_data) / len(scores_with_data)) if scores_with_data else None
+
+    target_counts = {}
+    for a in all_actions:
+        if a["action"] != "acknowledged" or not a["target"]:
+            continue
+        tk = (a["system_label"], a["target"])
+        target_counts[tk] = target_counts.get(tk, 0) + 1
+    top_targets = sorted(target_counts.items(), key=lambda kv: -kv[1])[:5]
+
+    return {
+        "range_key": range_key, "range_days": int(LEADERSHIP_RANGE_HOURS[range_key] / 24),
+        "total_acks": total_acks, "total_restarts": total_restarts, "total_incidents": total_incidents,
+        "overall_avg": overall_avg, "per_system": per_system, "system_keys": system_keys,
+        "top_targets": top_targets,
+    }
+
+
+def _leadership_digest_email_html(data):
+    """Self-contained HTML email (inline styles throughout, no <style>
+    block or external CSS) since most mail clients strip or ignore a
+    <style> tag - matches InfraWatch's own teal branding rather than
+    inheriting any other alert email's color scheme, since this digest
+    isn't an alert."""
+    def stat_cell(value, label):
+        return (
+            f'<td style="padding:10px 14px;text-align:center;border-right:1px solid #dee6ec;">'
+            f'<div style="font-size:20px;font-weight:700;color:#16212b;">{value}</div>'
+            f'<div style="font-size:10.5px;text-transform:uppercase;letter-spacing:0.04em;color:#8996a1;margin-top:2px;">{_esc(label)}</div>'
+            f'</td>'
+        )
+
+    dash = "&mdash;"
+    summary_cells = "".join([
+        stat_cell(f"{data['overall_avg']}%" if data["overall_avg"] is not None else dash, "Avg Uptime"),
+        stat_cell(data["total_acks"], "Acknowledgments"),
+        stat_cell(data["total_incidents"], "Tied to Incident #"),
+        stat_cell(data["total_restarts"], "Service Restarts"),
+    ])
+    summary_html = (
+        f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+        f'style="border:1px solid #dee6ec;border-radius:6px;overflow:hidden;margin-bottom:18px;">'
+        f'<tr>{summary_cells}</tr></table>'
+    )
+
+    def system_row(key):
+        s = data["per_system"][key]
+        avg_txt = f"{s['avg']}%" if s["avg"] is not None else dash
+        mtta_txt = _format_duration(s["mtta"]["mean"]) if s["mtta"] else dash
+        mttr_txt = _format_duration(s["mttr"]["mean"]) if s["mttr"] else dash
+        return (
+            '<tr>'
+            f'<td style="padding:8px 10px;border-bottom:1px solid #eef2f5;font-weight:600;">{_esc(TRENDS_SYSTEM_LABELS[key])}</td>'
+            f'<td style="padding:8px 10px;border-bottom:1px solid #eef2f5;text-align:right;">{avg_txt}</td>'
+            f'<td style="padding:8px 10px;border-bottom:1px solid #eef2f5;text-align:right;">{s["acknowledgements"]}</td>'
+            f'<td style="padding:8px 10px;border-bottom:1px solid #eef2f5;text-align:right;">{mtta_txt}</td>'
+            f'<td style="padding:8px 10px;border-bottom:1px solid #eef2f5;text-align:right;">{mttr_txt}</td>'
+            '</tr>'
+        )
+
+    systems_table = (
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:18px;">'
+        '<tr>'
+        '<th style="text-align:left;padding:6px 10px;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#8996a1;border-bottom:1.5px solid #c5d2da;">System</th>'
+        '<th style="text-align:right;padding:6px 10px;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#8996a1;border-bottom:1.5px solid #c5d2da;">Avg Uptime</th>'
+        '<th style="text-align:right;padding:6px 10px;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#8996a1;border-bottom:1.5px solid #c5d2da;">Acks</th>'
+        '<th style="text-align:right;padding:6px 10px;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#8996a1;border-bottom:1.5px solid #c5d2da;">MTTA</th>'
+        '<th style="text-align:right;padding:6px 10px;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#8996a1;border-bottom:1.5px solid #c5d2da;">MTTR</th>'
+        '</tr>'
+        + "".join(system_row(k) for k in data["system_keys"])
+        + '</table>'
+    )
+
+    if data["top_targets"]:
+        top_rows = "".join(
+            f'<tr><td style="padding:6px 10px;border-bottom:1px solid #eef2f5;">'
+            f'<span style="font-size:10.5px;text-transform:uppercase;background:#e4edf5;color:#06315e;padding:2px 7px;border-radius:20px;">{_esc(sys_label)}</span> '
+            f'{_esc(target)}</td><td style="padding:6px 10px;border-bottom:1px solid #eef2f5;text-align:right;">{count}</td></tr>'
+            for (sys_label, target), count in data["top_targets"]
+        )
+        top_html = (
+            '<p style="margin:0 0 8px;font-size:13px;font-weight:700;color:#005a9c;text-transform:uppercase;letter-spacing:0.04em;">Most Frequently Acknowledged</p>'
+            '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:4px;">' + top_rows + '</table>'
+        )
+    else:
+        top_html = '<p style="color:#8996a1;font-size:13px;">No acknowledgments in this range.</p>'
+
+    dashboard_html = ""
+    if LEADERSHIP_DIGEST_DASHBOARD_URL:
+        dashboard_html = (
+            f'<p style="margin-top:22px;"><a href="{_esc(LEADERSHIP_DIGEST_DASHBOARD_URL)}" '
+            f'style="background:#005a9c;color:#ffffff;text-decoration:none;padding:11px 22px;border-radius:8px;'
+            f'font-weight:700;font-size:14px;display:inline-block;">Open Leadership Dashboard &rarr;</a></p>'
+        )
+
+    generated_at = datetime.now().strftime("%A, %B %-d, %Y at %-I:%M %p")
+    return f"""<html><body style="margin:0;padding:0;background:#eef2f5;font-family:'Segoe UI',Arial,Helvetica,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="padding:24px 0;">
+<tr><td align="center">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:10px;overflow:hidden;box-shadow:0 1px 3px rgba(15,35,55,0.08);">
+<tr><td style="background:linear-gradient(135deg,#06315e,#005a9c);padding:20px 24px;">
+<span style="color:#ffffff;font-size:17px;font-weight:700;">InfraWatch Leadership Digest</span><br>
+<span style="color:#cfe0ee;font-size:12.5px;">Last {data['range_days']} days &middot; generated {_esc(generated_at)}</span>
+</td></tr>
+<tr><td style="padding:22px 24px;color:#16212b;font-size:14px;line-height:1.5;">
+{summary_html}
+{systems_table}
+{top_html}
+{dashboard_html}
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body></html>"""
+
+
+def _send_leadership_digest_mail(subject, html_body):
+    """Pipes a fully-formed RFC822 message straight into msmtp - see the
+    module docstring above for why (not the `mail`/`mailx` command).
+    Returns None on success, or a short error string to surface to an
+    admin (test-send button, or logged from the scheduler)."""
+    if not LEADERSHIP_DIGEST_RECIPIENTS:
+        return "No recipients configured (set LEADERSHIP_DIGEST_RECIPIENTS)"
+    to_header = ", ".join(LEADERSHIP_DIGEST_RECIPIENTS)
+    message = (
+        f"From: {LEADERSHIP_DIGEST_MAIL_FROM_NAME} <{LEADERSHIP_DIGEST_MAIL_FROM}>\n"
+        f"To: {to_header}\n"
+        f"Subject: {subject}\n"
+        "MIME-Version: 1.0\n"
+        "Content-Type: text/html; charset=UTF-8\n"
+        "\n"
+        f"{html_body}\n"
+    )
+    try:
+        subprocess.run(
+            ["msmtp"] + LEADERSHIP_DIGEST_RECIPIENTS,
+            input=message.encode("utf-8"), timeout=30, check=True, capture_output=True,
+        )
+    except FileNotFoundError:
+        return "msmtp is not installed / not on PATH on this host"
+    except subprocess.CalledProcessError as e:
+        return f"msmtp failed: {e.stderr.decode('utf-8', 'ignore')[:500] or e}"
+    except subprocess.TimeoutExpired:
+        return "msmtp timed out"
+    return None
+
+
+def _send_leadership_digest_now():
+    """Builds and sends the digest immediately, regardless of schedule -
+    used by both the scheduler (once it decides it's due) and the admin's
+    "Send Test Digest Now" button. Always stamps last-sent, even on
+    failure, so a persistently broken mail relay doesn't turn into the
+    scheduler retrying every tick forever - a failure is surfaced instead
+    (via the returned error) and the next attempt is the next scheduled
+    slot, same as a success would be."""
+    data = _leadership_digest_data()
+    html = _leadership_digest_email_html(data)
+    subject = f"InfraWatch Leadership Digest - {data['range_days']}-day summary"
+    error = _send_leadership_digest_mail(subject, html)
+    _set_leadership_digest_last_sent(time.time())
+    return error
+
+
+def _leadership_digest_due(now=None):
+    now = now or datetime.now()
+    target_day = _LEADERSHIP_DIGEST_DAY_NUMS.get(LEADERSHIP_DIGEST_DAY, 0)
+    if now.weekday() != target_day or now.hour != LEADERSHIP_DIGEST_HOUR:
+        return False
+    last_sent = _leadership_digest_last_sent()
+    # Guards against sending twice inside the same target hour (the
+    # scheduler ticks every LEADERSHIP_DIGEST_CHECK_INTERVAL_SECONDS, not
+    # exactly once an hour) without needing a separate "already sent
+    # today" flag - 20h comfortably clears one day without risking a
+    # skipped week if the process restarts near the boundary.
+    if last_sent and (time.time() - last_sent) < 20 * 3600:
+        return False
+    return True
+
+
+def _leadership_digest_tick():
+    if not _leadership_digest_enabled():
+        return
+    if not _leadership_digest_due():
+        return
+    _send_leadership_digest_now()
+
+
+def _run_leadership_digest_loop():
+    while True:
+        try:
+            _leadership_digest_tick()
+        except Exception:
+            pass
+        time.sleep(LEADERSHIP_DIGEST_CHECK_INTERVAL_SECONDS)
+
+
+threading.Thread(target=_run_leadership_digest_loop, daemon=True).start()
 
 
 @app.route("/admin/leadership")
