@@ -7727,7 +7727,7 @@ def trends_page(username):
       <a class="ghost page-action" href="/trends.csv?range={range_key}">Download CSV &darr;</a>
     </div>
     <style>{DASHBOARD_BASE_CSS}</style>
-    <div class="panel" style="margin-bottom:16px;">
+    <div class="panel">
       <div style="padding:14px 18px;" class="trend-range-row">{range_buttons}<span class="trend-range-sep"></span>{toggles}</div>
       {selector_row}
     </div>
@@ -7762,7 +7762,7 @@ def _device_reliability_section_html(username, since_ts, until_ts, range_key):
 
     rows_html = "".join(row_html(r) for r in rows[:50])
     return f"""
-    <div class="panel" style="margin-top:16px;">
+    <div class="panel">
       <div class="panel-head"><h2>Device Reliability</h2></div>
       <div style="padding:14px 18px;">
         <p class="sub" style="margin-top:-6px;">Worst offenders across every system, {range_key} - ranked by
@@ -11758,7 +11758,7 @@ def admin_config_page(username):
     else:
         holder = "None currently held"
     auto_restart_html = f"""
-    <div class="card" style="margin-top:16px;">
+    <div class="card">
       <div class="page-header" style="margin:0 0 8px;">
         <div><h2 style="margin:0; font-size:15px;">Downtime Auto-Restart</h2>
         <p class="sub" style="margin:4px 0 0;">Unattended background restarts for workstations that are down and
@@ -11800,7 +11800,7 @@ def admin_config_page(username):
             for system_label, name_a, name_b, ratio in similar_pairs
         )
         similar_sites_html = f"""
-        <div class="card" style="margin-top:16px;">
+        <div class="card">
           <div class="page-header" style="margin:0 0 8px;">
             <div><h2 style="margin:0; font-size:15px;">Possible Duplicate Site Names</h2>
             <p class="sub" style="margin:4px 0 0;">These pairs are close enough that they may be the same
@@ -11910,7 +11910,7 @@ def device_history_page(username, system, target):
       </div>
     </div>
     <style>{DASHBOARD_BASE_CSS}</style>
-    <div class="panel" style="margin-bottom:16px;">
+    <div class="panel">
       <div style="padding:14px 18px;">{stat_row}</div>
     </div>
     <div class="card">
@@ -12156,7 +12156,7 @@ def admin_activity_page(username):
         balance_html = f'<span class="balance-tag{balance_cls}">{_esc(balance_txt)}</span>'
 
     ratio_stats_html = f"""
-    <div class="card">
+    <div class="panel">
       <div class="stat-row">
         <div class="stat-tile"><div class="stat-num">{total_users}</div><div class="stat-lbl">Active Users</div></div>
         <div class="stat-tile"><div class="stat-num">{total_actions}</div><div class="stat-lbl">Total Actions</div></div>
@@ -12181,7 +12181,7 @@ def admin_activity_page(username):
       .share-bar-fill {{ height:100%; background:var(--teal); border-radius:4px; }}
       .share-bar-fill.over {{ background:var(--red, #c0392b); }}
       .share-pct {{ font-variant-numeric:tabular-nums; font-size:12px; color:var(--text-faint); min-width:34px; text-align:right; }}
-      .balance-row {{ margin-top:10px; font-size:13px; color:var(--text-faint); }}
+      .balance-row {{ margin-top:2px; padding:0 10px 10px; font-size:13px; color:var(--text-faint); }}
       .balance-tag {{ display:inline-block; padding:2px 9px; border-radius:999px; font-weight:700; font-size:12px; margin-left:4px; }}
       .balance-tag.balance-good {{ background:var(--teal-tint); color:var(--teal-dark); }}
       .balance-tag.balance-warn {{ background:#fdf0d5; color:#8a5a00; }}
@@ -12259,7 +12259,7 @@ def admin_leadership_page(username):
 
     dash = '<span class="dash-mark">&mdash;</span>'
     summary_html = f"""
-    <div class="panel" style="margin-bottom:16px;">
+    <div class="panel">
       <div class="stat-row">
         <div class="stat-tile"><div class="stat-num">{overall_avg if overall_avg is not None else dash}{'%' if overall_avg is not None else ''}</div><div class="stat-lbl">Avg Uptime Score</div></div>
         <div class="stat-tile"><div class="stat-num">{total_acks}</div><div class="stat-lbl">Acknowledgments</div></div>
