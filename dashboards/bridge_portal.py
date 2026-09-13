@@ -11178,6 +11178,38 @@ def admin_config_leadership_digest_recipients(username):
     return _redirect_msg("/admin/config", message=f"Saved {count} recipient{'s' if count != 1 else ''}" if count else "Recipient list cleared")
 
 
+@app.route("/admin/config/monitoring-alerts", methods=["POST"])
+@require_login
+@require_admin
+def admin_config_monitoring_alerts(username):
+    enabled = request.form.get("enabled") == "1"
+    _set_monitoring_alerts_enabled(enabled)
+    return redirect("/admin/config")
+
+
+@app.route("/admin/config/monitoring-alerts/recipients", methods=["POST"])
+@require_login
+@require_admin
+def admin_config_monitoring_alerts_recipients(username):
+    raw = request.form.get("recipients", "")
+    addrs = _parse_recipient_list(raw)
+    if raw.strip() and not addrs:
+        return _redirect_msg("/admin/config", error="None of that looked like a valid email address - not saved")
+    _set_monitoring_alert_recipients(addrs)
+    count = len(addrs)
+    return _redirect_msg("/admin/config", message=f"Saved {count} recipient{'s' if count != 1 else ''}" if count else "Recipient list cleared")
+
+
+@app.route("/admin/config/monitoring-alerts/test", methods=["POST"])
+@require_login
+@require_admin
+def admin_config_monitoring_alerts_test(username):
+    error = _monitoring_alert_send_test()
+    if error:
+        return _redirect_msg("/admin/config", error=f"Test alert failed: {error}")
+    return _redirect_msg("/admin/config", message=f"Test alert sent to {', '.join(_monitoring_alert_recipients())}")
+
+
 DASHBOARD_VIDEOWALL_SHELL = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -12112,6 +12144,62 @@ def admin_config_page(username):
     </div>
     """
 
+    monitoring_enabled = _monitoring_alerts_enabled()
+    monitoring_recipients = _monitoring_alert_recipients()
+    monitoring_last_critical = _get_app_setting(MONITORING_ALERT_LAST_CRITICAL_KEY)
+    monitoring_last_critical_txt = (
+        datetime.fromtimestamp(float(monitoring_last_critical)).strftime("%Y-%m-%d %I:%M:%S %p")
+        if monitoring_last_critical else "Never"
+    )
+    monitoring_last_digest = _get_app_setting(MONITORING_ALERT_LAST_DIGEST_KEY)
+    monitoring_last_digest_txt = (
+        datetime.fromtimestamp(float(monitoring_last_digest)).strftime("%Y-%m-%d %I:%M:%S %p")
+        if monitoring_last_digest else "Never"
+    )
+    monitoring_alerts_html = f"""
+    <div class="card">
+      <div class="page-header" style="margin:0 0 8px;">
+        <div><h2 style="margin:0; font-size:15px;">Real-Time Monitoring Alerts</h2>
+        <p class="sub" style="margin:4px 0 0;">For people actively watching the systems, not periodic-summary
+        readers - a separate audience and recipient list from the Leadership Digest above. Critical issues
+        (Hyperview/Ooma critical severity, iPRO offline/infrastructure) email within
+        {MONITORING_ALERT_CHECK_INTERVAL_SECONDS // 60} min of first going unacknowledged. Everything else -
+        non-critical issues on those systems, plus all Downtime Workstations issues - batches into a digest
+        every {MONITORING_ALERT_DIGEST_INTERVAL_SECONDS // 60} min for as long as it stays open and
+        unacknowledged. Off by default.</p></div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <form method="post" action="/admin/config/monitoring-alerts/test" style="margin:0;">
+            <button type="submit" class="ghost" style="margin-top:0;" {'disabled title="Add at least one recipient below first"' if not monitoring_recipients else ''}>Send Test Alert Now</button>
+          </form>
+          <form method="post" action="/admin/config/monitoring-alerts" style="margin:0;">
+            <input type="hidden" name="enabled" value="{'0' if monitoring_enabled else '1'}">
+            <button type="submit" class="{'cancel-btn' if monitoring_enabled else ''}" style="{'padding:9px 18px; font-size:14px; margin-top:0;' if monitoring_enabled else 'margin-top:0;'}">
+              {'Disable' if monitoring_enabled else 'Enable'} alerts
+            </button>
+          </form>
+        </div>
+      </div>
+      <div class="table-scroll"><table>
+        {row('Status', 'Enabled' if monitoring_enabled else 'Disabled')}
+        {row('Critical check interval', f'every {MONITORING_ALERT_CHECK_INTERVAL_SECONDS // 60} min')}
+        {row('Digest interval', f'every {MONITORING_ALERT_DIGEST_INTERVAL_SECONDS // 60} min, while unacknowledged')}
+        {row('Sent from', f'{MONITORING_ALERT_MAIL_FROM_NAME} <{MONITORING_ALERT_MAIL_FROM}>')}
+        {row('Last critical alert', monitoring_last_critical_txt)}
+        {row('Last digest', monitoring_last_digest_txt)}
+      </table></div>
+      <div style="padding:16px 20px; border-top:1px solid var(--border);">
+        <form method="post" action="/admin/config/monitoring-alerts/recipients" style="margin:0;">
+          <label for="monitoring-recipients">Recipients</label>
+          <textarea id="monitoring-recipients" name="recipients" rows="4"
+            style="max-width:480px; font-family:inherit;"
+            placeholder="one address per line, or comma-separated">{_esc(chr(10).join(monitoring_recipients))}</textarea>
+          <span class="runbook-hint">{len(monitoring_recipients)} recipient{'s' if len(monitoring_recipients) != 1 else ''} configured &mdash; addresses that don't look valid (no @, no domain) are dropped on save.</span>
+          <button type="submit" style="margin-top:10px;">Save Recipients</button>
+        </form>
+      </div>
+    </div>
+    """
+
     site_cards = [_hyperview_overview_card(), _ipro_overview_card()]
 
     similar_pairs = []
@@ -12154,6 +12242,7 @@ def admin_config_page(username):
     </div>
     {auto_restart_html}
     {leadership_digest_html}
+    {monitoring_alerts_html}
     {similar_sites_html}
     """
     return Response(render_shell("Admin - System Config", body, "admin-config", username), mimetype="text/html")
@@ -12793,17 +12882,21 @@ def _leadership_digest_email_html(data):
 </body></html>"""
 
 
-def _send_leadership_digest_mail(subject, html_body):
+def _send_html_mail(recipients, mail_from, mail_from_name, subject, html_body):
     """Pipes a fully-formed RFC822 message straight into msmtp - see the
-    module docstring above for why (not the `mail`/`mailx` command).
-    Returns None on success, or a short error string to surface to an
-    admin (test-send button, or logged from the scheduler)."""
-    recipients = _leadership_digest_recipients()
+    leadership-digest module docstring above for why (not the `mail`/
+    `mailx` command). Shared by both the leadership digest and the
+    monitoring alert mailer below - pure mechanical send plumbing, not
+    business logic, so unlike the data/schedule/state for each feature
+    (kept separate on purpose) there's no isolation reason to duplicate
+    this part. Returns None on success, or a short error string to
+    surface to an admin (a test-send button, or logged from a
+    scheduler)."""
     if not recipients:
         return "No recipients configured - add some in System Config"
     to_header = ", ".join(recipients)
     message = (
-        f"From: {LEADERSHIP_DIGEST_MAIL_FROM_NAME} <{LEADERSHIP_DIGEST_MAIL_FROM}>\n"
+        f"From: {mail_from_name} <{mail_from}>\n"
         f"To: {to_header}\n"
         f"Subject: {subject}\n"
         "MIME-Version: 1.0\n"
@@ -12823,6 +12916,13 @@ def _send_leadership_digest_mail(subject, html_body):
     except subprocess.TimeoutExpired:
         return "msmtp timed out"
     return None
+
+
+def _send_leadership_digest_mail(subject, html_body):
+    return _send_html_mail(
+        _leadership_digest_recipients(), LEADERSHIP_DIGEST_MAIL_FROM, LEADERSHIP_DIGEST_MAIL_FROM_NAME,
+        subject, html_body,
+    )
 
 
 def _send_leadership_digest_now():
@@ -12875,6 +12975,320 @@ def _run_leadership_digest_loop():
 
 
 threading.Thread(target=_run_leadership_digest_loop, daemon=True).start()
+
+# ---------------------------------------------------------------------------
+# Real-time monitoring alerts - a second, separate audience from the
+# leadership digest above: people actively watching the systems day to day,
+# not periodic-summary readers. Two channels, checked from one loop:
+#
+#   - Critical issues (Hyperview/Ooma: severity == "critical"; iPRO: status
+#     is Offline or Infrastructure Issue - the same rule each system's own
+#     alarm table already highlights rows by, see _severity_row_class and
+#     _ipro_device_rows_html) fire an email within one MONITORING_ALERT_
+#     CHECK_INTERVAL_SECONDS poll (2 min by default) of first being seen
+#     unacknowledged - not on every poll thereafter while it's still open,
+#     only when it's newly critical (tracked via a persisted set of
+#     currently-alerted keys, replaced wholesale each tick so a recovered
+#     or acknowledged issue "forgets" it already alerted and will alert
+#     again if it recurs).
+#   - Everything else - non-critical issues on those three systems, plus
+#     ALL Downtime Workstations issues (that system has no per-issue
+#     severity signal at all to split on) - goes into a digest sent every
+#     MONITORING_ALERT_DIGEST_INTERVAL_SECONDS (15 min by default),
+#     re-sent every interval for as long as an issue stays open AND
+#     unacknowledged (a deliberate nag, matching the existing critical-
+#     alert audio/favicon-badge cue elsewhere in the app persisting until
+#     acknowledged) - skipped entirely on a tick where nothing qualifies,
+#     rather than sending an empty "all clear" every 15 minutes.
+#
+# Downtime is deliberately left out of the 2-minute critical check (it's
+# digest-only either way) so its ping sweep - the one real per-tick cost
+# here, the other three systems are plain HTTP fetches already used
+# elsewhere - only happens once per digest interval, not four times as
+# often for no reason.
+# ---------------------------------------------------------------------------
+MONITORING_ALERT_SETTING_KEY = "monitoring_alerts_enabled"
+MONITORING_ALERT_RECIPIENTS_KEY = "monitoring_alert_recipients"
+MONITORING_ALERT_ACTIVE_CRITICALS_KEY = "monitoring_alert_active_criticals"
+MONITORING_ALERT_LAST_CRITICAL_KEY = "monitoring_alert_last_critical_ts"
+MONITORING_ALERT_LAST_DIGEST_KEY = "monitoring_alert_last_digest_ts"
+_MONITORING_ALERT_RECIPIENTS_ENV_DEFAULT = os.environ.get("MONITORING_ALERT_RECIPIENTS", "")
+MONITORING_ALERT_MAIL_FROM = os.environ.get("MONITORING_ALERT_MAIL_FROM", "infrawatch-alerts@covhlth.com")
+MONITORING_ALERT_MAIL_FROM_NAME = os.environ.get("MONITORING_ALERT_MAIL_FROM_NAME", "InfraWatch Alerts")
+MONITORING_ALERT_CHECK_INTERVAL_SECONDS = int(os.environ.get("MONITORING_ALERT_CHECK_INTERVAL_SECONDS", "120"))
+MONITORING_ALERT_DIGEST_INTERVAL_SECONDS = int(os.environ.get("MONITORING_ALERT_DIGEST_INTERVAL_SECONDS", "900"))
+MONITORING_ALERT_DASHBOARD_URL = os.environ.get("MONITORING_ALERT_DASHBOARD_URL", "")
+
+
+def _monitoring_alerts_enabled():
+    return _get_app_setting(MONITORING_ALERT_SETTING_KEY, "0") == "1"
+
+
+def _set_monitoring_alerts_enabled(enabled):
+    _set_app_setting(MONITORING_ALERT_SETTING_KEY, "1" if enabled else "0")
+
+
+def _monitoring_alert_recipients():
+    raw = _get_app_setting(MONITORING_ALERT_RECIPIENTS_KEY)
+    if raw is None:
+        raw = _MONITORING_ALERT_RECIPIENTS_ENV_DEFAULT
+    return _parse_recipient_list(raw)
+
+
+def _set_monitoring_alert_recipients(addrs):
+    _set_app_setting(MONITORING_ALERT_RECIPIENTS_KEY, ", ".join(addrs))
+
+
+def _monitoring_realtime_issues():
+    """Hyperview/iPRO/Ooma open, unacknowledged issues, normalized to a
+    common shape and classified critical/non-critical - NOT Downtime,
+    see the module docstring above for why. Each system fetched
+    independently; one being unreachable doesn't drop the others."""
+    issues = []
+
+    alarms = _hyperview_active_alarms()
+    for a in alarms or []:
+        if a.get("acknowledged"):
+            continue
+        location, device = a.get("location") or "", a.get("device") or ""
+        issues.append({
+            "system_key": "hyperview", "system_label": "Hyperview",
+            "key": f"hyperview:{a.get('id') or location + '/' + device}",
+            "location": location, "device": device, "message": a.get("alarm") or "",
+            "critical": str(a.get("severity") or "").strip().lower() == "critical",
+        })
+
+    ipro_data = _fetch_ipro_dashboard()
+    for d in (ipro_data or {}).get("devices", []):
+        if d.get("acknowledged"):
+            continue
+        location, device = d.get("location") or "", d.get("device") or ""
+        message = ", ".join(filter(None, [d.get("status"), d.get("detail")]))
+        issues.append({
+            "system_key": "ipro", "system_label": "iPRO Cameras",
+            "key": f"ipro:{location}/{device}",
+            "location": location, "device": device, "message": message,
+            "critical": d.get("status") in ("Offline", "Infrastructure Issue"),
+        })
+
+    ooma_data = _fetch_ooma_dashboard()
+    for a in (ooma_data or {}).get("issues", []):
+        if a.get("acknowledged"):
+            continue
+        account, device = a.get("account") or "", a.get("device") or ""
+        issues.append({
+            "system_key": "ooma", "system_label": "Ooma AirDial",
+            "key": f"ooma:{account}/{device}",
+            "location": account, "device": device, "message": a.get("message") or "",
+            "critical": str(a.get("severity") or "").strip().lower() == "critical",
+        })
+
+    return issues
+
+
+def _monitoring_downtime_open_issues():
+    """Downtime Workstations' currently open, unacknowledged issues - its
+    own fetch+ping+ack-filter (same three steps _downtime_overview_card
+    uses), kept out of _monitoring_realtime_issues so the 2-minute
+    critical-only loop never has to pay for a ping sweep. Always
+    non-critical - this system has no per-issue severity signal to
+    classify on (see the module docstring)."""
+    rows = _fetch_downtime_data()
+    if rows is None:
+        return []
+    candidates = [r for r in rows if r.get("strclassname") == "cssDeviceAlert"]
+    ping_results = _ping_hosts([r.get("strhostname") for r in candidates])
+    acks = _active_downtime_acks()
+    issues = []
+    for r in _downtime_issue_rows(rows, ping_results):
+        hostname = r.get("strhostname") or ""
+        if hostname in acks:
+            continue
+        issues.append({
+            "system_key": "downtime", "system_label": "Downtime Workstations",
+            "key": f"downtime:{hostname}",
+            "location": r.get("strgroupname") or "", "device": hostname,
+            "message": r.get("strhostdesc") or "Not responding to ping, or a queue backlog isn't clearing",
+            "critical": False,
+        })
+    return issues
+
+
+def _monitoring_issue_rows_html(issues):
+    def row(i):
+        badge = (
+            '<span style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;'
+            'background:#faeaee;color:#ae0031;padding:3px 9px;border-radius:20px;white-space:nowrap;">Critical</span>'
+            if i["critical"] else ""
+        )
+        where = _esc(i["location"])
+        if i["device"] and i["device"] != i["location"]:
+            where = f"{where} &middot; {_esc(i['device'])}" if where else _esc(i["device"])
+        return (
+            '<tr>'
+            f'<td style="padding:8px 10px;border-bottom:1px solid #eef2f5;white-space:nowrap;">'
+            f'<span style="font-size:10.5px;text-transform:uppercase;background:#e4edf5;color:#06315e;'
+            f'padding:2px 7px;border-radius:20px;">{_esc(i["system_label"])}</span></td>'
+            f'<td style="padding:8px 10px;border-bottom:1px solid #eef2f5;font-weight:600;">{where}</td>'
+            f'<td style="padding:8px 10px;border-bottom:1px solid #eef2f5;color:#55636e;">{_esc(i["message"])}</td>'
+            f'<td style="padding:8px 10px;border-bottom:1px solid #eef2f5;text-align:right;">{badge}</td>'
+            '</tr>'
+        )
+    return "".join(row(i) for i in issues)
+
+
+def _monitoring_alert_email_html(heading, accent_color, intro, issues):
+    """Shared wrapper for both the critical alert and the digest - same
+    inline-styles-only approach as the leadership digest email (most mail
+    clients strip a <style> block), differing only in heading/accent
+    color/intro copy so a critical alert visually reads as more urgent
+    than a routine digest at a glance."""
+    rows_html = _monitoring_issue_rows_html(issues) if issues else (
+        '<tr><td colspan="4" style="padding:16px 10px;text-align:center;color:#8996a1;">'
+        'No open issues right now.</td></tr>'
+    )
+    table_html = (
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:4px;">'
+        '<tr>'
+        '<th style="text-align:left;padding:6px 10px;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#8996a1;border-bottom:1.5px solid #c5d2da;">System</th>'
+        '<th style="text-align:left;padding:6px 10px;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#8996a1;border-bottom:1.5px solid #c5d2da;">Where</th>'
+        '<th style="text-align:left;padding:6px 10px;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#8996a1;border-bottom:1.5px solid #c5d2da;">Issue</th>'
+        '<th style="border-bottom:1.5px solid #c5d2da;"></th>'
+        '</tr>' + rows_html + '</table>'
+    )
+    dashboard_html = ""
+    if MONITORING_ALERT_DASHBOARD_URL:
+        dashboard_html = (
+            f'<p style="margin-top:20px;"><a href="{_esc(MONITORING_ALERT_DASHBOARD_URL)}" '
+            f'style="background:{accent_color};color:#ffffff;text-decoration:none;padding:11px 22px;border-radius:8px;'
+            f'font-weight:700;font-size:14px;display:inline-block;">Open InfraWatch &rarr;</a></p>'
+        )
+    generated_at = datetime.now().strftime("%A, %B %-d, %Y at %-I:%M %p")
+    return f"""<html><body style="margin:0;padding:0;background:#eef2f5;font-family:'Segoe UI',Arial,Helvetica,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="padding:24px 0;">
+<tr><td align="center">
+<table role="presentation" width="640" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:10px;overflow:hidden;box-shadow:0 1px 3px rgba(15,35,55,0.08);">
+<tr><td style="background:{accent_color};padding:20px 24px;">
+<span style="color:#ffffff;font-size:17px;font-weight:700;">{_esc(heading)}</span><br>
+<span style="color:#ffffff;opacity:0.85;font-size:12.5px;">{_esc(generated_at)}</span>
+</td></tr>
+<tr><td style="padding:22px 24px;color:#16212b;font-size:14px;line-height:1.5;">
+<p style="margin:0 0 14px;">{intro}</p>
+{table_html}
+{dashboard_html}
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body></html>"""
+
+
+def _send_monitoring_alert_mail(subject, html_body):
+    return _send_html_mail(
+        _monitoring_alert_recipients(), MONITORING_ALERT_MAIL_FROM, MONITORING_ALERT_MAIL_FROM_NAME,
+        subject, html_body,
+    )
+
+
+def _monitoring_alert_check_criticals(realtime_issues):
+    """Fires a real-time email for any critical issue that wasn't already
+    in the persisted "currently alerted" set - i.e. only for ones that
+    are newly critical-and-unacknowledged since the last tick, not every
+    poll while one sits open. Replacing that persisted set wholesale each
+    tick (rather than only ever adding to it) is what makes a recovered
+    or acknowledged issue "forgotten" - if it becomes critical again
+    later, it's treated as new and alerts again, same as it should."""
+    current = {i["key"]: i for i in realtime_issues if i["critical"]}
+    try:
+        prev_keys = set(json.loads(_get_app_setting(MONITORING_ALERT_ACTIVE_CRITICALS_KEY, "[]") or "[]"))
+    except ValueError:
+        prev_keys = set()
+    new_keys = set(current) - prev_keys
+    if new_keys:
+        new_issues = [current[k] for k in new_keys]
+        n = len(new_issues)
+        html = _monitoring_alert_email_html(
+            f"InfraWatch Critical Alert - {n} new issue{'s' if n != 1 else ''}", "#ae0031",
+            f"{n} device{'s' if n != 1 else ''} just went critical and {'are' if n != 1 else 'is'} not yet acknowledged:",
+            new_issues,
+        )
+        _send_monitoring_alert_mail(f"[CRITICAL] InfraWatch: {n} new critical issue{'s' if n != 1 else ''}", html)
+        _set_app_setting(MONITORING_ALERT_LAST_CRITICAL_KEY, str(time.time()))
+    _set_app_setting(MONITORING_ALERT_ACTIVE_CRITICALS_KEY, json.dumps(sorted(current)))
+
+
+def _monitoring_alert_run_digest(realtime_issues):
+    non_critical = [i for i in realtime_issues if not i["critical"]] + _monitoring_downtime_open_issues()
+    if non_critical:
+        n = len(non_critical)
+        html = _monitoring_alert_email_html(
+            f"InfraWatch Monitoring Digest - {n} unacknowledged issue{'s' if n != 1 else ''}", "#005a9c",
+            "Still open and unacknowledged as of this check - repeats every "
+            f"{MONITORING_ALERT_DIGEST_INTERVAL_SECONDS // 60} minutes for as long as that stays true:",
+            non_critical,
+        )
+        _send_monitoring_alert_mail(f"InfraWatch Monitoring Digest - {n} unacknowledged issue{'s' if n != 1 else ''}", html)
+    _set_app_setting(MONITORING_ALERT_LAST_DIGEST_KEY, str(time.time()))
+
+
+def _monitoring_alert_send_test():
+    """Sends whatever's actually true right now - a critical-style email
+    if any critical issues are currently open, a digest-style email if
+    any non-critical ones are, or one friendly "nothing open" email if
+    genuinely quiet - so an admin can confirm delivery works without
+    needing to wait for or fake a real incident. Returns the first error
+    encountered, if any, same contract as the leadership digest's."""
+    realtime_issues = _monitoring_realtime_issues()
+    critical = [i for i in realtime_issues if i["critical"]]
+    non_critical = [i for i in realtime_issues if not i["critical"]] + _monitoring_downtime_open_issues()
+    sent_any = False
+    if critical:
+        html = _monitoring_alert_email_html(
+            "InfraWatch Critical Alert (test)", "#ae0031",
+            "Test send - these are currently open critical issues, not necessarily new:", critical,
+        )
+        error = _send_monitoring_alert_mail(f"[TEST] InfraWatch Critical Alert - {len(critical)} currently open", html)
+        if error:
+            return error
+        sent_any = True
+    if non_critical:
+        html = _monitoring_alert_email_html(
+            "InfraWatch Monitoring Digest (test)", "#005a9c",
+            "Test send - these are the issues the next real digest would include:", non_critical,
+        )
+        error = _send_monitoring_alert_mail(f"[TEST] InfraWatch Monitoring Digest - {len(non_critical)} currently open", html)
+        if error:
+            return error
+        sent_any = True
+    if not sent_any:
+        html = _monitoring_alert_email_html(
+            "InfraWatch Monitoring Alert (test)", "#005a9c",
+            "Test send - no open issues right now, so this is just confirming delivery works.", [],
+        )
+        return _send_monitoring_alert_mail("[TEST] InfraWatch Monitoring Alert - no open issues", html)
+    return None
+
+
+def _monitoring_alert_tick():
+    if not _monitoring_alerts_enabled():
+        return
+    realtime_issues = _monitoring_realtime_issues()
+    _monitoring_alert_check_criticals(realtime_issues)
+    last_digest = float(_get_app_setting(MONITORING_ALERT_LAST_DIGEST_KEY, "0") or 0)
+    if time.time() - last_digest >= MONITORING_ALERT_DIGEST_INTERVAL_SECONDS:
+        _monitoring_alert_run_digest(realtime_issues)
+
+
+def _run_monitoring_alert_loop():
+    while True:
+        try:
+            _monitoring_alert_tick()
+        except Exception:
+            pass
+        time.sleep(MONITORING_ALERT_CHECK_INTERVAL_SECONDS)
+
+
+threading.Thread(target=_run_monitoring_alert_loop, daemon=True).start()
 
 
 @app.route("/admin/leadership")
