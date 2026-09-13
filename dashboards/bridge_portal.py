@@ -5429,13 +5429,13 @@ DASHBOARD_EXTRA_CSS = """
   .trend-range-sep { width: 1px; height: 18px; background: var(--border); margin: 0 2px; }
   .trend-selector {
     display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600;
-    color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.04em;
+    color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.04em; flex-wrap: wrap;
   }
   .trend-selector select {
     width: auto; max-width: none; margin: 0; padding: 6px 10px; font-size: 13px;
     font-weight: 400; text-transform: none; letter-spacing: normal; color: var(--text);
   }
-  .trend-sys-checks { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .trend-sys-checks { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; min-width: 0; }
   .trend-sys-check {
     display: inline-flex; align-items: center; gap: 5px; font-size: 13px;
     font-weight: 400; text-transform: none; letter-spacing: normal; color: var(--text); cursor: pointer;
@@ -7863,12 +7863,16 @@ def trends_page(username):
     )
     if metric == "score" and len(wanted) > 1:
         checkbox_keys = list(wanted) + ["combined"]
-        system_selector_html = "".join(
+        # .trend-sys-checks is what actually carries flex-wrap - without
+        # it these were bare inline labels straight inside the "Systems"
+        # <label>, so on a narrow screen the row just ran off the edge
+        # instead of wrapping to a second line.
+        system_selector_html = '<div class="trend-sys-checks">' + "".join(
             f'<label class="trend-sys-check"><input type="checkbox" class="trend-sys-cb" value="{key}"'
             f'{" checked" if key in selected_systems else ""} onchange="updateTrendSystems(this)"> '
             f'{_esc(TRENDS_SYSTEM_LABELS[key])}</label>'
             for key in checkbox_keys
-        )
+        ) + '</div>'
         system_selector_script = """
         <script>
         function updateTrendSystems(cb) {
