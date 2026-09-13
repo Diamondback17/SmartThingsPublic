@@ -55,12 +55,12 @@ app = Flask(__name__)
 # CONFIG
 # ---------------------------------------------------------------------------
 TENANT_URL = os.environ.get("HYPERVIEW_TENANT_URL", "https://covhlth.hyperviewhq.com")
-# NOTE: falls back to the values that were originally hardcoded here so the
-# service keeps running as-is. When you get a chance, set HYPERVIEW_CLIENT_ID
-# / HYPERVIEW_CLIENT_SECRET in the environment (systemd Environment= lines,
-# etc.) and drop the fallback -- credentials shouldn't live in source control.
-CLIENT_ID = os.environ.get("HYPERVIEW_CLIENT_ID", "7ecbda12-6dcb-4ace-b9ea-f2ab44b23486")
-CLIENT_SECRET = os.environ.get("HYPERVIEW_CLIENT_SECRET", "3ff54714-90d4-46ea-9054-545ebc20d87d")
+# No hardcoded fallback - a credential belongs in the environment or in the
+# .env file _load_dotenv() reads above, never in source control. Left unset,
+# these fail startup via _require_config() below rather than silently
+# running on a stale/leaked value.
+CLIENT_ID = os.environ.get("HYPERVIEW_CLIENT_ID")
+CLIENT_SECRET = os.environ.get("HYPERVIEW_CLIENT_SECRET")
 
 CACHE_SECONDS = 2
 ASSET_CACHE_SECONDS = 3600
