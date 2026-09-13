@@ -12163,7 +12163,8 @@ def admin_config_page(username):
         <p class="sub" style="margin:4px 0 0;">For people actively watching the systems, not periodic-summary
         readers - a separate audience and recipient list from the Leadership Digest above. Critical issues
         (Hyperview/Ooma critical severity, iPRO offline/infrastructure) email within
-        {MONITORING_ALERT_CHECK_INTERVAL_SECONDS // 60} min of first going unacknowledged. Everything else -
+        {MONITORING_ALERT_CHECK_INTERVAL_SECONDS // 60} min of first going unacknowledged, then repeat every
+        {MONITORING_CRITICAL_REPEAT_INTERVAL_SECONDS // 60} min for as long as that stays true. Everything else -
         non-critical issues on those systems, plus all Downtime Workstations issues - batches into a digest
         every {MONITORING_ALERT_DIGEST_INTERVAL_SECONDS // 60} min for as long as it stays open and
         unacknowledged. Off by default.</p></div>
@@ -12182,6 +12183,7 @@ def admin_config_page(username):
       <div class="table-scroll"><table>
         {row('Status', 'Enabled' if monitoring_enabled else 'Disabled')}
         {row('Critical check interval', f'every {MONITORING_ALERT_CHECK_INTERVAL_SECONDS // 60} min')}
+        {row('Critical repeat interval', f'every {MONITORING_CRITICAL_REPEAT_INTERVAL_SECONDS // 60} min, while unacknowledged')}
         {row('Digest interval', f'every {MONITORING_ALERT_DIGEST_INTERVAL_SECONDS // 60} min, while unacknowledged')}
         {row('Sent from', f'{MONITORING_ALERT_MAIL_FROM_NAME} <{MONITORING_ALERT_MAIL_FROM}>')}
         {row('Last critical alert', monitoring_last_critical_txt)}
@@ -12986,11 +12988,13 @@ threading.Thread(target=_run_leadership_digest_loop, daemon=True).start()
 #     alarm table already highlights rows by, see _severity_row_class and
 #     _ipro_device_rows_html) fire an email within one MONITORING_ALERT_
 #     CHECK_INTERVAL_SECONDS poll (2 min by default) of first being seen
-#     unacknowledged - not on every poll thereafter while it's still open,
-#     only when it's newly critical (tracked via a persisted set of
-#     currently-alerted keys, replaced wholesale each tick so a recovered
-#     or acknowledged issue "forgets" it already alerted and will alert
-#     again if it recurs).
+#     unacknowledged, then repeat every MONITORING_CRITICAL_REPEAT_
+#     INTERVAL_SECONDS (5 min by default) for as long as it's still open
+#     and unacknowledged - tracked via a persisted per-key last-alerted
+#     timestamp (not just a seen/unseen set), rebuilt from scratch each
+#     tick from whatever's currently critical, so a recovered or
+#     acknowledged issue drops out and starts over (as a fresh "new"
+#     alert, not mid-repeat-cycle) if it recurs later.
 #   - Everything else - non-critical issues on those three systems, plus
 #     ALL Downtime Workstations issues (that system has no per-issue
 #     severity signal at all to split on) - goes into a digest sent every
@@ -13017,6 +13021,7 @@ MONITORING_ALERT_MAIL_FROM = os.environ.get("MONITORING_ALERT_MAIL_FROM", "infra
 MONITORING_ALERT_MAIL_FROM_NAME = os.environ.get("MONITORING_ALERT_MAIL_FROM_NAME", "InfraWatch Alerts")
 MONITORING_ALERT_CHECK_INTERVAL_SECONDS = int(os.environ.get("MONITORING_ALERT_CHECK_INTERVAL_SECONDS", "120"))
 MONITORING_ALERT_DIGEST_INTERVAL_SECONDS = int(os.environ.get("MONITORING_ALERT_DIGEST_INTERVAL_SECONDS", "900"))
+MONITORING_CRITICAL_REPEAT_INTERVAL_SECONDS = int(os.environ.get("MONITORING_CRITICAL_REPEAT_INTERVAL_SECONDS", "300"))
 MONITORING_ALERT_DASHBOARD_URL = os.environ.get("MONITORING_ALERT_DASHBOARD_URL", "")
 
 
@@ -13191,30 +13196,55 @@ def _send_monitoring_alert_mail(subject, html_body):
 
 
 def _monitoring_alert_check_criticals(realtime_issues):
-    """Fires a real-time email for any critical issue that wasn't already
-    in the persisted "currently alerted" set - i.e. only for ones that
-    are newly critical-and-unacknowledged since the last tick, not every
-    poll while one sits open. Replacing that persisted set wholesale each
-    tick (rather than only ever adding to it) is what makes a recovered
-    or acknowledged issue "forgotten" - if it becomes critical again
-    later, it's treated as new and alerts again, same as it should."""
+    """Fires a real-time email for any critical issue that's either brand
+    new (never alerted before) or has gone MONITORING_CRITICAL_REPEAT_
+    INTERVAL_SECONDS since its last alert - so a still-open, still-
+    unacknowledged critical nags on a fixed cadence instead of alerting
+    once and going silent. State is a persisted {key: last_alerted_ts}
+    dict (not just a seen/unseen set) rebuilt from scratch from whatever's
+    currently critical each tick - a key that drops out (recovered or
+    acknowledged) simply isn't carried into the new dict, so if it
+    recurs later it's alerted as new again, starting its own repeat
+    cycle over rather than picking up wherever the old one left off."""
     current = {i["key"]: i for i in realtime_issues if i["critical"]}
     try:
-        prev_keys = set(json.loads(_get_app_setting(MONITORING_ALERT_ACTIVE_CRITICALS_KEY, "[]") or "[]"))
+        prev_state = json.loads(_get_app_setting(MONITORING_ALERT_ACTIVE_CRITICALS_KEY, "{}") or "{}")
+        if not isinstance(prev_state, dict):
+            prev_state = {}
     except ValueError:
-        prev_keys = set()
-    new_keys = set(current) - prev_keys
-    if new_keys:
-        new_issues = [current[k] for k in new_keys]
-        n = len(new_issues)
-        html = _monitoring_alert_email_html(
-            f"InfraWatch Critical Alert - {n} new issue{'s' if n != 1 else ''}", "#ae0031",
-            f"{n} device{'s' if n != 1 else ''} just went critical and {'are' if n != 1 else 'is'} not yet acknowledged:",
-            new_issues,
+        prev_state = {}
+
+    now = time.time()
+    due = []  # (issue, is_new) pairs
+    new_state = {}
+    for key, issue in current.items():
+        last_alerted = prev_state.get(key)
+        if last_alerted is None or (now - last_alerted) >= MONITORING_CRITICAL_REPEAT_INTERVAL_SECONDS:
+            due.append((issue, last_alerted is None))
+            new_state[key] = now
+        else:
+            new_state[key] = last_alerted  # unchanged - not due yet, keep its original alert time
+
+    if due:
+        due_issues = [issue for issue, _ in due]
+        new_count = sum(1 for _, is_new in due if is_new)
+        repeat_count = len(due) - new_count
+        n = len(due_issues)
+        parts = []
+        if new_count:
+            parts.append(f"{new_count} new")
+        if repeat_count:
+            parts.append(f"{repeat_count} still unacknowledged")
+        intro = (
+            f"{' and '.join(parts)} critical issue{'s' if n != 1 else ''} - "
+            f"repeats every {MONITORING_CRITICAL_REPEAT_INTERVAL_SECONDS // 60} min for as long as that stays true:"
         )
-        _send_monitoring_alert_mail(f"[CRITICAL] InfraWatch: {n} new critical issue{'s' if n != 1 else ''}", html)
-        _set_app_setting(MONITORING_ALERT_LAST_CRITICAL_KEY, str(time.time()))
-    _set_app_setting(MONITORING_ALERT_ACTIVE_CRITICALS_KEY, json.dumps(sorted(current)))
+        subject_suffix = f" ({new_count} new)" if new_count and repeat_count else ""
+        html = _monitoring_alert_email_html(f"InfraWatch Critical Alert - {n} issue{'s' if n != 1 else ''}", "#ae0031", intro, due_issues)
+        _send_monitoring_alert_mail(f"[CRITICAL] InfraWatch: {n} critical issue{'s' if n != 1 else ''}{subject_suffix}", html)
+        _set_app_setting(MONITORING_ALERT_LAST_CRITICAL_KEY, str(now))
+
+    _set_app_setting(MONITORING_ALERT_ACTIVE_CRITICALS_KEY, json.dumps(new_state))
 
 
 def _monitoring_alert_run_digest(realtime_issues):
