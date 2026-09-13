@@ -1929,6 +1929,32 @@ PAGE_SHELL = """<!DOCTYPE html>
   button.cancel-btn:hover {{ background: var(--danger-tint); box-shadow: none; }}
   button.ghost {{ border-color: var(--border-bright); background: var(--panel); color: var(--text-dim); font-size: 12px; padding: 8px 14px; box-shadow: none; }}
   button.ghost:hover {{ border-color: var(--teal); color: var(--teal); background: var(--panel); box-shadow: none; }}
+  /* Applied by the global submit handler below the instant a real
+     (non-AJAX, non-prevented) form POST fires, so a slow Hyperview/AD
+     round-trip reads as "working" instead of inviting a second click
+     while the page hasn't navigated yet. Dims + spins in place rather
+     than swapping the label, so it works on every button's own colors
+     without having to special-case ghost/cancel/gradient variants. */
+  button.btn-loading, input[type=submit].btn-loading {{ opacity: 0.72; cursor: default; pointer-events: none; }}
+  button.btn-loading::after, input[type=submit].btn-loading::after {{
+    content: ""; display: inline-block; width: 12px; height: 12px; margin: 0 0 -1px 8px;
+    border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%;
+    animation: btn-spin 0.6s linear infinite;
+  }}
+  @keyframes btn-spin {{ to {{ transform: rotate(360deg); }} }}
+  .msg {{ animation: msg-in 0.2s ease-out; }}
+  .msg.msg-fade-out {{ opacity: 0; transform: translateY(-6px); transition: opacity 0.35s ease, transform 0.35s ease; }}
+  @keyframes msg-in {{ from {{ opacity: 0; transform: translateY(-6px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+  /* One rule instead of hunting down every animation/transition
+     individually (button hover, nav dropdowns, the row-flash on User
+     Activity, this file's own spinner/toast above, anything added later)
+     - respects the OS-level "reduce motion" setting everywhere at once. */
+  @media (prefers-reduced-motion: reduce) {{
+    *, *::before, *::after {{
+      animation-duration: 0.001ms !important; animation-iteration-count: 1 !important;
+      transition-duration: 0.001ms !important; scroll-behavior: auto !important;
+    }}
+  }}
   table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
   th {{ text-align: left; color: var(--text-dim); font-weight: 700; text-transform: uppercase;
     font-size: 11px; letter-spacing: 0.05em; padding: 8px 10px; border-bottom: 1.5px solid var(--border-bright);
@@ -2152,6 +2178,47 @@ PAGE_SHELL = """<!DOCTYPE html>
       document.querySelectorAll('nav.top details.nav-dropdown[open]').forEach(function (d) {{
         if (!d.contains(e.target)) d.open = false;
       }});
+    }});
+  }})();
+  (function () {{
+    // Every real (non-AJAX) form POST on the site - Start/Resume Audit,
+    // Mark Complete, the Auto-Restart toggle, admin forms, etc. Anything
+    // that already calls preventDefault() (the ack-panel's own AJAX
+    // submit handler above) or fails its own onsubmit (a cancelled
+    // confirm() dialog) leaves the event's defaultPrevented flag set by
+    // the time it reaches here, so this only ever fires for a submit
+    // that's actually about to navigate the page away.
+    document.addEventListener('submit', function (e) {{
+      if (e.defaultPrevented) return;
+      var form = e.target;
+      if (!(form instanceof HTMLFormElement) || form.hasAttribute('data-no-spinner')) return;
+      var btn = form.querySelector('button[type="submit"], input[type="submit"]');
+      if (!btn || btn.disabled) return;
+      btn.classList.add('btn-loading');
+      btn.disabled = true;
+    }});
+    // A back/forward navigation into a bfcache'd page can restore a form
+    // whose button this same handler disabled right before the user
+    // navigated away - without this it would stay stuck disabled forever.
+    window.addEventListener('pageshow', function (e) {{
+      if (!e.persisted) return;
+      document.querySelectorAll('button.btn-loading, input.btn-loading').forEach(function (btn) {{
+        btn.classList.remove('btn-loading');
+        btn.disabled = false;
+      }});
+    }});
+  }})();
+  (function () {{
+    // Success confirmations (a completed audit, a saved setting) don't
+    // need to sit on screen until the next page load pushes them out -
+    // fading them on their own after a few seconds reads as "acknowledged
+    // and done" rather than a banner someone has to notice and dismiss.
+    // Errors stay put; those are worth requiring a look at.
+    document.querySelectorAll('.msg.ok').forEach(function (el) {{
+      setTimeout(function () {{
+        el.classList.add('msg-fade-out');
+        setTimeout(function () {{ el.remove(); }}, 400);
+      }}, 4000);
     }});
   }})();
   (function () {{
@@ -7200,10 +7267,14 @@ def rack_audit_page(username):
         font-weight: 700; font-size: 14px; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,0.15);
         transition: filter 0.1s ease; }}
       .ra-start-btn:hover {{ filter: brightness(1.08); }}
-      .ra-start-card.ra-resume {{ background: linear-gradient(135deg, var(--warn-tint, #fdf0d5), var(--panel)); border-color: var(--warn); }}
+      .ra-start-card.ra-resume {{ position: relative; background: linear-gradient(135deg, var(--warn-tint, #fdf0d5), var(--panel)); border-color: var(--warn); }}
       .ra-start-card.ra-resume .ra-start-eyebrow {{ color: var(--warn-dark, #8a5a00); }}
       .ra-start-card.ra-resume .ra-start-btn {{ background: var(--warn); color: #1a1200; }}
       .ra-resume-site {{ color: var(--text-faint); font-weight: 400; }}
+      .ra-resume-dismiss {{ position: absolute; top: 8px; right: 10px; background: transparent; border: none;
+        box-shadow: none; margin: 0; padding: 3px 8px; font-size: 17px; line-height: 1;
+        color: var(--warn-dark, #8a5a00); cursor: pointer; border-radius: 6px; }}
+      .ra-resume-dismiss:hover {{ background: rgba(0,0,0,0.07); }}
 
       .ra-filter-tile {{ cursor: pointer; transition: box-shadow 0.15s ease, transform 0.1s ease; }}
       .ra-filter-tile:hover {{ box-shadow: 0 0 0 2px var(--border-bright) inset; }}
@@ -7250,6 +7321,9 @@ def rack_audit_page(username):
       <div class="stat-row">{stat_row}</div>
     </div>
     <div class="panel ra-start-card{' ra-resume' if pending else ''}">
+      {'''<form method="POST" action="/tools/rack-audit/skip" style="margin:0;">
+        <button class="ra-resume-dismiss" type="submit" data-no-spinner title="Dismiss - the rack itself is unchanged, still overdue" aria-label="Dismiss resume reminder">&times;</button>
+      </form>''' if pending else ''}
       <div>
         <div class="ra-start-eyebrow">{'Audit In Progress' if pending else 'Next Audit'}</div>
         <p class="ra-start-copy">{ra_start_copy}</p>
@@ -7417,6 +7491,19 @@ def rack_audit_start(username):
     </div>
     """
     return Response(render_shell("Rack Audit", body, "rack-audit", username), mimetype="text/html")
+
+
+@app.route("/tools/rack-audit/skip", methods=["POST"])
+@require_login
+def rack_audit_skip(username):
+    """Dismisses the "Resume Audit" reminder without touching the rack
+    itself - it's still overdue in Hyperview and _rack_audit_next will
+    hand it right back out on the next Start Next Audit click, same as
+    before it was ever started. This only clears the session's memory
+    of "you were mid-walk on this one", for someone who genuinely wants
+    the plain generic card back instead of the resume prompt."""
+    session.pop("rack_audit_pending", None)
+    return redirect("/tools/rack-audit")
 
 
 @app.route("/tools/rack-audit/complete", methods=["POST"])
