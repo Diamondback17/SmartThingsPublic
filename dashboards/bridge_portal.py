@@ -7052,6 +7052,23 @@ def rack_audit_page(username):
 
     racks, error = _rack_audit_scope_racks(sites)
     top_sites_html = ""
+    # A rack someone started auditing (POSTed /tools/rack-audit/start for)
+    # but hasn't marked complete yet - offered back here as "Resume Audit"
+    # instead of the generic "Start Next Audit" so navigating away mid-walk
+    # doesn't feel like starting over. Cross-checked against the live
+    # compliance list (not just trusted from the session) so a rack that
+    # someone else already audited, or that got deleted, doesn't get
+    # offered as still in progress.
+    pending = session.get("rack_audit_pending")
+    if pending and not error:
+        still_pending = any(
+            r.get("id") == pending.get("rack_id")
+            and (r.get("compliance") or {}).get("status") in ("overdue", "never_audited", "due_soon")
+            for r in racks
+        )
+        if not still_pending:
+            session.pop("rack_audit_pending", None)
+            pending = None
     if error:
         needs_attention_html = f'<div class="msg err">{_esc(error)}</div>'
         counts = {}
@@ -7158,6 +7175,14 @@ def rack_audit_page(username):
         )
     )
 
+    if pending:
+        ra_start_copy = (
+            f'{_esc(pending["rack_name"])} <span class="ra-resume-site">&middot; {_esc(pending["site_path"])}</span>'
+            f' &mdash; started {_format_duration(time.time() - pending["started_at"])} ago'
+        )
+    else:
+        ra_start_copy = "We'll pick the most overdue rack in your scope for you."
+
     body = f"""
     <div class="page-header">
       <div>
@@ -7175,6 +7200,10 @@ def rack_audit_page(username):
         font-weight: 700; font-size: 14px; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,0.15);
         transition: filter 0.1s ease; }}
       .ra-start-btn:hover {{ filter: brightness(1.08); }}
+      .ra-start-card.ra-resume {{ background: linear-gradient(135deg, var(--warn-tint, #fdf0d5), var(--panel)); border-color: var(--warn); }}
+      .ra-start-card.ra-resume .ra-start-eyebrow {{ color: var(--warn-dark, #8a5a00); }}
+      .ra-start-card.ra-resume .ra-start-btn {{ background: var(--warn); color: #1a1200; }}
+      .ra-resume-site {{ color: var(--text-faint); font-weight: 400; }}
 
       .ra-filter-tile {{ cursor: pointer; transition: box-shadow 0.15s ease, transform 0.1s ease; }}
       .ra-filter-tile:hover {{ box-shadow: 0 0 0 2px var(--border-bright) inset; }}
@@ -7220,13 +7249,13 @@ def rack_audit_page(username):
     <div class="panel">
       <div class="stat-row">{stat_row}</div>
     </div>
-    <div class="panel ra-start-card">
+    <div class="panel ra-start-card{' ra-resume' if pending else ''}">
       <div>
-        <div class="ra-start-eyebrow">Next Audit</div>
-        <p class="ra-start-copy">We'll pick the most overdue rack in your scope for you.</p>
+        <div class="ra-start-eyebrow">{'Audit In Progress' if pending else 'Next Audit'}</div>
+        <p class="ra-start-copy">{ra_start_copy}</p>
       </div>
       <form method="POST" action="/tools/rack-audit/start" style="margin:0;">
-        <button class="ra-start-btn" type="submit">Start Next Audit &rarr;</button>
+        <button class="ra-start-btn" type="submit">{'Resume Audit &rarr;' if pending else 'Start Next Audit &rarr;'}</button>
       </form>
     </div>
     {top_sites_html}
@@ -7289,6 +7318,16 @@ def rack_audit_start(username):
         return Response(render_shell("Rack Audit", body, "rack-audit", username), mimetype="text/html")
 
     rack, assets = result
+    # Remembered so the overview page can offer "Resume Audit" naming this
+    # specific rack instead of a generic "Start Next Audit" - _rack_audit_next
+    # is deterministic (same most-overdue rack until marked complete), so
+    # this is really just making that already-deterministic behavior visible
+    # rather than a promise the button will change targets.
+    session["rack_audit_pending"] = {
+        "rack_id": rack["id"], "rack_name": rack["name"] or rack["id"],
+        "site_path": rack.get("site_path") or rack.get("site") or "",
+        "started_at": time.time(),
+    }
     pdf_filename_js = json.dumps(_rack_audit_pdf_filename(rack["name"] or rack["id"], username))
     asset_rows = "".join(
         f'<tr><td>{a["u_location"] if a.get("u_location") is not None else "&mdash;"}</td>'
@@ -7401,6 +7440,8 @@ def rack_audit_complete_action(username):
         _log_maintenance_action("hyperview", "rack_audited", rack_name, "rack", None, username)
     except Exception:
         pass
+    if (session.get("rack_audit_pending") or {}).get("rack_id") == rack_id:
+        session.pop("rack_audit_pending", None)
 
     message = f"Marked {rack_name} audited"
     delete_problem = None
@@ -12107,6 +12148,9 @@ def admin_activity_page(username):
     display_users = sorted(by_user.items(), key=lambda kv: -kv[1]["total"]) if show_key == "all" else human_users
     display_total = sum(u["total"] for _name, u in display_users)
 
+    def _user_row_anchor(name):
+        return "ua-row-" + re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
     def _user_row(name, u):
         systems_txt = ", ".join(f"{s} ({c})" for s, c in sorted(u["systems"].items(), key=lambda kv: -kv[1]))
         last_active = datetime.fromtimestamp(u["last_ts"]).strftime("%Y-%m-%d %I:%M %p")
@@ -12118,7 +12162,7 @@ def admin_activity_page(username):
         )
         name_html = f'{_esc(name)} <span class="tag">System</span>' if u["is_system"] else _esc(name)
         return (
-            f"<tr><td>{name_html}</td>"
+            f"<tr id=\"{_user_row_anchor(name)}\"><td>{name_html}</td>"
             f"<td class=\"n\">{u['total']}</td>"
             f"<td>{share_html}</td>"
             f"<td class=\"n\">{u.get('acknowledged', 0)}</td>"
@@ -12153,7 +12197,16 @@ def admin_activity_page(username):
             balance_txt, balance_cls = "Uneven", " balance-warn"
         else:
             balance_txt, balance_cls = "Balanced", " balance-good"
-        balance_html = f'<span class="balance-tag{balance_cls}">{_esc(balance_txt)}</span>'
+        # Flagged (Uneven/Concentrated) jumps straight to the row it's
+        # actually about instead of leaving the reader to scan the whole
+        # table for whoever's over - "Balanced"/single-user has no one row
+        # to point at, so those stay plain text.
+        if balance_cls in (" balance-warn", " balance-bad"):
+            balance_html = (
+                f'<a href="#{_user_row_anchor(top_name)}" class="balance-tag{balance_cls}">{_esc(balance_txt)}</a>'
+            )
+        else:
+            balance_html = f'<span class="balance-tag{balance_cls}">{_esc(balance_txt)}</span>'
 
     ratio_stats_html = f"""
     <div class="panel">
@@ -12182,10 +12235,18 @@ def admin_activity_page(username):
       .share-bar-fill.over {{ background:var(--red, #c0392b); }}
       .share-pct {{ font-variant-numeric:tabular-nums; font-size:12px; color:var(--text-faint); min-width:34px; text-align:right; }}
       .balance-row {{ margin-top:2px; padding:0 10px 10px; font-size:13px; color:var(--text-faint); }}
-      .balance-tag {{ display:inline-block; padding:2px 9px; border-radius:999px; font-weight:700; font-size:12px; margin-left:4px; }}
+      .balance-tag {{ display:inline-block; padding:2px 9px; border-radius:999px; font-weight:700; font-size:12px; margin-left:4px;
+        text-decoration:none; }}
       .balance-tag.balance-good {{ background:var(--teal-tint); color:var(--teal-dark); }}
       .balance-tag.balance-warn {{ background:#fdf0d5; color:#8a5a00; }}
       .balance-tag.balance-bad {{ background:#fbe2e2; color:#8a1f1f; }}
+      a.balance-tag {{ cursor:pointer; }}
+      a.balance-tag:hover {{ filter:brightness(0.95); }}
+      table tr:target {{ animation: ua-row-flash 1.6s ease-out; }}
+      @keyframes ua-row-flash {{
+        from {{ background: var(--teal-tint); }}
+        to {{ background: transparent; }}
+      }}
     </style>
     <div class="card">
       <div class="trend-range-row">{range_buttons}</div>
