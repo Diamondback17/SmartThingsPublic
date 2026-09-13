@@ -1694,6 +1694,24 @@ PAGE_SHELL = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="icon" type="image/png" href="data:image/png;base64,{favicon_b64}">
 <title>{title} - InfraWatch</title>
+<script>
+  // Several dashboards auto-refresh themselves via a plain location.reload()
+  // on a timer (DASHBOARD_AUTO_REFRESH_SCRIPT etc.) - the .wrap fade-in
+  // below is meant to smooth over navigating to a different page, not to
+  // replay itself every 30-60s on a page that's just refreshing its own
+  // data. Reload is the one navigation type that's never "arriving
+  // somewhere new", so it's the one case worth suppressing - checked here,
+  // synchronously, before the stylesheet below is even parsed, so the
+  // class is already on <html> by the time the animation would start.
+  (function () {{
+    try {{
+      var nav = performance.getEntriesByType('navigation')[0];
+      if (nav && nav.type === 'reload') {{
+        document.documentElement.classList.add('no-page-transition');
+      }}
+    }} catch (e) {{}}
+  }})();
+</script>
 <style>
   :root {{
     --bg: #eef2f5; --panel: #ffffff; --panel-raised: #f6f9fb;
@@ -1760,6 +1778,10 @@ PAGE_SHELL = """<!DOCTYPE html>
      in, so moving between pages reads as one app rather than a stack of
      flat server-rendered documents. */
   @keyframes page-fade-in {{ from {{ opacity: 0; transform: translateY(3px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+  /* Set synchronously in <head>, above, before this stylesheet is even
+     parsed - a dashboard reloading itself every 30-60s isn't "arriving
+     somewhere new" each time, so the fade shouldn't replay on it. */
+  html.no-page-transition .wrap {{ animation: none; }}
   .breadcrumb {{ font-size: 12.5px; color: var(--text-faint); margin: 0 0 10px; display: flex; align-items: center; gap: 6px; }}
   .breadcrumb .crumb-current {{ color: var(--text-dim); font-weight: 600; }}
   .breadcrumb .crumb-sep {{ color: var(--border-bright); }}
