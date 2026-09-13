@@ -12791,26 +12791,39 @@ def _leadership_digest_email_html(data):
     block or external CSS) since most mail clients strip or ignore a
     <style> tag - matches InfraWatch's own teal branding rather than
     inheriting any other alert email's color scheme, since this digest
-    isn't an alert."""
+    isn't an alert. Fluid, not fixed-width, top to bottom: the outer
+    card uses width="100%" with a max-width rather than a bare pixel
+    width, and the stat row is a 2-per-line grid rather than 4 across -
+    a fixed-width table this size runs well past a phone's screen with
+    no way to see the rest of it short of scrolling sideways, and most
+    of this audience is reading it on one."""
     def stat_cell(value, label):
         return (
-            f'<td style="padding:10px 14px;text-align:center;border-right:1px solid #dee6ec;">'
+            f'<td width="50%" style="padding:10px 14px;text-align:center;">'
             f'<div style="font-size:20px;font-weight:700;color:#16212b;">{value}</div>'
             f'<div style="font-size:10.5px;text-transform:uppercase;letter-spacing:0.04em;color:#8996a1;margin-top:2px;">{_esc(label)}</div>'
             f'</td>'
         )
 
     dash = "&mdash;"
-    summary_cells = "".join([
-        stat_cell(f"{data['overall_avg']}%" if data["overall_avg"] is not None else dash, "Avg Uptime"),
-        stat_cell(data["total_acks"], "Acknowledgments"),
-        stat_cell(data["total_incidents"], "Tied to Incident #"),
-        stat_cell(data["total_restarts"], "Service Restarts"),
-    ])
+    stats = [
+        (f"{data['overall_avg']}%" if data["overall_avg"] is not None else dash, "Avg Uptime"),
+        (data["total_acks"], "Acknowledgments"),
+        (data["total_incidents"], "Tied to Incident #"),
+        (data["total_restarts"], "Service Restarts"),
+    ]
+    # Two per row rather than one long row of four - halves the minimum
+    # width this needs before anything gets cramped, at the cost of a
+    # little extra vertical space nobody reading an email minds spending.
+    stat_rows = "".join(
+        f'<tr style="border-bottom:1px solid #dee6ec;">{stat_cell(*stats[i])}'
+        f'<td width="1" style="border-left:1px solid #dee6ec;"></td>{stat_cell(*stats[i + 1])}</tr>'
+        for i in range(0, len(stats), 2)
+    )
     summary_html = (
         f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
         f'style="border:1px solid #dee6ec;border-radius:6px;overflow:hidden;margin-bottom:18px;">'
-        f'<tr>{summary_cells}</tr></table>'
+        f'{stat_rows}</table>'
     )
 
     def system_row(key):
@@ -12829,16 +12842,27 @@ def _leadership_digest_email_html(data):
         )
 
     systems_table = (
-        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:18px;">'
+        # overflow-x:auto so an actual data table (comparing 4 systems'
+        # numbers is genuinely tabular - unlike the issue lists below,
+        # there's no good "stacked block" substitute here) can still be
+        # read in full on a narrow screen via a sideways swipe instead of
+        # clipping columns off entirely, once its natural width exceeds
+        # the fluid card around it.
+        '<div style="overflow-x:auto;">'
+        '<table role="presentation" cellpadding="0" cellspacing="0" style="margin-bottom:18px;min-width:100%;">'
         '<tr>'
-        '<th style="text-align:left;padding:6px 10px;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#8996a1;border-bottom:1.5px solid #c5d2da;">System</th>'
-        '<th style="text-align:right;padding:6px 10px;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#8996a1;border-bottom:1.5px solid #c5d2da;">Avg Uptime</th>'
-        '<th style="text-align:right;padding:6px 10px;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#8996a1;border-bottom:1.5px solid #c5d2da;">Acks</th>'
-        '<th style="text-align:right;padding:6px 10px;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#8996a1;border-bottom:1.5px solid #c5d2da;">MTTA</th>'
-        '<th style="text-align:right;padding:6px 10px;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#8996a1;border-bottom:1.5px solid #c5d2da;">MTTR</th>'
+        '<th style="text-align:left;padding:6px 10px;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#8996a1;border-bottom:1.5px solid #c5d2da;white-space:nowrap;">System</th>'
+        '<th style="text-align:right;padding:6px 10px;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#8996a1;border-bottom:1.5px solid #c5d2da;white-space:nowrap;">Avg Uptime</th>'
+        '<th style="text-align:right;padding:6px 10px;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#8996a1;border-bottom:1.5px solid #c5d2da;white-space:nowrap;">Acks</th>'
+        '<th style="text-align:right;padding:6px 10px;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#8996a1;border-bottom:1.5px solid #c5d2da;white-space:nowrap;">MTTA</th>'
+        '<th style="text-align:right;padding:6px 10px;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#8996a1;border-bottom:1.5px solid #c5d2da;white-space:nowrap;">MTTR</th>'
         '</tr>'
         + "".join(system_row(k) for k in data["system_keys"])
-        + '</table>'
+        + '</table></div>'
+        # A clean-edged cutoff with no visible scrollbar (typical on a
+        # phone) reads as "that's the whole table," not "swipe for more" -
+        # spell it out rather than letting MTTR quietly go unseen.
+        '<div style="font-size:10.5px;color:#8996a1;margin:-14px 0 18px;">Swipe to see all columns &rarr;</div>'
     )
 
     if data["top_targets"]:
@@ -12867,7 +12891,7 @@ def _leadership_digest_email_html(data):
     return f"""<html><body style="margin:0;padding:0;background:#eef2f5;font-family:'Segoe UI',Arial,Helvetica,sans-serif;">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="padding:24px 0;">
 <tr><td align="center">
-<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:10px;overflow:hidden;box-shadow:0 1px 3px rgba(15,35,55,0.08);">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;table-layout:fixed;background:#ffffff;border-radius:10px;overflow:hidden;box-shadow:0 1px 3px rgba(15,35,55,0.08);">
 <tr><td style="background:linear-gradient(135deg,#06315e,#005a9c);padding:20px 24px;">
 <span style="color:#ffffff;font-size:17px;font-weight:700;">InfraWatch Leadership Digest</span><br>
 <span style="color:#cfe0ee;font-size:12.5px;">Last {data['range_days']} days &middot; generated {_esc(generated_at)}</span>
@@ -13120,46 +13144,42 @@ def _monitoring_downtime_open_issues():
 
 
 def _monitoring_issue_rows_html(issues):
+    # A row-per-issue block, not a 4-column table - a real column layout
+    # here (System | Where | Issue | badge) is exactly what forced the
+    # actual "what's wrong" text off the right edge of a phone screen: the
+    # same lesson learned building Rack Audit's Needs Attention list.
+    # Each block stacks full-width instead, so it just wraps.
     def row(i):
         badge = (
             '<span style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;'
-            'background:#faeaee;color:#ae0031;padding:3px 9px;border-radius:20px;white-space:nowrap;">Critical</span>'
+            'background:#faeaee;color:#ae0031;padding:3px 9px;border-radius:20px;white-space:nowrap;'
+            'margin-left:8px;">Critical</span>'
             if i["critical"] else ""
         )
         where = _esc(i["location"])
         if i["device"] and i["device"] != i["location"]:
             where = f"{where} &middot; {_esc(i['device'])}" if where else _esc(i["device"])
         return (
-            '<tr>'
-            f'<td style="padding:8px 10px;border-bottom:1px solid #eef2f5;white-space:nowrap;">'
+            '<div style="border-left:4px solid #dee6ec;background:#f8f9fa;padding:10px 14px;'
+            'margin-bottom:8px;border-radius:0 4px 4px 0;">'
             f'<span style="font-size:10.5px;text-transform:uppercase;background:#e4edf5;color:#06315e;'
-            f'padding:2px 7px;border-radius:20px;">{_esc(i["system_label"])}</span></td>'
-            f'<td style="padding:8px 10px;border-bottom:1px solid #eef2f5;font-weight:600;">{where}</td>'
-            f'<td style="padding:8px 10px;border-bottom:1px solid #eef2f5;color:#55636e;">{_esc(i["message"])}</td>'
-            f'<td style="padding:8px 10px;border-bottom:1px solid #eef2f5;text-align:right;">{badge}</td>'
-            '</tr>'
+            f'padding:2px 7px;border-radius:20px;">{_esc(i["system_label"])}</span>{badge}'
+            f'<div style="font-weight:700;font-size:14px;color:#16212b;margin-top:6px;">{where}</div>'
+            f'<div style="color:#55636e;font-size:13px;margin-top:2px;">{_esc(i["message"])}</div>'
+            '</div>'
         )
     return "".join(row(i) for i in issues)
 
 
 def _monitoring_alert_email_html(heading, accent_color, intro, issues):
     """Shared wrapper for both the critical alert and the digest - same
-    inline-styles-only approach as the leadership digest email (most mail
-    clients strip a <style> block), differing only in heading/accent
+    inline-styles-only, fluid-not-fixed-width approach as the leadership
+    digest email (most mail clients strip a <style> block, and most of
+    this audience reads on a phone), differing only in heading/accent
     color/intro copy so a critical alert visually reads as more urgent
     than a routine digest at a glance."""
-    rows_html = _monitoring_issue_rows_html(issues) if issues else (
-        '<tr><td colspan="4" style="padding:16px 10px;text-align:center;color:#8996a1;">'
-        'No open issues right now.</td></tr>'
-    )
-    table_html = (
-        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:4px;">'
-        '<tr>'
-        '<th style="text-align:left;padding:6px 10px;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#8996a1;border-bottom:1.5px solid #c5d2da;">System</th>'
-        '<th style="text-align:left;padding:6px 10px;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#8996a1;border-bottom:1.5px solid #c5d2da;">Where</th>'
-        '<th style="text-align:left;padding:6px 10px;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#8996a1;border-bottom:1.5px solid #c5d2da;">Issue</th>'
-        '<th style="border-bottom:1.5px solid #c5d2da;"></th>'
-        '</tr>' + rows_html + '</table>'
+    table_html = _monitoring_issue_rows_html(issues) if issues else (
+        '<p style="padding:16px 10px;text-align:center;color:#8996a1;margin:0;">No open issues right now.</p>'
     )
     dashboard_html = ""
     if MONITORING_ALERT_DASHBOARD_URL:
@@ -13172,7 +13192,7 @@ def _monitoring_alert_email_html(heading, accent_color, intro, issues):
     return f"""<html><body style="margin:0;padding:0;background:#eef2f5;font-family:'Segoe UI',Arial,Helvetica,sans-serif;">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="padding:24px 0;">
 <tr><td align="center">
-<table role="presentation" width="640" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:10px;overflow:hidden;box-shadow:0 1px 3px rgba(15,35,55,0.08);">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:640px;table-layout:fixed;background:#ffffff;border-radius:10px;overflow:hidden;box-shadow:0 1px 3px rgba(15,35,55,0.08);">
 <tr><td style="background:{accent_color};padding:20px 24px;">
 <span style="color:#ffffff;font-size:17px;font-weight:700;">{_esc(heading)}</span><br>
 <span style="color:#ffffff;opacity:0.85;font-size:12.5px;">{_esc(generated_at)}</span>
