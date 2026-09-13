@@ -11157,7 +11157,25 @@ def admin_config_leadership_digest_test(username):
     error = _send_leadership_digest_now()
     if error:
         return _redirect_msg("/admin/config", error=f"Test digest failed: {error}")
-    return _redirect_msg("/admin/config", message=f"Test digest sent to {', '.join(LEADERSHIP_DIGEST_RECIPIENTS)}")
+    return _redirect_msg("/admin/config", message=f"Test digest sent to {', '.join(_leadership_digest_recipients())}")
+
+
+@app.route("/admin/config/leadership-digest/recipients", methods=["POST"])
+@require_login
+@require_admin
+def admin_config_leadership_digest_recipients(username):
+    raw = request.form.get("recipients", "")
+    addrs = _parse_recipient_list(raw)
+    # A non-empty submission that parsed down to nothing is someone who
+    # typed something that doesn't look like an address at all (a typo, a
+    # name with no @) - worth telling them rather than silently saving an
+    # empty list and leaving them to wonder why the digest stopped going
+    # anywhere. A genuinely empty box (clearing it on purpose) still saves.
+    if raw.strip() and not addrs:
+        return _redirect_msg("/admin/config", error="None of that looked like a valid email address - not saved")
+    _set_leadership_digest_recipients(addrs)
+    count = len(addrs)
+    return _redirect_msg("/admin/config", message=f"Saved {count} recipient{'s' if count != 1 else ''}" if count else "Recipient list cleared")
 
 
 DASHBOARD_VIDEOWALL_SHELL = """<!DOCTYPE html>
@@ -12053,7 +12071,7 @@ def admin_config_page(username):
     digest_last_sent_txt = (
         datetime.fromtimestamp(digest_last_sent).strftime("%Y-%m-%d %I:%M:%S %p") if digest_last_sent else "Never"
     )
-    digest_recipients_txt = ", ".join(LEADERSHIP_DIGEST_RECIPIENTS) if LEADERSHIP_DIGEST_RECIPIENTS else "None configured (set LEADERSHIP_DIGEST_RECIPIENTS)"
+    digest_recipients = _leadership_digest_recipients()
     digest_day_label = LEADERSHIP_DIGEST_DAY.capitalize()
     leadership_digest_html = f"""
     <div class="card">
@@ -12061,10 +12079,10 @@ def admin_config_page(username):
         <div><h2 style="margin:0; font-size:15px;">Leadership Digest Email</h2>
         <p class="sub" style="margin:4px 0 0;">A periodic summary of the Leadership Dashboard's numbers -
         uptime, acknowledgments, MTTA/MTTR per system - sent to people who don't open the portal themselves.
-        Off by default. Recipients and schedule are set via environment variables, not here.</p></div>
+        Off by default. Schedule and sender are set via environment variables; recipients are managed below.</p></div>
         <div style="display:flex; gap:8px; flex-wrap:wrap;">
           <form method="post" action="/admin/config/leadership-digest/test" style="margin:0;">
-            <button type="submit" class="ghost" style="margin-top:0;" {'disabled title="Configure LEADERSHIP_DIGEST_RECIPIENTS first"' if not LEADERSHIP_DIGEST_RECIPIENTS else ''}>Send Test Digest Now</button>
+            <button type="submit" class="ghost" style="margin-top:0;" {'disabled title="Add at least one recipient below first"' if not digest_recipients else ''}>Send Test Digest Now</button>
           </form>
           <form method="post" action="/admin/config/leadership-digest" style="margin:0;">
             <input type="hidden" name="enabled" value="{'0' if digest_enabled else '1'}">
@@ -12076,12 +12094,21 @@ def admin_config_page(username):
       </div>
       <div class="table-scroll"><table>
         {row('Status', 'Enabled' if digest_enabled else 'Disabled')}
-        {row('Recipients', digest_recipients_txt)}
         {row('Schedule', f'Every {digest_day_label} at {LEADERSHIP_DIGEST_HOUR:02d}:00 (server-local time)')}
         {row('Range summarized', f'Last {LEADERSHIP_RANGE_HOURS[LEADERSHIP_DIGEST_RANGE_KEY] // 24} days')}
         {row('Sent from', f'{LEADERSHIP_DIGEST_MAIL_FROM_NAME} <{LEADERSHIP_DIGEST_MAIL_FROM}>')}
         {row('Last sent', digest_last_sent_txt)}
       </table></div>
+      <div style="padding:16px 20px; border-top:1px solid var(--border);">
+        <form method="post" action="/admin/config/leadership-digest/recipients" style="margin:0;">
+          <label for="digest-recipients">Recipients</label>
+          <textarea id="digest-recipients" name="recipients" rows="4"
+            style="max-width:480px; font-family:inherit;"
+            placeholder="one address per line, or comma-separated">{_esc(chr(10).join(digest_recipients))}</textarea>
+          <span class="runbook-hint">{len(digest_recipients)} recipient{'s' if len(digest_recipients) != 1 else ''} configured &mdash; addresses that don't look valid (no @, no domain) are dropped on save.</span>
+          <button type="submit" style="margin-top:10px;">Save Recipients</button>
+        </form>
+      </div>
     </div>
     """
 
@@ -12535,23 +12562,60 @@ LEADERSHIP_DEFAULT_RANGE = "30d"
 # ---------------------------------------------------------------------------
 # Leadership digest email - a periodic (default: weekly) summary of the same
 # numbers the Leadership Dashboard shows on screen, sent to people who don't
-# open the portal themselves. Recipients/schedule/mail relay are read from
-# the environment (matching how every other external-integration setting in
-# this file - HYPERVIEW_BASE_URL, LDAP_*, AUTO_RESTART_* - is configured),
-# not editable in the UI; enabling/disabling it and seeing when it last went
-# out live in app_settings (the same generic KV table the auto-restart
-# toggle already uses) since that's a runtime on/off switch, not deployment
-# config. Sent via msmtp (piped a fully-formed message, not the `mail`/
-# `mailx` command - `mail -a` for a raw header isn't reliably "add this
-# header" across implementations, which silently degrades an HTML email to
-# plain text on some builds) since that's this org's already-working mail
-# relay setup elsewhere in the environment.
+# open the portal themselves. Mail relay/schedule are read from the
+# environment (matching how every other external-integration setting in this
+# file - HYPERVIEW_BASE_URL, LDAP_*, AUTO_RESTART_* - is configured), not
+# editable in the UI. Recipients are the one exception - unlike a base URL or
+# an LDAP setting, the recipient list is something an admin plausibly wants
+# to change often (someone joins/leaves leadership) without needing a
+# redeploy, so it's editable from System Config and lives in app_settings
+# (the same generic KV table the auto-restart toggle and the enabled/
+# last-sent state below already use) - LEADERSHIP_DIGEST_RECIPIENTS is only
+# the seed value the first time this runs with nothing saved yet. Sent via
+# msmtp (piped a fully-formed message, not the `mail`/`mailx` command -
+# `mail -a` for a raw header isn't reliably "add this header" across
+# implementations, which silently degrades an HTML email to plain text on
+# some builds) since that's this org's already-working mail relay setup
+# elsewhere in the environment.
 # ---------------------------------------------------------------------------
 LEADERSHIP_DIGEST_SETTING_KEY = "leadership_digest_enabled"
 LEADERSHIP_DIGEST_LAST_SENT_KEY = "leadership_digest_last_sent_ts"
-LEADERSHIP_DIGEST_RECIPIENTS = [
-    addr.strip() for addr in os.environ.get("LEADERSHIP_DIGEST_RECIPIENTS", "").split(",") if addr.strip()
-]
+LEADERSHIP_DIGEST_RECIPIENTS_KEY = "leadership_digest_recipients"
+_LEADERSHIP_DIGEST_RECIPIENTS_ENV_DEFAULT = os.environ.get("LEADERSHIP_DIGEST_RECIPIENTS", "")
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _parse_recipient_list(raw):
+    """Splits on comma AND newline (the admin textarea makes newline the
+    natural way to add one per line, but comma still works for anyone
+    pasting a single-line list) and drops anything that doesn't look like
+    a real address, case-insensitively de-duplicated while preserving
+    first-seen order."""
+    seen = set()
+    out = []
+    for chunk in re.split(r"[,\n]+", raw or ""):
+        addr = chunk.strip()
+        if not addr or not _EMAIL_RE.match(addr):
+            continue
+        key = addr.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(addr)
+    return out
+
+
+def _leadership_digest_recipients():
+    raw = _get_app_setting(LEADERSHIP_DIGEST_RECIPIENTS_KEY)
+    if raw is None:
+        raw = _LEADERSHIP_DIGEST_RECIPIENTS_ENV_DEFAULT
+    return _parse_recipient_list(raw)
+
+
+def _set_leadership_digest_recipients(addrs):
+    _set_app_setting(LEADERSHIP_DIGEST_RECIPIENTS_KEY, ", ".join(addrs))
+
+
 LEADERSHIP_DIGEST_MAIL_FROM = os.environ.get("LEADERSHIP_DIGEST_MAIL_FROM", "infrawatch@covhlth.com")
 LEADERSHIP_DIGEST_MAIL_FROM_NAME = os.environ.get("LEADERSHIP_DIGEST_MAIL_FROM_NAME", "InfraWatch")
 # 3-letter day name, lower-case - which day of the week the digest goes out.
@@ -12734,9 +12798,10 @@ def _send_leadership_digest_mail(subject, html_body):
     module docstring above for why (not the `mail`/`mailx` command).
     Returns None on success, or a short error string to surface to an
     admin (test-send button, or logged from the scheduler)."""
-    if not LEADERSHIP_DIGEST_RECIPIENTS:
-        return "No recipients configured (set LEADERSHIP_DIGEST_RECIPIENTS)"
-    to_header = ", ".join(LEADERSHIP_DIGEST_RECIPIENTS)
+    recipients = _leadership_digest_recipients()
+    if not recipients:
+        return "No recipients configured - add some in System Config"
+    to_header = ", ".join(recipients)
     message = (
         f"From: {LEADERSHIP_DIGEST_MAIL_FROM_NAME} <{LEADERSHIP_DIGEST_MAIL_FROM}>\n"
         f"To: {to_header}\n"
@@ -12748,7 +12813,7 @@ def _send_leadership_digest_mail(subject, html_body):
     )
     try:
         subprocess.run(
-            ["msmtp"] + LEADERSHIP_DIGEST_RECIPIENTS,
+            ["msmtp"] + recipients,
             input=message.encode("utf-8"), timeout=30, check=True, capture_output=True,
         )
     except FileNotFoundError:
