@@ -1812,6 +1812,9 @@ PAGE_SHELL = """<!DOCTYPE html>
     color: var(--text-dim); white-space: nowrap;
   }}
   .search-result-row.alert .srr-tag {{ background: var(--danger-tint); color: var(--danger); }}
+  .search-result-row mark {{ background: var(--teal-tint); color: var(--teal-dark); border-radius: 3px;
+    padding: 0 1px; font-weight: 700; }}
+  .search-result-row:focus {{ outline: none; border-color: var(--teal); box-shadow: 0 0 0 2px var(--teal-tint); }}
   .nav-dropdown-menu {{
     position: absolute; top: calc(100% + 8px); right: 0; z-index: 50; min-width: 175px;
     background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
@@ -2519,6 +2522,24 @@ def _delete_with_usage_check(list_path, in_use, noun, removed_message):
 def _esc(s):
     from markupsafe import escape
     return escape(s or "")
+
+
+def _highlight_term(escaped_html, term):
+    """Wraps case-insensitive matches of `term` in <mark> inside text
+    that's already been through _esc() - used on the search results page
+    so a hit reads as "found because of this part", not just a name in a
+    list. `term` is escaped the same way before matching so it lines up
+    with how it'd actually appear inside already-escaped text (a raw "&"
+    in the query matches the "&amp;" it becomes there); anything that
+    doesn't survive that round-trip (matches spanning an entity, HTML
+    special characters mid-term) just doesn't get highlighted rather than
+    risking a broken match - the plain-text search this only decorates
+    already found the row regardless."""
+    escaped_html = str(escaped_html)
+    esc_term = str(_esc((term or "").strip()))
+    if not esc_term:
+        return escaped_html
+    return re.sub(f"({re.escape(esc_term)})", r"<mark>\1</mark>", escaped_html, flags=re.IGNORECASE)
 
 
 def _ack_tag_html(acknowledged):
@@ -4197,8 +4218,8 @@ def search_page(username):
         rows = "".join(
             f"""<a class="search-result-row{' alert' if r['alert'] else ''}" href="{_esc(r['href'])}">
               <div>
-                <div class="srr-label">{_esc(r['label'])}</div>
-                <div class="srr-sub">{r['sublabel']}</div>
+                <div class="srr-label">{_highlight_term(_esc(r['label']), term)}</div>
+                <div class="srr-sub">{_highlight_term(r['sublabel'], term)}</div>
               </div>
               <span class="srr-tag">{_esc(r['tag'])}</span>
             </a>"""
@@ -4233,6 +4254,33 @@ def search_page(username):
       <button type="submit">Search</button>
     </form>
     {content}
+    <script>
+      (function () {{
+        // Down from the query field or any result jumps into the results
+        // list; Up/Down from inside the list moves between rows; Up out of
+        // the first row goes back to the query field. Enter still just
+        // follows the link natively since these are plain <a> elements.
+        var input = document.getElementById('search-q-input');
+        var rows = Array.prototype.slice.call(document.querySelectorAll('.search-result-row'));
+        if (!rows.length) return;
+        function focusRow(i) {{
+          if (i < 0) {{ if (input) input.focus(); return; }}
+          if (i >= rows.length) i = rows.length - 1;
+          rows[i].focus();
+        }}
+        if (input) {{
+          input.addEventListener('keydown', function (e) {{
+            if (e.key === 'ArrowDown') {{ e.preventDefault(); focusRow(0); }}
+          }});
+        }}
+        rows.forEach(function (row, i) {{
+          row.addEventListener('keydown', function (e) {{
+            if (e.key === 'ArrowDown') {{ e.preventDefault(); focusRow(i + 1); }}
+            else if (e.key === 'ArrowUp') {{ e.preventDefault(); focusRow(i - 1); }}
+          }});
+        }});
+      }})();
+    </script>
     """
     return Response(render_shell("Search", body, "search", username), mimetype="text/html")
 
